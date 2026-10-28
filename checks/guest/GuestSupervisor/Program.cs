@@ -33,6 +33,8 @@ internal static class GuestSupervisor
         public int CachedAnswerFilesRemoved { get; set; }
         public bool CachedAnswerFilesAbsentVerified { get; set; }
         public bool ActivationLicensedObserved { get; set; }
+        public ActivationObservation? ActivationObservation { get; set; }
+        public OwnedPowerRequest.Observation? PowerRequest { get; set; }
         public bool OfflineRuntimeVerified { get; set; }
         public bool HarnessCompiled { get; set; }
         public bool AutologonDisabled { get; set; }
@@ -75,6 +77,11 @@ internal static class GuestSupervisor
     [DllImport("kernel32.dll", EntryPoint = "CreateDirectoryW", CharSet = CharSet.Unicode, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool CreateDirectory(string path, IntPtr security);
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool TerminateProcess(IntPtr process, uint code);
 
     private static async Task<int> Main(string[] args)
     {
@@ -82,6 +89,7 @@ internal static class GuestSupervisor
         Result result = new();
         string? work = null, runtime = null;
         bool ownWork = false, ownRuntime = false;
+        OwnedPowerRequest? powerRequest = null;
         using SerialChannel serial = new();
         try
         {
@@ -119,6 +127,12 @@ internal static class GuestSupervisor
             DisableOwnedAutologon(account);
             result.AutologonDisabled = true;
             serial.Phase("elevated_owned_parent_verified");
+            result.Stage = "acquire_owned_power_request";
+            powerRequest = new OwnedPowerRequest();
+            result.PowerRequest = powerRequest.Evidence;
+            powerRequest.Acquire();
+            Require(powerRequest.Evidence.Acquired, "owned_power_request_not_acquired");
+            serial.Phase("owned_power_request_acquired");
             result.Stage = "remove_owned_setup_media";
             DriveInfo[] setupDrives = DriveInfo.GetDrives().Where(item => item.DriveType == DriveType.CDRom &&
                 item.IsReady && item.VolumeLabel == "SESSIONSETUP").ToArray();
@@ -169,8 +183,7 @@ internal static class GuestSupervisor
             Require(result.SecureBootVerified && result.Tpm2Verified, "secure_boot_or_tpm2_not_verified");
             serial.Phase("secure_boot_tpm2_verified");
             result.Stage = "observe_standard_activation";
-            serial.Phase("awaiting_standard_activation");
-            result.ActivationLicensedObserved = await ObserveActivation();
+            result.ActivationLicensedObserved = await ObserveActivation(serial, result);
             Require(result.ActivationLicensedObserved, "activation_not_observed");
             serial.Phase("standard_activation_observed");
 
@@ -261,6 +274,8 @@ internal static class GuestSupervisor
             }
             result.GuestWorkDirectoriesRemoved = removed;
             if (!removed) { result.CleanupUnverified = true; result.Status = "failed"; }
+            if (powerRequest is not null && !powerRequest.Release().CleanupVerified)
+            { result.CleanupUnverified = true; result.Status = "failed"; }
             // A failure before a valid per-run nonce cannot produce a bound
             // result. The host's bounded HELLO/install timeout remains failure.
             if (serial.HelloWritten) serial.Result(JsonSerializer.SerializeToUtf8Bytes(result, JsonOptions));
@@ -310,27 +325,91 @@ internal static class GuestSupervisor
         throw new GuestFailure("setup_media_still_readable_timeout");
     }
 
-    private static async Task<bool> ObserveActivation()
+    private static async Task<bool> ObserveActivation(SerialChannel serial, Result result)
     {
-        // Observe only LicenseStatus. No product key is read, installed, or
-        // changed; no rearm, expiry edit, or activation workaround is attempted.
+        // The provider selects the installed primary Windows license. The key
+        // is a presence predicate only: its value, product names and IDs are
+        // never selected, read or emitted. No activation settings are changed.
         const string query = "$ErrorActionPreference='Stop'; " +
-            "$p=@(Get-CimInstance -Query \"SELECT LicenseStatus FROM SoftwareLicensingProduct WHERE " +
-            "ApplicationID='55c92734-d682-4d71-983e-d6ec3f16059f' AND LicenseStatus=1\"); " +
-            "($p.Count -gt 0)|ConvertTo-Json -Compress";
-        Stopwatch watch = Stopwatch.StartNew();
-        while (watch.Elapsed < TimeSpan.FromMinutes(3))
+            "$p=@(Get-CimInstance -Query \"SELECT LicenseStatus,LicenseStatusReason FROM SoftwareLicensingProduct WHERE " +
+            "ApplicationID='55c92734-d682-4d71-983e-d6ec3f16059f' AND PartialProductKey IS NOT NULL AND LicenseIsAddon=FALSE\"); " +
+            "$s=$null;$r=$null;if($p.Count -eq 1){$s=$p[0].LicenseStatus;$r=$p[0].LicenseStatusReason};" +
+            "[ordered]@{candidate_count=$p.Count;license_status=$s;license_status_reason=$r}|ConvertTo-Json -Compress";
+        ActivationObservation progress = new(0, 0, 0, -1, -1, -1);
+        // Only immutable baseline evidence crosses to the watchdog thread.
+        // It must never race serialization of the main thread's mutable Result.
+        byte[] baseline = JsonSerializer.SerializeToUtf8Bytes(result, JsonOptions);
+        void StopOwnProcess()
         {
-            (int code, string text) = await RunProcess(Path.Combine(Environment.SystemDirectory, @"WindowsPowerShell\v1.0\powershell.exe"),
-                new[] { "-NoLogo", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", Encoded(query) },
-                Environment.SystemDirectory, TimeSpan.FromSeconds(25), null, null);
-            Require(code == 0, "activation_status_query_failed");
-            using JsonDocument value = JsonDocument.Parse(text);
-            if (value.RootElement.ValueKind == JsonValueKind.True) return true;
-            Require(value.RootElement.ValueKind == JsonValueKind.False, "activation_status_format_invalid");
-            await Task.Delay(10000);
+            try
+            {
+                JsonObject failure = JsonNode.Parse(baseline)!.AsObject();
+                failure["status"] = "failed";
+                failure["stage"] = "observe_standard_activation";
+                failure["failure_code"] = "activation_watchdog_timeout";
+                failure["error_type"] = "TimeoutException";
+                failure["activation_licensed_observed"] = false;
+                failure["cleanup_unverified"] = true;
+                failure["guest_work_directories_removed"] = false;
+                failure["activation_observation"] = JsonSerializer.SerializeToNode(Volatile.Read(ref progress), JsonOptions);
+                // A stuck UART must not make this dedicated deadline wait on
+                // the normal writer's lock. Host timeout remains independent.
+                serial.TryResult(JsonSerializer.SerializeToUtf8Bytes(failure, JsonOptions), TimeSpan.FromMilliseconds(100));
+            }
+            catch { /* Host sees no final result if the UART itself is stuck. */ }
+            finally
+            {
+                // Only this exact supervisor is terminated. PowerShell child
+                // cleanup is unverified here; disposal of the owned VM is the
+                // host's separate responsibility. No foreign process lookup.
+                _ = TerminateProcess(GetCurrentProcess(), 124);
+                Environment.Exit(124); // fallback only if the native call failed
+            }
         }
-        return false;
+        OperationWatchdog watchdog = new(TimeSpan.FromSeconds(240), StopOwnProcess);
+        Stopwatch watch = Stopwatch.StartNew();
+        try
+        {
+            serial.Phase("awaiting_standard_activation");
+            for (int iteration = 1; iteration <= 18 && watch.Elapsed < TimeSpan.FromMinutes(3); iteration++)
+            {
+                void Report(int step, int code = 0, int count = -1, int status = -1, long reason = -1)
+                {
+                    ActivationObservation update = new(iteration, step, code, count, status, reason);
+                    Volatile.Write(ref progress, update);
+                    result.ActivationObservation = update;
+                    serial.Activation(update);
+                }
+                try
+                {
+                    Report(0); // query operation started, before Process.Start
+                    (int code, string text) = await RunProcess(Path.Combine(Environment.SystemDirectory, @"WindowsPowerShell\v1.0\powershell.exe"),
+                        new[] { "-NoLogo", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", Encoded(query) },
+                        Environment.SystemDirectory, TimeSpan.FromSeconds(25), null, null, (step, number) => Report(step, number));
+                    Report(6, code); // query process and bounded output returned
+                    Require(code == 0, "activation_status_query_failed");
+                    ActivationSample sample = ActivationSample.Parse(text);
+                    Report(7, 0, sample.CandidateCount, sample.LicenseStatus, sample.LicenseStatusReason);
+                    Require(sample.CandidateCount <= 1, "activation_primary_license_ambiguous");
+                    if (sample.Licensed) return true;
+                }
+                catch (Exception error)
+                {
+                    Report(8, error.HResult);
+                    throw;
+                }
+                await Task.Delay(10000);
+            }
+            return false;
+        }
+        finally
+        {
+            bool disarmed = watchdog.TryDisarm();
+            bool joined = watchdog.JoinAndRelease(TimeSpan.FromSeconds(6));
+            // If expiry won the atomic race, execution must never proceed to
+            // account creation or the harness even if the blocked call returns.
+            if (!disarmed || !joined) StopOwnProcess();
+        }
     }
 
     private static async Task WaitDesktop()
@@ -391,19 +470,24 @@ internal static class GuestSupervisor
     }
 
     private static async Task<(int ExitCode, string Output)> RunProcess(string executable, IEnumerable<string> arguments,
-        string directory, TimeSpan timeout, Dictionary<string, string>? environment, SerialChannel? serial)
+        string directory, TimeSpan timeout, Dictionary<string, string>? environment, SerialChannel? serial,
+        Action<int, int>? progress = null)
     {
+        Stopwatch watch = Stopwatch.StartNew();
         ProcessStartInfo start = new(executable) { WorkingDirectory = directory, UseShellExecute = false, CreateNoWindow = true,
             RedirectStandardOutput = true, RedirectStandardError = true };
         foreach (string value in arguments) start.ArgumentList.Add(value);
         if (environment is not null) foreach ((string key, string value) in environment) start.Environment[key] = value;
+        progress?.Invoke(1, 0); // starting
         using Process process = Process.Start(start) ?? throw new InvalidOperationException("own_process_not_created");
-        Task<string> output = ReadBounded(process.StandardOutput, serial);
-        Task<string> error = ReadBounded(process.StandardError, null);
-        Task exited = process.WaitForExitAsync();
-        Stopwatch watch = Stopwatch.StartNew();
         try
         {
+            progress?.Invoke(2, 0); // process created
+            Task<string> output = ReadBounded(process.StandardOutput, serial);
+            Task<string> error = ReadBounded(process.StandardError, null);
+            progress?.Invoke(3, 0); // both readers registered
+            Task exited = process.WaitForExitAsync();
+            progress?.Invoke(4, 0); // exit wait registered
             List<Task> pending = new() { exited, output, error };
             while (!exited.IsCompleted)
             {
@@ -414,6 +498,7 @@ internal static class GuestSupervisor
                 pending.Remove(completed);
             }
             await exited;
+            progress?.Invoke(5, process.ExitCode); // actual process exit
             string captured = await output.WaitAsync(TimeSpan.FromSeconds(5));
             _ = await error.WaitAsync(TimeSpan.FromSeconds(5));
             return (process.ExitCode, captured);
@@ -494,7 +579,7 @@ internal sealed class SerialChannel : IDisposable
 {
     private readonly SafeFileHandle handle;
     private readonly object gate = new();
-    private int phases;
+    private int phases, activationRecords, terminalClaimed;
     internal bool HelloWritten { get; private set; }
     [StructLayout(LayoutKind.Sequential)]
     private struct Dcb
@@ -556,19 +641,45 @@ internal sealed class SerialChannel : IDisposable
         lock (gate)
         {
             if (!HelloWritten) throw new InvalidOperationException("serial_hello_required");
+            if (Volatile.Read(ref terminalClaimed) != 0) return;
             if (phases++ < 32) Write(Encoding.ASCII.GetBytes("GUEST_PHASE_V1 " + value + "\n"));
         }
     }
 
-    internal void Result(byte[] json)
+    internal void Activation(ActivationObservation value)
     {
-        if (json.Length is <= 0 or > 65536) throw new InvalidOperationException("serial_result_size_invalid");
+        if (value.Iteration is < 1 or > 18 || value.Step is < 0 or > 8 || value.CandidateCount is < -1 or > 512 ||
+            value.LicenseStatus is < -1 or > 6 || value.LicenseStatusReason is < -1 or > uint.MaxValue)
+            throw new InvalidOperationException("invalid_activation_observation");
         lock (gate)
         {
             if (!HelloWritten) throw new InvalidOperationException("serial_hello_required");
-            string header = "GUEST_RESULT_V1 " + json.Length + " " + Convert.ToHexString(SHA256.HashData(json)) + "\n";
-            Write(Encoding.ASCII.GetBytes(header)); Write(json); Write(new byte[] { 10 });
+            if (Volatile.Read(ref terminalClaimed) != 0) return;
+            if (++activationRecords > 192) throw new InvalidOperationException("activation_observation_limit");
+            string line = FormattableString.Invariant($"GUEST_ACTIVATION_V1 {value.Iteration} {value.Step} {value.Code} {value.CandidateCount} {value.LicenseStatus} {value.LicenseStatusReason}\n");
+            Write(Encoding.ASCII.GetBytes(line));
         }
+    }
+
+    internal void Result(byte[] json) => _ = TryResult(json, TimeSpan.FromSeconds(6));
+
+    internal bool TryResult(byte[] json, TimeSpan lockTimeout)
+    {
+        if (json.Length is <= 0 or > 65536) throw new InvalidOperationException("serial_result_size_invalid");
+        // Exactly one main/watchdog writer can claim the terminal result.
+        // A partial/failed write is failure, never retried as a second frame.
+        if (Interlocked.CompareExchange(ref terminalClaimed, 1, 0) != 0) return false;
+        if (!Monitor.TryEnter(gate, lockTimeout)) return false;
+        try
+        {
+            if (!HelloWritten) throw new InvalidOperationException("serial_hello_required");
+            byte[] header = Encoding.ASCII.GetBytes("GUEST_RESULT_V1 " + json.Length + " " + Convert.ToHexString(SHA256.HashData(json)) + "\n");
+            byte[] frame = new byte[header.Length + json.Length + 1];
+            header.CopyTo(frame, 0); json.CopyTo(frame, header.Length); frame[^1] = 10;
+            Write(frame); // one native write with the existing five-second timeout
+            return true;
+        }
+        finally { Monitor.Exit(gate); }
     }
 
     private void Write(byte[] bytes)

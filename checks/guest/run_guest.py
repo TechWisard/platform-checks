@@ -30,6 +30,8 @@ import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
 
+import failure_diagnostics
+
 HERE = Path(__file__).resolve().parent
 GIB = 1024**3
 ENDPOINTS = {"go.microsoft.com", "software-static.download.prss.microsoft.com", "builds.dotnet.microsoft.com"}
@@ -541,6 +543,35 @@ class SerialReader:
         self.noise_bytes = 0
         self.noise_tail = b""
         self.noise_categories = set()
+        self.activation_count = 0
+        self.activation_iteration = 0
+        self.activation_step = -1
+        self.activation_pending = []
+
+    def _activation(self, values: tuple[int, ...]) -> None:
+        iteration, step, code, count, status, reason = values
+        require(1 <= iteration <= 18 and 0 <= step <= 8 and -(2**31) <= code < 2**31 and
+                -1 <= count <= 512 and -1 <= status <= 6 and -1 <= reason < 2**32,
+                "activation_observation_range_invalid")
+        new_iteration = iteration == self.activation_iteration + 1 and step == 0 and self.activation_step in {-1, 7}
+        next_step = iteration == self.activation_iteration and (step == self.activation_step + 1 or
+                    (step == 8 and 0 <= self.activation_step < 8))
+        require(new_iteration or next_step, "activation_observation_order_invalid")
+        if step == 7:
+            require(count >= 0 and code == 0 and ((count == 1 and status >= 0 and reason >= 0) or
+                    (count != 1 and status == -1 and reason == -1)), "activation_parsed_observation_invalid")
+        else:
+            require(count == -1 and status == -1 and reason == -1 and (code == 0 or step in {5, 6, 8}),
+                    "activation_process_observation_invalid")
+        self.activation_count += 1
+        require(self.activation_count <= 192, "activation_observation_limit")
+        self.activation_iteration, self.activation_step = iteration, step
+        self.activation_pending.append({"iteration": iteration, "step": step, "code": code,
+            "candidate_count": count, "license_status": status, "license_status_reason": reason})
+
+    def take_activation_observations(self) -> list[dict]:
+        result, self.activation_pending = self.activation_pending, []
+        return result
 
     def _classify_noise(self, data: bytes) -> set[str]:
         lowered = data.lower()
@@ -617,6 +648,7 @@ class SerialReader:
             del self.buffer[:position + 1]
             phase = re.fullmatch(rb"GUEST_PHASE_V1 ([a-z0-9_]{1,100})", line)
             header = re.fullmatch(rb"GUEST_RESULT_V1 ([0-9]{1,5}) ([0-9A-F]{64})", line)
+            activation = re.fullmatch(rb"GUEST_ACTIVATION_V1 ([0-9]{1,2}) ([0-9]) (-?[0-9]{1,10}) (-?[0-9]{1,3}) (-?[0-9]) (-?[0-9]{1,10})", line)
             if phase:
                 self.phases += 1
                 require(self.phases <= 32, "serial_phase_limit")
@@ -624,6 +656,8 @@ class SerialReader:
             elif header:
                 self.length = int(header.group(1)); self.digest = header.group(2).decode("ascii")
                 require(0 < self.length <= 65536, "serial_result_length_invalid")
+            elif activation:
+                self._activation(tuple(map(int, activation.groups())))
             else:
                 raise Failure("unexpected_serial_frame")
         return stages
@@ -635,9 +669,15 @@ def successful_result(value: dict) -> bool:
                 "setup_media_was_readable", "setup_media_unavailable_verified", "cached_answer_files_absent_verified",
                 "harness_cleanup_verified", "guest_work_directories_removed")
     test = value.get("test", {})
+    power = value.get("power_request", {})
+    activation = value.get("activation_observation", {})
     return (value.get("status") == "verified" and type(value.get("test_exit_code")) is int and value["test_exit_code"] == 0 and
             value.get("cleanup_unverified") is False and all(value.get(key) is True for key in required) and
             value.get("physical_input_isolation_verified") is False and value.get("native_multiseat_verified") is False and
+            isinstance(power, dict) and power.get("acquired") is True and power.get("cleanup_verified") is True and
+            isinstance(activation, dict) and type(activation.get("candidate_count")) is int and activation["candidate_count"] == 1 and
+            type(activation.get("license_status")) is int and activation["license_status"] == 1 and activation.get("step") == 7 and
+            isinstance(test, dict) and
             all(test.get(key) is True for key in ("different_account_verified", "frame_challenge_verified", "direct_input_channel_verified")))
 
 
@@ -681,7 +721,8 @@ def execute(args) -> int:
         emit("install_official_ubuntu_tools")
         command(["apt-get", "update", "-qq"], deadline, 600)
         command(["apt-get", "install", "--yes", "--no-install-recommends", "-o", "Dpkg::Use-Pty=0",
-                 "qemu-system-x86", "qemu-utils", "ovmf", "swtpm", "swtpm-tools", "xorriso", "p7zip-full", "wimtools"], deadline, 600)
+                 "qemu-system-x86", "qemu-utils", "ovmf", "swtpm", "swtpm-tools", "xorriso", "p7zip-full", "wimtools",
+                 "tesseract-ocr", "tesseract-ocr-eng"], deadline, 600)
         descriptor = Path("/usr/share/qemu/firmware/40-edk2-x86_64-secure-enrolled.json")
         firmware = json.loads(descriptor.read_text())
         require({"secure-boot", "enrolled-keys", "requires-smm"}.issubset(set(firmware["features"])), "ms_secure_firmware_features_missing")
@@ -753,9 +794,11 @@ def execute(args) -> int:
         first_logon = None
         setup_detached = False
         hello_reported = False
+        activation_started = None
+        activation_finished = False
 
         def observe_serial() -> None:
-            nonlocal offset, first_logon, setup_detached, hello_reported
+            nonlocal offset, first_logon, setup_detached, hello_reported, activation_started, activation_finished
             block = b""
             if serial_path.exists():
                 with serial_path.open("rb") as file:
@@ -773,6 +816,15 @@ def execute(args) -> int:
                     require(not setup_detached, "duplicate_setup_detach_request")
                     remove_setup_medium(qmp, setup_iso)
                     setup_detached = True
+                elif phase == "awaiting_standard_activation":
+                    require(activation_started is None and not activation_finished, "duplicate_activation_phase")
+                    activation_started = time.monotonic()
+                elif phase == "standard_activation_observed":
+                    require(activation_started is not None and not activation_finished, "activation_phase_order_invalid")
+                    activation_finished = True
+                    activation_started = None
+            for observation in reader.take_activation_observations():
+                emit("guest_activation_observation", **observation)
 
         qmp.call("cont")
         # Only the initial, owned VM boot gets a finite space-key burst for
@@ -793,13 +845,15 @@ def execute(args) -> int:
             require(time.monotonic() - boot_start < 50 * 60, "guest_install_or_test_timeout")
             if first_logon is not None:
                 require(time.monotonic() - first_logon < 20 * 60, "guest_supervisor_timeout")
+            if activation_started is not None:
+                require(time.monotonic() - activation_started < 270, "guest_activation_phase_timeout")
             require(shutil.disk_usage(work).free >= 3 * GIB, "host_disk_reserve_exhausted")
             require((work / "qemu.log").stat().st_size <= 2 * 1024 * 1024 and (work / "swtpm.log").stat().st_size <= 2 * 1024 * 1024,
                     "hypervisor_log_limit")
             observe_serial()
             if time.monotonic() >= next_heartbeat:
                 emit("awaiting_guest", first_logon_observed=first_logon is not None,
-                     elapsed_seconds=int(time.monotonic() - boot_start), storage=block_progress(qmp),
+                     elapsed_seconds=int(time.monotonic() - boot_start), vm_state=failure_diagnostics.query_state(qmp), storage=block_progress(qmp),
                      serial_startup=reader.startup_observation())
                 next_heartbeat = time.monotonic() + 30
             time.sleep(0.25)
@@ -809,7 +863,7 @@ def execute(args) -> int:
                          "secure_boot_verified", "tpm2_verified", "fixture_presentation_verified", "first_logon_animation_value",
                          "privacy_experience_value", "setup_media_was_readable", "setup_media_unavailable_verified",
                          "setup_media_read_error_code", "cached_answer_files_removed", "cached_answer_files_absent_verified",
-                         "activation_licensed_observed", "offline_runtime_verified",
+                         "activation_licensed_observed", "activation_observation", "power_request", "offline_runtime_verified",
                          "harness_compiled", "autologon_disabled", "harness_cleanup_verified", "guest_work_directories_removed",
                          "cleanup_unverified", "physical_input_isolation_verified", "native_multiseat_verified",
                          "test_exit_code", "test", "error_type", "failure_code", "error_hresult")
@@ -821,6 +875,11 @@ def execute(args) -> int:
         if reader is not None:
             emit("serial_startup_observation", **reader.startup_observation())
         if qmp is not None:
+            if outcome != 0 and qemu is not None and qemu.poll() is None:
+                try:
+                    emit("guest_failure_observation", **failure_diagnostics.observe_failure(qmp, work, deadline, command))
+                except Exception:
+                    emit("guest_failure_observation", diagnostic_only=True, diagnostic_category="observation_unavailable")
             try:
                 qmp.call("quit")
             except Exception:

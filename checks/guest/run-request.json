@@ -1,5 +1,5 @@
 {
   "schema": "windows-guest-run-request/v1",
-  "request_id": "w11-ltsc-x64-20261028-bound-supervisor-hello",
-  "previous_execution_commit": "94c49024077bca72439da592e4a15807f1c6d7ba"
+  "request_id": "w11-ltsc-x64-20261028-activation-watchdog-power-diagnostics",
+  "previous_execution_commit": "7b220ae8953d5bfc109ccae202f2ae3f6520df98"
 }

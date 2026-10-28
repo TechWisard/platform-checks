@@ -12,6 +12,7 @@ import unittest
 import xml.etree.ElementTree as ET
 
 import run_guest as guest
+import failure_diagnostics as diagnostics
 
 
 class HostContractTests(unittest.TestCase):
@@ -130,6 +131,8 @@ class HostContractTests(unittest.TestCase):
         value.update({name: True for name in gates})
         value.update(status="verified", test_exit_code=0, cleanup_unverified=False,
                      physical_input_isolation_verified=False, native_multiseat_verified=False,
+                     power_request={"acquired": True, "cleanup_verified": True},
+                     activation_observation={"candidate_count": 1, "license_status": 1, "step": 7},
                      test={"different_account_verified": True, "frame_challenge_verified": True, "direct_input_channel_verified": True})
         self.assertTrue(guest.successful_result(value))
         for key in gates:
@@ -142,6 +145,115 @@ class HostContractTests(unittest.TestCase):
                                  ("physical_input_isolation_verified", True), ("native_multiseat_verified", True)):
             changed = copy.deepcopy(value); changed[key] = replacement
             self.assertFalse(guest.successful_result(changed), key)
+        for key in ("acquired", "cleanup_verified"):
+            changed = copy.deepcopy(value); changed["power_request"][key] = False
+            self.assertFalse(guest.successful_result(changed), key)
+        for key, replacement in (("candidate_count", 0), ("candidate_count", 2), ("candidate_count", True),
+                                 ("license_status", 2), ("license_status", True), ("step", 6)):
+            changed = copy.deepcopy(value); changed["activation_observation"][key] = replacement
+            self.assertFalse(guest.successful_result(changed), key)
+
+    def activation(self, iteration, step, code=0, count=-1, status=-1, reason=-1):
+        return f"GUEST_ACTIVATION_V1 {iteration} {step} {code} {count} {status} {reason}\n".encode()
+
+    def test_activation_fragments_are_bounded_diagnostic_not_success(self):
+        reader = guest.SerialReader(self.nonce)
+        data = self.hello() + b"".join(self.activation(1, step) for step in range(7)) + self.activation(1, 7, count=1, status=1, reason=0)
+        for start in range(0, len(data), 3):
+            self.assertEqual(reader.feed(data[start:start + 3]), [])
+        observations = reader.take_activation_observations()
+        self.assertEqual(len(observations), 8)
+        self.assertEqual(observations[-1]["license_status"], 1)
+        self.assertEqual(reader.take_activation_observations(), [])
+        self.assertEqual(reader.phases, 0)
+        self.assertIsNone(reader.result)
+        self.assertEqual(reader.feed(self.frame(self.value())), [])
+        self.assertFalse(guest.successful_result(reader.result))
+
+    def test_activation_order_ranges_and_private_text_rejected(self):
+        bad = [self.activation(2, 0), self.activation(1, 2), self.activation(19, 0), self.activation(1, 0, 2**31),
+               self.activation(1, 0, count=1), b"GUEST_ACTIVATION_V1 credential-secret\n"]
+        for line in bad:
+            with self.subTest(line_length=len(line)):
+                with self.assertRaises(guest.Failure):
+                    guest.SerialReader(self.nonce).feed(self.hello() + line)
+        prefix = self.hello() + b"".join(self.activation(1, step) for step in range(7))
+        for invalid in (self.activation(1, 7, count=1, status=-1, reason=0),
+                        self.activation(1, 7, count=2, status=1, reason=0),
+                        self.activation(1, 7, count=1, status=1, reason=2**32)):
+            with self.assertRaises(guest.Failure):
+                guest.SerialReader(self.nonce).feed(prefix + invalid)
+
+    def test_activation_error_is_terminal_and_iterations_capped(self):
+        reader = guest.SerialReader(self.nonce)
+        reader.feed(self.hello() + self.activation(1, 0) + self.activation(1, 1) + self.activation(1, 8, -2147023436))
+        self.assertEqual(reader.take_activation_observations()[-1]["step"], 8)
+        with self.assertRaises(guest.Failure):
+            reader.feed(self.activation(2, 0))
+        reader = guest.SerialReader(self.nonce)
+        reader.feed(self.hello())
+        for iteration in range(1, 19):
+            data = b"".join(self.activation(iteration, step) for step in range(7)) + self.activation(iteration, 7, count=0)
+            reader.feed(data)
+        self.assertEqual(reader.activation_count, 144)
+        self.assertIsNone(reader.result)
+        with self.assertRaises(guest.Failure):
+            reader.feed(self.activation(19, 0))
+
+    def test_qmp_state_whitelist_never_leaks_unknown_state(self):
+        class Qmp:
+            def __init__(self, value): self.value = value
+            def call(self, name):
+                self.assertion = name == "query-status"
+                return self.value
+        for state in ("running", "paused", "suspended", "guest-panicked", "io-error"):
+            value = diagnostics.query_state(Qmp({"running": state == "running", "status": state, "extra": "private-text"}))
+            self.assertEqual(value["status"], state)
+            self.assertNotIn("private-text", json.dumps(value))
+        for value in ({"running": 1, "status": "running"}, {"running": False, "status": "private-text"}, None):
+            self.assertEqual(diagnostics.query_state(Qmp(value)), {"query_succeeded": False})
+
+    def tsv(self, words, confidence=90):
+        header = "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n"
+        return (header + "".join(f"5\t1\t1\t1\t1\t{number}\t0\t0\t10\t10\t{confidence}\t{word}\n"
+                                for number, word in enumerate(words, 1))).encode()
+
+    def test_ocr_only_fixed_labels_and_confidence_never_raw_words(self):
+        words = "PrivateUser credential-secret Your device ran into a problem Stop code".split()
+        result = diagnostics.classify_tsv(self.tsv(words))
+        self.assertEqual(result["fixed_label_ids"], ["windows_problem_message", "windows_stop_code_label"])
+        self.assertNotIn("PrivateUser", json.dumps(result)); self.assertNotIn("credential-secret", json.dumps(result))
+        self.assertEqual(diagnostics.classify_tsv(self.tsv(words, 20))["fixed_label_ids"], [])
+        self.assertEqual(diagnostics.classify_tsv(self.tsv(["arbitrary", "desktop", "text"]))["fixed_label_ids"], [])
+        for invalid in (b"x" * 65537, self.tsv(["x"], float("nan")), b"arbitrary raw OCR text"):
+            with self.assertRaises(ValueError): diagnostics.classify_tsv(invalid)
+
+    def test_failure_screen_is_own_temporary_and_removed_after_ocr_failure(self):
+        class Qmp:
+            def call(self, name, arguments=None):
+                if name == "query-status": return {"running": False, "status": "suspended"}
+                self.path = Path(arguments["filename"])
+                self.path.write_bytes(b"P6\n2 2\n255\n" + b"\0" * 12)
+                return {}
+        def failed_ocr(*args, **kwargs): raise ValueError("raw credential-secret")
+        with tempfile.TemporaryDirectory() as directory:
+            qmp = Qmp()
+            result = diagnostics.observe_failure(qmp, Path(directory), guest.Deadline(), failed_ocr)
+            self.assertTrue(result["diagnostic_only"])
+            self.assertTrue(result["screen_capture_succeeded"])
+            self.assertFalse(result["ocr_succeeded"])
+            self.assertTrue(result["temporary_image_removed"])
+            self.assertFalse(qmp.path.exists())
+            self.assertNotIn("credential-secret", json.dumps(result))
+
+    def test_ppm_pixel_and_file_bounds_before_decoder(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "synthetic.ppm"
+            path.write_bytes(b"P6\n2 2\n255\n" + b"\0" * 12)
+            self.assertEqual(diagnostics.ppm_dimensions(path), (2, 2))
+            for data in (b"P6\n9999 9999\n255\n", b"P6\n2 2\n255\n" + b"\0" * 11, b"not-an-image"):
+                path.write_bytes(data)
+                with self.assertRaises(ValueError): diagnostics.ppm_dimensions(path)
 
     def test_unattend_setup_boundary_and_command_length(self):
         root = ET.fromstring(guest.unattend("scgatest001", "SyntheticTestPassword1!", "SCG-UNIT", 1))
