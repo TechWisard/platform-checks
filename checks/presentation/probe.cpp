@@ -1,6 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <ole2.h>
 #include <appmodel.h>
 #include <wtsapi32.h>
 #include <uiautomation.h>
