@@ -14,19 +14,19 @@ try {
     if (-not $process.WaitForExit(20000)) { throw 'native_timeout' }
     $process.Refresh()
     $size = (Get-Item -LiteralPath $stdout).Length
-    if ($size -le 0 -or $size -gt 32768) { throw 'output_size' }
+    if ($size -le 0 -or $size -gt 131072) { throw 'output_size' }
     $text = [IO.File]::ReadAllText($stdout, [Text.UTF8Encoding]::new($false, $true))
     $result = $text | ConvertFrom-Json -Depth 12
-    if ($result.schema -ne 'native-input-contract/v1' -or $result.status -notin @('verified','failed')) { throw 'output_schema' }
+    if ($result.schema -ne 'native-input-contract/v2' -or $result.status -notin @('verified','failed')) { throw 'output_schema' }
     foreach ($name in @('rdp_connect_called','input_methods_called','credentials_used','remote_frame_verified','input_delivery_verified','physical_multiseat_verified')) {
         if ($result.$name -isnot [bool] -or $result.$name) { throw 'scope_flag' }
     }
     if ($process.ExitCode -eq 0) {
         if ($result.status -ne 'verified' -or $result.error_hresult -ne 0 -or $result.close_hresult -ne 0 -or $result.connected_before -ne 0 -or $result.connected_after -ne 0) { throw 'native_contradiction' }
-        foreach ($name in @('sta_verified','metadata_verified','qi_verified','cleanup_verified','ole_uninitialized')) {
+        foreach ($name in @('sta_verified','metadata_verified','qi_attempted','qi_verified','sdk_input_qi_attempted','cleanup_verified','ole_uninitialized')) {
             if ($result.$name -isnot [bool] -or -not $result.$name) { throw 'required_gate' }
         }
-        if (@($result.methods).Count -ne 3 -or @($result.enums).Count -ne 2) { throw 'metadata_count' }
+        if (@($result.default_contract.methods).Count -ne 3 -or @($result.default_contract.enums).Count -ne 2) { throw 'metadata_count' }
         $outcome = 0
     } elseif ($result.status -eq 'verified') { throw 'verified_failed_exit' }
     Write-Output ($text.Trim())
