@@ -285,7 +285,12 @@ internal sealed class Evidence
     public bool TaskRemoved { get; set; } = true;
     public bool ParentStillActiveAfterCleanup { get; set; }
     public List<object> Events { get; set; } = new();
-    internal void Event(string stage, object? details = null) => Events.Add(new { utc = DateTimeOffset.UtcNow.ToString("O"), stage, details });
+    internal void Event(string stage, object? details = null)
+    {
+        Events.Add(new { utc = DateTimeOffset.UtcNow.ToString("O"), stage, details });
+        Console.WriteLine("experiment_stage=" + stage);
+        Console.Out.Flush();
+    }
     internal void Error(string stage, Exception exception)
     {
         Exception ex = exception is TargetInvocationException { InnerException: Exception inner } ? inner : exception;
@@ -379,8 +384,11 @@ internal sealed class ExperimentForm : Form
                 evidence.Event("shared_framebuffer_requested");
             }
             catch (Exception ex) { evidence.Error("optional_shared_framebuffer_request_failed", ex); }
+            using (CredentialPromptControl prompts = new(control, evidence.Event))
+                prompts.DisableAndVerify(evidence.Event);
             Stopwatch deadline = Stopwatch.StartNew();
             evidence.ConnectCalled = true;
+            evidence.Event("connect_invocation_started");
             Dispatch.Call(control, "Connect");
             evidence.Event("connect_called");
             while (deadline.Elapsed < timeout)

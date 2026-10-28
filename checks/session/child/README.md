@@ -79,7 +79,9 @@ authentication prompt, certificate failure or policy block must produce failure
 or timeout. The process never tries to fill or dismiss credential dialogs.
 
 The normal path has a finite connection/frame deadline and an additional
-20-second logoff verification window. A CI job should also have an outer timeout
+20-second logoff verification window. The PowerShell wrapper bounds the whole
+process to the requested deadline plus 45 seconds. A forced process termination
+is reported as a failure with cleanup unverified. A CI job also has an outer timeout
 and discard its VM after an abnormal process crash or forced cancellation;
 cleanup cannot be claimed after a killed process. Such an outcome is not a pass.
 The temporary helper has its own 150-second lifetime and its scheduled task has
