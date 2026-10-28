@@ -10,5 +10,8 @@
   <ItemGroup>
     <Compile Include="../GuestSupervisor/OperationWatchdog.cs" Link="OperationWatchdog.cs" />
     <Compile Include="../GuestSupervisor/ActivationObservation.cs" Link="ActivationObservation.cs" />
+    <Compile Include="../GuestSupervisor/LicensingSnapshot.cs" Link="LicensingSnapshot.cs" />
+    <Compile Include="../GuestSupervisor/ActivationScripts.cs" Link="ActivationScripts.cs" />
+    <Compile Include="../GuestSupervisor/ActivationNetwork.cs" Link="ActivationNetwork.cs" />
   </ItemGroup>
 </Project>

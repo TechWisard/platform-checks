@@ -133,6 +133,7 @@ class HostContractTests(unittest.TestCase):
                      physical_input_isolation_verified=False, native_multiseat_verified=False,
                      power_request={"acquired": True, "cleanup_verified": True},
                      activation_observation={"candidate_count": 1, "license_status": 1, "step": 7},
+                     activation_audit=self.audit(),
                      test={"different_account_verified": True, "frame_challenge_verified": True, "direct_input_channel_verified": True})
         self.assertTrue(guest.successful_result(value))
         for key in gates:
@@ -152,6 +153,99 @@ class HostContractTests(unittest.TestCase):
                                  ("license_status", 2), ("license_status", True), ("step", 6)):
             changed = copy.deepcopy(value); changed["activation_observation"][key] = replacement
             self.assertFalse(guest.successful_result(changed), key)
+
+    def audit(self):
+        snapshot = dict(candidate_count=1, license_status=1, license_status_reason=0, grace_period_remaining=0,
+                        evaluation_end_utc=None, trusted_time_utc=None, guest_utc=1793232000, evaluation_expired=None)
+        return dict(before=snapshot, after=copy.deepcopy(snapshot), network=None, attempt_count=0,
+                    method_process_started=False, method_process_completed=False, method_process_exit_code=None,
+                    method_reply=None, same_product_verified=True, licensed_status_confirmed=True)
+
+    def method_audit(self):
+        audit = self.audit()
+        audit["before"]["license_status"] = 5
+        audit["before"]["license_status_reason"] = 3221549065
+        audit.update(attempt_count=1, method_process_started=True, method_process_completed=True, method_process_exit_code=0,
+                     network=[dict(endpoint_id=i, dns_succeeded=True, tcp_succeeded=True, tls_succeeded=True, error_hresult=None)
+                              for i in (1, 2)],
+                     method_reply=dict(invocation_started=True, invocation_returned=True, return_value=0,
+                                       error_hresult=None, guard_code=0, same_product_verified=True))
+        return audit
+
+    def test_activation_audit_requires_fresh_license_not_method_return(self):
+        audit = self.method_audit()
+        self.assertTrue(guest.licensed_audit(audit))
+        audit["after"]["license_status"] = 5
+        self.assertFalse(guest.licensed_audit(audit))
+        for key in ("same_product_verified", "licensed_status_confirmed"):
+            changed = self.method_audit(); changed[key] = False
+            self.assertFalse(guest.licensed_audit(changed))
+        changed = self.method_audit(); changed["method_reply"]["same_product_verified"] = False
+        self.assertFalse(guest.licensed_audit(changed))
+        # A provider error can coexist with an independently observed Licensed
+        # state; a success method return cannot create that observation.
+        changed = self.method_audit(); changed["method_reply"]["return_value"] = 3221549065
+        self.assertTrue(guest.licensed_audit(changed))
+
+    def test_activation_audit_unknown_completion_never_passes(self):
+        for completed, reply in ((False, None), (True, None), (True, dict(invocation_started=True,
+                invocation_returned=False, return_value=None, error_hresult=-2147023436, guard_code=0, same_product_verified=True))):
+            changed = self.method_audit()
+            changed.update(method_process_completed=completed, method_process_exit_code=0 if completed else None, method_reply=reply)
+            self.assertFalse(guest.licensed_audit(changed))
+        changed = self.method_audit(); changed["attempt_count"] = 2
+        self.assertFalse(guest.licensed_audit(changed))
+
+    def test_activation_audit_expiry_unknowns_and_clock_types(self):
+        self.assertTrue(guest.licensed_audit(self.audit()))
+        for end, trusted in ((1793231999, None), (1793232001, 1793232002)):
+            changed = self.method_audit()
+            changed["after"].update(evaluation_end_utc=end, trusted_time_utc=trusted, evaluation_expired=True)
+            self.assertFalse(guest.licensed_audit(changed))
+        for key, replacement in (("guest_utc", None), ("guest_utc", False), ("evaluation_end_utc", 0),
+                                 ("trusted_time_utc", "private-text"), ("license_status", True), ("candidate_count", True)):
+            changed = self.method_audit(); changed["after"][key] = replacement
+            with self.assertRaises(guest.Failure): guest.activation_audit_projection(changed)
+        changed = self.method_audit(); changed["after"].update(evaluation_end_utc=1793231999, evaluation_expired=False)
+        self.assertFalse(guest.licensed_audit(changed))
+
+    def test_activation_audit_projection_rejects_unknown_text_and_keys(self):
+        audit = self.method_audit()
+        self.assertEqual(guest.activation_audit_projection(audit), audit)
+        for path in ((), ("after",), ("method_reply",), ("network", 0)):
+            changed = self.method_audit(); node = changed
+            for key in path: node = node[key]
+            node["private_text"] = "credential-secret"
+            with self.assertRaises(guest.Failure): guest.activation_audit_projection(changed)
+        for key in ("method_process_started", "method_process_completed", "same_product_verified", "licensed_status_confirmed"):
+            changed = self.method_audit(); changed[key] = 1
+            self.assertFalse(guest.licensed_audit(changed))
+
+    def test_activation_network_is_diagnostic_and_strictly_typed(self):
+        changed = self.method_audit()
+        changed["network"] = [dict(endpoint_id=i, dns_succeeded=False, tcp_succeeded=False, tls_succeeded=False,
+                                   error_hresult=-1) for i in (1, 2)]
+        self.assertTrue(guest.licensed_audit(changed))
+        for key, replacement in (("endpoint_id", True), ("dns_succeeded", 1), ("error_hresult", "private")):
+            broken = self.method_audit(); broken["network"][0][key] = replacement
+            self.assertFalse(guest.licensed_audit(broken))
+        broken = self.method_audit(); broken["network"][0]["dns_succeeded"] = False
+        self.assertFalse(guest.licensed_audit(broken))
+        broken = self.method_audit(); broken["network"].append(broken["network"][0])
+        self.assertFalse(guest.licensed_audit(broken))
+
+    def test_activation_preinvoke_guards_and_already_licensed(self):
+        changed = self.method_audit()
+        changed["method_reply"].update(invocation_started=False, invocation_returned=False, return_value=None, guard_code=1)
+        self.assertTrue(guest.licensed_audit(changed))
+        changed["method_reply"]["guard_code"] = 2
+        self.assertFalse(guest.licensed_audit(changed))
+        changed["method_reply"].update(guard_code=3, same_product_verified=False)
+        self.assertFalse(guest.licensed_audit(changed))
+        changed["method_reply"].update(guard_code=4, error_hresult=-1)
+        self.assertFalse(guest.licensed_audit(changed))
+        for changed in (None, True, {}, self.method_audit() | {"attempt_count": True}):
+            self.assertFalse(guest.licensed_audit(changed))
 
     def activation(self, iteration, step, code=0, count=-1, status=-1, reason=-1):
         return f"GUEST_ACTIVATION_V1 {iteration} {step} {code} {count} {status} {reason}\n".encode()

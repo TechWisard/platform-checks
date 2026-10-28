@@ -663,6 +663,106 @@ class SerialReader:
         return stages
 
 
+def activation_audit_projection(value):
+    """Validate and copy only bounded fixed fields; never forward provider text."""
+    if value is None:
+        return None
+    def shape(item, fields):
+        require(isinstance(item, dict) and set(item) == set(fields), "activation_audit_shape_invalid")
+    def integer(item, minimum, maximum):
+        return type(item) is int and minimum <= item <= maximum
+    def boolean(item):
+        return type(item) is bool
+    def nullable_int(item, minimum, maximum):
+        return item is None or integer(item, minimum, maximum)
+    def license_snapshot(item):
+        if item is None:
+            return None
+        names = ("candidate_count", "license_status", "license_status_reason", "grace_period_remaining",
+                 "evaluation_end_utc", "trusted_time_utc", "guest_utc", "evaluation_expired")
+        shape(item, names)
+        require(integer(item["candidate_count"], 0, 512) and integer(item["guest_utc"], 946684800, 4102444800),
+                "activation_license_identity_shape_invalid")
+        if item["candidate_count"] != 1:
+            require(type(item["license_status"]) is int and item["license_status"] == -1 and
+                    type(item["license_status_reason"]) is int and item["license_status_reason"] == -1 and
+                    all(item[key] is None for key in ("grace_period_remaining", "evaluation_end_utc", "trusted_time_utc", "evaluation_expired")),
+                    "activation_license_ambiguous_values")
+        else:
+            require(integer(item["license_status"], 0, 6) and integer(item["license_status_reason"], 0, 2**32 - 1) and
+                    nullable_int(item["grace_period_remaining"], 0, 2**32 - 1) and
+                    all(nullable_int(item[key], 1, 253402300799) for key in ("evaluation_end_utc", "trusted_time_utc")),
+                    "activation_license_numbers_invalid")
+            end, trusted = item["evaluation_end_utc"], item["trusted_time_utc"]
+            expired = None if end is None else end <= item["guest_utc"] or (trusted is not None and end <= trusted)
+            require(item["evaluation_expired"] is expired, "activation_evaluation_expiry_inconsistent")
+        return {key: item[key] for key in names}
+    fields = ("before", "after", "network", "attempt_count", "method_process_started", "method_process_completed",
+              "method_process_exit_code", "method_reply", "same_product_verified", "licensed_status_confirmed")
+    shape(value, fields)
+    require(integer(value["attempt_count"], 0, 1) and
+            all(boolean(value[key]) for key in ("method_process_started", "method_process_completed", "same_product_verified", "licensed_status_confirmed")) and
+            nullable_int(value["method_process_exit_code"], -(2**31), 2**31 - 1), "activation_audit_values_invalid")
+    before, after = license_snapshot(value["before"]), license_snapshot(value["after"])
+    network = value["network"]
+    if network is not None:
+        require(isinstance(network, list) and len(network) == 2, "activation_network_count_invalid")
+        copied = []
+        for index, item in enumerate(network, 1):
+            names = ("endpoint_id", "dns_succeeded", "tcp_succeeded", "tls_succeeded", "error_hresult")
+            shape(item, names)
+            require(type(item["endpoint_id"]) is int and item["endpoint_id"] == index and
+                    all(boolean(item[key]) for key in ("dns_succeeded", "tcp_succeeded", "tls_succeeded")) and
+                    nullable_int(item["error_hresult"], -(2**31), 2**31 - 1) and
+                    (not item["tls_succeeded"] or item["tcp_succeeded"]) and
+                    (not item["tcp_succeeded"] or item["dns_succeeded"]) and
+                    (item["error_hresult"] is not None or item["tls_succeeded"]), "activation_network_values_invalid")
+            copied.append({key: item[key] for key in names})
+        network = copied
+    reply = value["method_reply"]
+    if reply is not None:
+        names = ("invocation_started", "invocation_returned", "return_value", "error_hresult", "guard_code", "same_product_verified")
+        shape(reply, names)
+        require(all(boolean(reply[key]) for key in ("invocation_started", "invocation_returned", "same_product_verified")) and
+                integer(reply["guard_code"], 0, 4) and nullable_int(reply["return_value"], 0, 2**32 - 1) and
+                nullable_int(reply["error_hresult"], -(2**31), 2**31 - 1), "activation_method_values_invalid")
+        started, returned, guard, same = (reply[key] for key in ("invocation_started", "invocation_returned", "guard_code", "same_product_verified"))
+        rv, error = reply["return_value"], reply["error_hresult"]
+        require(not ((started and (guard != 0 or not same)) or (not started and returned) or (rv is not None and not returned) or
+                (not started and rv is not None) or (started and not returned and error is None) or
+                (returned and rv is None and error is None) or (guard == 4 and error is None) or
+                (guard in {1, 2} and (not same or started or error is not None)) or (guard == 3 and (same or started or error is not None)) or
+                (guard == 0 and not started)), "activation_method_reply_inconsistent")
+        reply = {key: reply[key] for key in names}
+    started, completed, code = (value[key] for key in ("method_process_started", "method_process_completed", "method_process_exit_code"))
+    require((not completed or started) and (completed == (code is not None)) and
+            (reply is None or (completed and code == 0)) and
+            (value["attempt_count"] != 0 or (not started and not completed and reply is None)), "activation_process_evidence_inconsistent")
+    return dict(before=before, after=after, network=network, attempt_count=value["attempt_count"],
+                method_process_started=started, method_process_completed=completed, method_process_exit_code=code,
+                method_reply=reply, same_product_verified=value["same_product_verified"], licensed_status_confirmed=value["licensed_status_confirmed"])
+
+
+def licensed_audit(value) -> bool:
+    try:
+        audit = activation_audit_projection(value)
+    except Failure:
+        return False
+    if audit is None or not audit["same_product_verified"] or not audit["licensed_status_confirmed"]:
+        return False
+    before, after = audit["before"], audit["after"]
+    if before is None or after is None or before["candidate_count"] != 1 or after["candidate_count"] != 1 or after["license_status"] != 1 or \
+            before["evaluation_expired"] is True or after["evaluation_expired"] is True:
+        return False
+    if audit["attempt_count"] == 0:
+        return before["license_status"] == 1 and before == after
+    reply = audit["method_reply"]
+    return (before["license_status"] != 1 and audit["network"] is not None and audit["method_process_started"] and
+            audit["method_process_completed"] and audit["method_process_exit_code"] == 0 and reply is not None and
+            reply["same_product_verified"] and reply["error_hresult"] is None and reply["guard_code"] in {0, 1} and
+            (not reply["invocation_started"] or reply["invocation_returned"]))
+
+
 def successful_result(value: dict) -> bool:
     required = ("guest_identity_verified", "elevated", "interactive_console_verified", "secure_boot_verified", "tpm2_verified",
                 "fixture_presentation_verified", "activation_licensed_observed", "offline_runtime_verified", "harness_compiled", "autologon_disabled",
@@ -677,7 +777,7 @@ def successful_result(value: dict) -> bool:
             isinstance(power, dict) and power.get("acquired") is True and power.get("cleanup_verified") is True and
             isinstance(activation, dict) and type(activation.get("candidate_count")) is int and activation["candidate_count"] == 1 and
             type(activation.get("license_status")) is int and activation["license_status"] == 1 and activation.get("step") == 7 and
-            isinstance(test, dict) and
+            licensed_audit(value.get("activation_audit")) and isinstance(test, dict) and
             all(test.get(key) is True for key in ("different_account_verified", "frame_challenge_verified", "direct_input_channel_verified")))
 
 
@@ -868,6 +968,8 @@ def execute(args) -> int:
                          "cleanup_unverified", "physical_input_isolation_verified", "native_multiseat_verified",
                          "test_exit_code", "test", "error_type", "failure_code", "error_hresult")
         public = {key: value[key] for key in public_fields if key in value}
+        if "activation_audit" in value:
+            public["activation_audit"] = activation_audit_projection(value["activation_audit"])
         emit("guest_result", result=public)
         outcome = 0 if setup_detached and successful_result(value) else 1
     finally:

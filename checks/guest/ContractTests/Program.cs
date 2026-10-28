@@ -1,8 +1,20 @@
 using System.Text.Json;
+using System.Security.Cryptography;
+using System.Text;
 using SessionContractExperiment;
 
 // Pure managed contracts only. No PowerShell, licensing query, Win32 call,
 // account, VM, serial device, screenshot, or product code is executed here.
+if (args.Length == 2 && args[0] == "--export-scripts")
+{
+    Directory.CreateDirectory(args[1]);
+    File.WriteAllText(Path.Combine(args[1], "query.ps1"), ActivationScripts.Query);
+    string syntheticDigest = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes("00000000-0000-0000-0000-000000000001")));
+    File.WriteAllText(Path.Combine(args[1], "activate.ps1"), ActivationScripts.Activate(syntheticDigest));
+    Console.WriteLine("exported_exact_compiled_scripts=2");
+    return;
+}
+if (args.Length != 0) throw new ArgumentException("unexpected_test_arguments");
 int passed = 0;
 void Check(bool value) { if (!value) throw new InvalidOperationException("contract_test_failed"); }
 void Reject(Action action)
@@ -71,6 +83,71 @@ foreach (string text in new[] {
     "{\"candidate_count\":2,\"license_status\":1,\"license_status_reason\":0}",
     "{\"candidate_count\":1,\"license_status\":1,\"license_status\":2,\"license_status_reason\":0}",
     new string('x', 4097), "true" }) Reject(() => ActivationSample.Parse(text));
+passed++;
+string Snapshot(int status = 5, int count = 1, string? end = "null", string? trusted = "null", string? digest = null) =>
+    JsonSerializer.Serialize(new Dictionary<string, object?>
+    {
+        ["candidate_count"] = count, ["license_status"] = count == 1 ? status : null,
+        ["license_status_reason"] = count == 1 ? 3221549065U : null,
+        ["grace_period_remaining"] = count == 1 ? 0U : null,
+        ["evaluation_end_utc"] = count == 1 && end != "null" ? long.Parse(end!) : null,
+        ["trusted_time_utc"] = count == 1 && trusted != "null" ? long.Parse(trusted!) : null,
+        ["guest_utc"] = 1793232000L, ["identity_digest"] = count == 1 ? digest ?? new string('A', 64) : null
+    });
+// Notification plus 0xC004F009 is not proof of an expired evaluation.
+LicensingSnapshot notification = LicensingSnapshot.Parse(Snapshot());
+Check(!notification.Licensed && notification.Evidence.EvaluationExpired is null && notification.Evidence.LicenseStatusReason == 3221549065L);
+Check(LicensingSnapshot.Parse(Snapshot(1)).Licensed);
+Check(!LicensingSnapshot.Parse(Snapshot(1, 0)).Licensed);
+Check(!LicensingSnapshot.Parse(Snapshot(1, 2)).Licensed);
+passed++;
+// Known expiration is distinct from missing date, future date, and trusted time.
+Check(LicensingSnapshot.Parse(Snapshot(1, end: "1793231999")).Evidence.EvaluationExpired == true);
+Check(!LicensingSnapshot.Parse(Snapshot(1, end: "1793231999")).Licensed);
+Check(LicensingSnapshot.Parse(Snapshot(1, end: "1793232100")).Evidence.EvaluationExpired == false);
+Check(LicensingSnapshot.Parse(Snapshot(1, end: "1793232100", trusted: "1793232101")).Evidence.EvaluationExpired == true);
+passed++;
+Check(notification.SameProduct(LicensingSnapshot.Parse(Snapshot(1))));
+Check(!notification.SameProduct(LicensingSnapshot.Parse(Snapshot(1, digest: new string('B', 64)))));
+Check(!notification.SameProduct(LicensingSnapshot.Parse(Snapshot(1, 0))));
+// Only the fixed evidence projection is public; digest is absent.
+string projected = JsonSerializer.Serialize(notification.Evidence);
+Check(!projected.Contains(new string('A', 64), StringComparison.Ordinal) && !projected.Contains("Identity", StringComparison.Ordinal));
+passed++;
+foreach (string text in new[] {
+    Snapshot().Replace("\"candidate_count\":1", "\"candidate_count\":true", StringComparison.Ordinal),
+    Snapshot().Replace("\"guest_utc\":1793232000", "\"guest_utc\":null", StringComparison.Ordinal),
+    Snapshot().Replace("\"guest_utc\":1793232000", "\"guest_utc\":0", StringComparison.Ordinal),
+    Snapshot().Replace("\"trusted_time_utc\":null", "\"trusted_time_utc\":true", StringComparison.Ordinal),
+    Snapshot().Replace("\"evaluation_end_utc\":null", "\"evaluation_end_utc\":-1", StringComparison.Ordinal),
+    Snapshot().Replace("\"license_status\":5", "\"license_status\":1,\"license_status\":5", StringComparison.Ordinal),
+    Snapshot(digest: "not-a-digest"), Snapshot(7), Snapshot().Replace("3221549065", "4294967296", StringComparison.Ordinal),
+    Snapshot().Replace("\"grace_period_remaining\":0", "\"grace_period_remaining\":false", StringComparison.Ordinal),
+    new string('x', 8193), "[]" }) Reject(() => LicensingSnapshot.Parse(text));
+passed++;
+string Reply(bool started, bool returned, uint? rv, int? error, int guard, bool same) =>
+    JsonSerializer.Serialize(new { invocation_started = started, invocation_returned = returned, return_value = rv,
+        error_hresult = error, guard_code = guard, same_product_verified = same });
+Check(ActivationMethodReply.Parse(Reply(true, true, 0, null, 0, true)).ReturnValue == 0);
+Check(ActivationMethodReply.Parse(Reply(true, false, null, -1, 0, true)).InvocationReturned == false);
+Check(!ActivationMethodReply.Parse(Reply(false, false, null, null, 1, true)).InvocationStarted);
+Check(!ActivationMethodReply.Parse(Reply(false, false, null, null, 2, true)).InvocationStarted);
+Check(!ActivationMethodReply.Parse(Reply(false, false, null, null, 3, false)).InvocationStarted);
+Check(!ActivationMethodReply.Parse(Reply(false, false, null, -1, 4, false)).InvocationStarted);
+passed++;
+foreach (string text in new[] {
+    Reply(true, true, 0, null, 0, false), Reply(true, false, 0, -1, 0, true),
+    Reply(false, true, 0, null, 1, true), Reply(true, false, null, null, 0, true),
+    Reply(false, false, null, null, 0, true), Reply(false, false, null, null, 4, false),
+    Reply(false, false, null, null, 2, false), Reply(false, false, null, null, 3, true),
+    Reply(true, true, 0, null, 0, true).Replace("\"guard_code\":0", "\"guard_code\":true", StringComparison.Ordinal) })
+    Reject(() => ActivationMethodReply.Parse(text));
+passed++;
+Reject(() => ActivationScripts.Activate("';unexpected-command"));
+Check(ActivationScripts.Activate(new string('A', 64)).Split("Invoke-CimMethod", StringSplitOptions.None).Length == 2);
+// A method reply carries no Licensed property; only an independently parsed
+// same-product snapshot can satisfy the supervisor's final gate.
+Check(!notification.Licensed);
 passed++;
 Console.WriteLine(JsonSerializer.Serialize(new { schema = "managed-contract-tests/v1", passed, failed = 0,
     windows_executed = false, activation_queried = false, guest_executed = false }));

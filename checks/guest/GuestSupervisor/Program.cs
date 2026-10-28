@@ -34,6 +34,7 @@ internal static class GuestSupervisor
         public bool CachedAnswerFilesAbsentVerified { get; set; }
         public bool ActivationLicensedObserved { get; set; }
         public ActivationObservation? ActivationObservation { get; set; }
+        public ActivationAudit? ActivationAudit { get; set; }
         public OwnedPowerRequest.Observation? PowerRequest { get; set; }
         public bool OfflineRuntimeVerified { get; set; }
         public bool HarnessCompiled { get; set; }
@@ -258,7 +259,9 @@ internal static class GuestSupervisor
             result.ErrorType = exception.GetType().Name;
             result.FailureCode = exception is GuestFailure failure ? failure.Code :
                 exception is OwnedAnswerFiles.Failure cached ? cached.Code : null;
-            result.ErrorHresult = exception.HResult;
+            result.ErrorHresult = exception is GuestFailure { CleanupUnverified: true, InnerException: { } cleanupError }
+                ? cleanupError.HResult : exception.HResult;
+            if (exception is GuestFailure { CleanupUnverified: true }) result.CleanupUnverified = true;
             if (result.Stage == "run_session_contract" && !result.HarnessCleanupVerified) result.CleanupUnverified = true;
         }
         finally
@@ -283,8 +286,11 @@ internal static class GuestSupervisor
         return result.Status == "verified" ? 0 : 1;
     }
 
-    private sealed class GuestFailure(string code) : Exception
-    { internal string Code { get; } = code; }
+    private sealed class GuestFailure(string code, bool cleanupUnverified = false, Exception? inner = null) : Exception(code, inner)
+    {
+        internal string Code { get; } = code;
+        internal bool CleanupUnverified { get; } = cleanupUnverified;
+    }
     private static void Require(bool condition, string stage)
     { if (!condition) throw new GuestFailure(stage); }
 
@@ -327,14 +333,12 @@ internal static class GuestSupervisor
 
     private static async Task<bool> ObserveActivation(SerialChannel serial, Result result)
     {
-        // The provider selects the installed primary Windows license. The key
-        // is a presence predicate only: its value, product names and IDs are
-        // never selected, read or emitted. No activation settings are changed.
-        const string query = "$ErrorActionPreference='Stop'; " +
-            "$p=@(Get-CimInstance -Query \"SELECT LicenseStatus,LicenseStatusReason FROM SoftwareLicensingProduct WHERE " +
-            "ApplicationID='55c92734-d682-4d71-983e-d6ec3f16059f' AND PartialProductKey IS NOT NULL AND LicenseIsAddon=FALSE\"); " +
-            "$s=$null;$r=$null;if($p.Count -eq 1){$s=$p[0].LicenseStatus;$r=$p[0].LicenseStatusReason};" +
-            "[ordered]@{candidate_count=$p.Count;license_status=$s;license_status_reason=$r}|ConvertTo-Json -Compress";
+        ActivationAudit audit = new();
+        void PublishAudit(ActivationAudit value)
+        {
+            Volatile.Write(ref audit, value);
+            result.ActivationAudit = value;
+        }
         ActivationObservation progress = new(0, 0, 0, -1, -1, -1);
         // Only immutable baseline evidence crosses to the watchdog thread.
         // It must never race serialization of the main thread's mutable Result.
@@ -352,6 +356,7 @@ internal static class GuestSupervisor
                 failure["cleanup_unverified"] = true;
                 failure["guest_work_directories_removed"] = false;
                 failure["activation_observation"] = JsonSerializer.SerializeToNode(Volatile.Read(ref progress), JsonOptions);
+                failure["activation_audit"] = JsonSerializer.SerializeToNode(Volatile.Read(ref audit), JsonOptions);
                 // A stuck UART must not make this dedicated deadline wait on
                 // the normal writer's lock. Host timeout remains independent.
                 serial.TryResult(JsonSerializer.SerializeToUtf8Bytes(failure, JsonOptions), TimeSpan.FromMilliseconds(100));
@@ -367,11 +372,10 @@ internal static class GuestSupervisor
             }
         }
         OperationWatchdog watchdog = new(TimeSpan.FromSeconds(240), StopOwnProcess);
-        Stopwatch watch = Stopwatch.StartNew();
         try
         {
             serial.Phase("awaiting_standard_activation");
-            for (int iteration = 1; iteration <= 18 && watch.Elapsed < TimeSpan.FromMinutes(3); iteration++)
+            async Task<LicensingSnapshot> Query(int iteration)
             {
                 void Report(int step, int code = 0, int count = -1, int status = -1, long reason = -1)
                 {
@@ -382,25 +386,85 @@ internal static class GuestSupervisor
                 }
                 try
                 {
-                    Report(0); // query operation started, before Process.Start
+                    Report(0);
                     (int code, string text) = await RunProcess(Path.Combine(Environment.SystemDirectory, @"WindowsPowerShell\v1.0\powershell.exe"),
-                        new[] { "-NoLogo", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", Encoded(query) },
+                        new[] { "-NoLogo", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", Encoded(ActivationScripts.Query) },
                         Environment.SystemDirectory, TimeSpan.FromSeconds(25), null, null, (step, number) => Report(step, number));
-                    Report(6, code); // query process and bounded output returned
+                    Report(6, code);
                     Require(code == 0, "activation_status_query_failed");
-                    ActivationSample sample = ActivationSample.Parse(text);
-                    Report(7, 0, sample.CandidateCount, sample.LicenseStatus, sample.LicenseStatusReason);
-                    Require(sample.CandidateCount <= 1, "activation_primary_license_ambiguous");
-                    if (sample.Licensed) return true;
+                    LicensingSnapshot snapshot = LicensingSnapshot.Parse(text);
+                    LicensingEvidence value = snapshot.Evidence;
+                    Report(7, 0, value.CandidateCount, value.LicenseStatus, value.LicenseStatusReason);
+                    return snapshot;
                 }
                 catch (Exception error)
                 {
-                    Report(8, error.HResult);
+                    // A diagnostic UART failure must not replace an owned-
+                    // process cleanup failure or its unverified-cleanup marker.
+                    try { Report(8, error.HResult); } catch { }
                     throw;
                 }
-                await Task.Delay(10000);
+            }
+            LicensingSnapshot before = await Query(1);
+            PublishAudit(audit with { Before = before.Evidence });
+            Require(before.Evidence.CandidateCount == 1, "activation_unique_primary_license_missing");
+            Require(before.Evidence.EvaluationExpired != true, "evaluation_expired_observed");
+            if (before.Licensed)
+            {
+                PublishAudit(audit with { After = before.Evidence, SameProductVerified = true, LicensedStatusConfirmed = true });
+                return true;
+            }
+            // Diagnostic-only connectivity uses default trust and no HTTP data.
+            // It neither supplies a license nor predicts the provider's route.
+            PublishAudit(audit with { Network = await ActivationNetwork.Observe() });
+            serial.Phase("activation_network_observed");
+            // One ordinary native activation attempt. No key, clock, activation
+            // server, policy, service, registry, rearm or trust change is made.
+            PublishAudit(audit with { AttemptCount = 1 });
+            serial.Phase("activation_method_started");
+            (int activationExit, string response) = await RunProcess(Path.Combine(Environment.SystemDirectory, @"WindowsPowerShell\v1.0\powershell.exe"),
+                new[] { "-NoLogo", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", Encoded(ActivationScripts.Activate(before.IdentityDigest!)) },
+                Environment.SystemDirectory, TimeSpan.FromSeconds(100), null, null,
+                (step, _) => { if (step == 2) PublishAudit(audit with { MethodProcessStarted = true }); });
+            PublishAudit(audit with { MethodProcessCompleted = true, MethodProcessExitCode = activationExit });
+            Require(activationExit == 0, "activation_method_process_failed");
+            ActivationMethodReply reply = ActivationMethodReply.Parse(response);
+            PublishAudit(audit with { MethodReply = reply });
+            serial.Phase("activation_method_returned");
+            Require(reply.GuardCode != 2, "evaluation_expired_before_activation");
+            Require(reply.GuardCode != 3, "activation_primary_product_changed");
+            Require(reply.GuardCode != 4, "activation_method_guard_failed");
+            Require(reply.SameProductVerified, "activation_method_identity_unverified");
+            if (reply.InvocationStarted && !reply.InvocationReturned)
+            {
+                result.CleanupUnverified = true;
+                throw new GuestFailure("activation_provider_completion_unverified");
+            }
+            Require(reply.ErrorHresult is null, "activation_method_reply_error");
+            // A zero method result never substitutes for a fresh status query
+            // on the exact same product. A second bounded query allows normal
+            // provider state propagation without retrying the activation call.
+            for (int iteration = 2; iteration <= 3; iteration++)
+            {
+                if (iteration == 3) await Task.Delay(5000);
+                LicensingSnapshot after = await Query(iteration);
+                bool same = before.SameProduct(after);
+                PublishAudit(audit with { After = after.Evidence, SameProductVerified = same,
+                    LicensedStatusConfirmed = same && after.Licensed });
+                Require(same, "activation_primary_product_changed");
+                Require(after.Evidence.EvaluationExpired != true, "evaluation_expired_after_activation");
+                if (after.Licensed) return true;
             }
             return false;
+        }
+        catch
+        {
+            // Missing/invalid replies cannot establish provider completion,
+            // even when our PowerShell process has been stopped and reaped.
+            if (audit.MethodProcessStarted && (audit.MethodReply is null ||
+                (audit.MethodReply.InvocationStarted && !audit.MethodReply.InvocationReturned)))
+                result.CleanupUnverified = true;
+            throw;
         }
         finally
         {
@@ -499,14 +563,28 @@ internal static class GuestSupervisor
             }
             await exited;
             progress?.Invoke(5, process.ExitCode); // actual process exit
-            string captured = await output.WaitAsync(TimeSpan.FromSeconds(5));
-            _ = await error.WaitAsync(TimeSpan.FromSeconds(5));
+            // Both pipe drains share the original operation deadline; a child
+            // retaining a pipe cannot silently add two further time budgets.
+            TimeSpan drainBudget = timeout - watch.Elapsed;
+            if (drainBudget <= TimeSpan.Zero) throw new TimeoutException("owned_process_output_timeout");
+            await Task.WhenAll(output, error).WaitAsync(drainBudget);
+            string captured = await output;
             return (process.ExitCode, captured);
         }
         catch
         {
-            if (!process.HasExited) process.Kill(entireProcessTree: true);
-            await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(10));
+            try
+            {
+                if (!process.HasExited) process.Kill(entireProcessTree: true);
+                await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(10));
+            }
+            catch (Exception cleanupError)
+            {
+                // This includes an initial licensing-query failure before the
+                // activation-method process exists. Main must never report
+                // cleanup verified when stopping/reaping an owned child failed.
+                throw new GuestFailure("owned_process_cleanup_unverified", true, cleanupError);
+            }
             throw;
         }
     }

@@ -1,5 +1,5 @@
 {
   "schema": "windows-guest-run-request/v1",
-  "request_id": "w11-ltsc-x64-20261028-activation-watchdog-power-diagnostics",
-  "previous_execution_commit": "7b220ae8953d5bfc109ccae202f2ae3f6520df98"
+  "request_id": "w11-ltsc-x64-20261029-native-activation-once",
+  "previous_execution_commit": "b7937e19ced8a2b505941b31e5ac06dbd746dff9"
 }
