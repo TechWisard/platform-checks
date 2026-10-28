@@ -11,6 +11,8 @@ on:
       - '.github/workflows/presentation.yml'
       - 'checks/guest/**'
       - '.github/workflows/windows-guest.yml'
+      - 'checks/ole/**'
+      - '.github/workflows/native-ole.yml'
   pull_request:
   workflow_dispatch:
 

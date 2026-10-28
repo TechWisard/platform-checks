@@ -1,0 +1,42 @@
+name: Native OLE host observation
+
+on:
+  push:
+    paths:
+      - 'checks/ole/**'
+      - '.github/workflows/native-ole.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-ole-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  observe:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-11-arm
+            architecture: ARM64
+          - runner: windows-2025
+            architecture: x64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Configure the isolated native host test
+        run: cmake -S checks/ole -B build/ole -A ${{ matrix.architecture }}
+      - name: Compile the isolated native host test
+        run: cmake --build build/ole --config Release --parallel 2
+      - name: Exercise in-place activation and resize without connecting
+        timeout-minutes: 1
+        shell: pwsh
+        run: |
+          & .\checks\ole\run.ps1 -Program .\build\ole\Release\native_ole_host_probe.exe
+          exit $LASTEXITCODE
