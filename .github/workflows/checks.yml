@@ -17,6 +17,8 @@ on:
       - '.github/workflows/native-component.yml'
       - 'checks/events/**'
       - '.github/workflows/native-events.yml'
+      - 'checks/input-contract/**'
+      - '.github/workflows/native-input-contract.yml'
   pull_request:
   workflow_dispatch:
 

@@ -1,0 +1,42 @@
+name: Native input interface contracts
+
+on:
+  push:
+    paths:
+      - 'checks/input-contract/**'
+      - '.github/workflows/native-input-contract.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-input-contract-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  observe:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-11-arm
+            architecture: ARM64
+          - runner: windows-2025
+            architecture: x64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Configure isolated metadata probe
+        run: cmake -S checks/input-contract -B build/input-contract -A ${{ matrix.architecture }}
+      - name: Compile isolated metadata probe
+        run: cmake --build build/input-contract --config Release --parallel 2
+      - name: Read installed contracts without sending input
+        timeout-minutes: 1
+        shell: pwsh
+        run: |
+          & .\checks\input-contract\run.ps1 -Executable .\build\input-contract\Release\input_contract.exe
+          exit $LASTEXITCODE
