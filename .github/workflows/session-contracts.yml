@@ -13,7 +13,7 @@ permissions:
 
 concurrency:
   group: session-contracts-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   environment:
@@ -32,10 +32,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Configure
+      - name: Configure independent probes
         run: cmake -S . -B build -A ${{ matrix.arch }}
       - name: Compile independent session and window probes
         run: cmake --build build --config Release --target win32_session_environment win32_window_calibration --parallel 2
+      - name: Configure first-logon preparation helper
+        run: cmake -S checks/session/first-logon -B build/first-logon -A ${{ matrix.arch }}
+      - name: Compile first-logon preparation helper
+        run: cmake --build build/first-logon --config Release --parallel 2
       - name: Query actual environment
         shell: pwsh
         run: |
@@ -49,35 +53,17 @@ jobs:
           exit $probeExit
       - name: Report .NET SDK
         run: dotnet --info
-      - name: Measure independent native own-window visibility
-        id: calibration
-        continue-on-error: true
-        timeout-minutes: 1
-        shell: pwsh
-        run: |
-          & .\checks\window\run.ps1 -Program .\build\Release\win32_window_calibration.exe
-          exit $LASTEXITCODE
-      - name: Exercise isolated account, session and frame contract
+      - name: Prepare owned desktop and require native calibration plus frame/input contract
+        timeout-minutes: 8
         shell: pwsh
         env:
           DOTNET_CLI_TELEMETRY_OPTOUT: '1'
           DOTNET_NOLOGO: '1'
           DOTNET_GENERATE_ASPNET_CERTIFICATE: 'false'
         run: |
-          & .\checks\session\child\run.ps1 -ResultsDirectory "$env:RUNNER_TEMP\session-contract-$env:GITHUB_RUN_ID" -AllowEnableChildSessions -AlternateTestAccount -TestDirectInput -TimeoutSeconds 120
-          $experimentExit = $LASTEXITCODE
-          "experiment_exit=$experimentExit"
-          if ($experimentExit -eq 77) {
-            "::notice::Child-session experiment unsupported in this environment; no functional pass."
-            exit 0
-          }
-          exit $experimentExit
-      - name: Require the native calibration result
-        if: ${{ always() && !cancelled() }}
-        shell: pwsh
-        env:
-          CALIBRATION_OUTCOME: ${{ steps.calibration.outcome }}
-        run: |
-          if ($env:CALIBRATION_OUTCOME -ne 'success') {
-            throw 'The independent native window calibration did not pass; inspect its measured result.'
-          }
+          & .\checks\session\first-logon\run-prepared.ps1 `
+            -PreparationProgram .\build\first-logon\Release\first_logon_prepare.exe `
+            -CalibrationProgram .\build\Release\win32_window_calibration.exe `
+            -ResultsDirectory "$env:RUNNER_TEMP\session-contract-$env:GITHUB_RUN_ID" `
+            -AllowDisposablePrivacyPreparation -TimeoutSeconds 120
+          exit $LASTEXITCODE

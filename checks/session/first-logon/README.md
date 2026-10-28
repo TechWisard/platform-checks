@@ -1,0 +1,125 @@
+# Disposable first-logon preparation
+
+This is a separate, explicitly opted-in CI helper. It completes only the exact
+privacy page previously observed on an owned disposable GitHub-hosted Windows
+runner. It is not a general OOBE, login, activation, credential or popup handler.
+It creates no windows and performs no action unless the fixed checks below
+succeed. It does not change the original read-only presentation probe.
+
+## Native helper contract
+
+`first_logon_prepare.exe --allow-disposable-privacy-preparation` requires all
+three hosted Windows environment markers and a nonzero active console session
+matching the calling process. It verifies an active `Default` input desktop.
+
+For an actionable page, the foreground root must have:
+
+- The exact class `Windows.UI.Core.CoreWindow`.
+- Package family `Microsoft.Windows.CloudExperienceHost_cw5n1h2txyewy`.
+- Application ID `Microsoft.Windows.CloudExperienceHost_cw5n1h2txyewy!App`.
+- A process and thread belonging to the caller's active session, with the
+  process handle retained through the operation.
+- At least one exact, visible text heading `Choose privacy settings for your
+  device` (bounded at eight matches).
+- Exactly one visible, enabled, non-password `UIA_ButtonControlTypeId` element
+  with `AutomationId` equal to `OobeSettingsAcceptButton` and an Invoke pattern.
+
+UI Automation searches only that verified window. Conditions filter the fixed
+heading and button in the provider; unrelated names and values are not read.
+The helper obtains a second fresh page snapshot, compares button identity, and
+rechecks foreground, process, thread, package, application ID and active session
+immediately before one normal `IUIAutomationInvokePattern::Invoke` call.
+
+No switch values are toggled. The action accepts the privacy settings currently
+shown by the verified page. A missing/changed page, a duplicate or disabled
+button, an owner change or an API failure stops the helper. There is no second
+Invoke, fallback button, key injection, focus request, process kill or window
+close directed at Windows UI.
+
+After the one Invoke, the helper waits for the observed page HWND to become
+hidden or cease to exist. It also requires the active Default input desktop,
+an actual same-session Explorer shell and an ordinary foreground: that shell,
+a known Explorer window class in its process, or the helper's own associated
+console. Five consecutive observations, separated by 250 ms, are required.
+Unknown foreground UI is not treated as ordinary desktop readiness.
+The wrapper uses `CreateNoWindow=true`; consequently this helper normally has
+no associated console HWND. A pre-existing runner console in the foreground
+may therefore produce `ordinary_desktop_timeout` rather than `not_needed`.
+The helper does not broaden its ownership rule to guess that console's identity.
+
+If the initial foreground is not the CloudExperienceHost package, **no UI action
+is performed**. `not_needed` is returned only after the same ordinary-parent-
+desktop checks. It makes no assertion that a future child session has no pages.
+
+The native helper uses an MTA thread without its own windows. UI Automation
+connection and transaction timeouts are one second. The overall observation
+budget is 32 seconds. A synchronous provider may still block, so the wrapper
+adds a 40-second process wait and at most one three-second stop wait, within a
+45-second outer bound. Only the process tree created by that wrapper is stopped.
+Forced termination is reported as failure and cannot prove native cleanup.
+
+Output consists only of a bounded JSON record with fixed status labels, numeric
+counts and HRESULTs, and booleans. No arbitrary UI text, user/domain/SID,
+credentials, window handles, screenshots, or process paths are emitted. The
+exact Explorer image path is used transiently only to check the basename and
+its buffer is cleared. UI text values or credential fields are not inspected.
+
+Exit 0 means `completed` or `not_needed` with the stated parent-desktop
+observations and cleanup. Exit 1 means the preparation did not establish those
+conditions. Remote pixels, input channels, session functionality and physical
+isolation are always reported as unverified.
+
+## Policy lifetime and strict downstream gates
+
+`run-prepared.ps1` additionally requires
+`-AllowDisposablePrivacyPreparation`. Before the helper and before any fresh B
+account, it reads both existing policy values, their exact Registry64 kinds,
+and unexpanded data; then sets only:
+
+| Registry64 key under HKLM | Value | Temporary DWORD |
+|---|---|---:|
+| `SOFTWARE\Policies\Microsoft\Windows\OOBE` | `DisablePrivacyExperience` | 1 |
+| `SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System` | `EnableFirstLogonAnimation` | 0 |
+
+Both snapshots are completed before either write. The wrapper verifies writes,
+requires native preparation, then requires the unchanged independent native
+window calibration. It rechecks the two policy values before starting the
+existing child runner with `-AlternateTestAccount -TestDirectInput`.
+Calibration failure prevents the child experiment; neither gate is weakened.
+
+The calibration and child runner execute as owned PowerShell subprocesses, so
+their `exit` statements cannot leave the policy wrapper's `finally` scope.
+That one `finally` covers all preparation, calibration and experiment failures.
+Each policy restoration runs independently. Original values are restored with
+the original kind and unexpanded contents; originally absent values are
+deleted. Fresh readback must match before `policy_values_restored` becomes true.
+Snapshots and their contents are not printed or written to files.
+
+Restoration concerns the two named values. An originally absent leaf registry
+key may remain empty; the script never deletes a registry tree or unrelated
+values. Native test/account cleanup remains the existing harness's separately
+reported responsibility. External runner loss can prevent `finally`; absence
+of a final restoration report is not evidence of cleanup.
+
+The workflow disables cancellation of an earlier running job on push
+(`cancel-in-progress: false`). It does not alter authentication, certificates,
+RDP security, licensing, activation, Secure Boot, TPM, or driver settings.
+
+## Workflow integration
+
+The session-contracts workflow builds this helper separately and encloses
+the existing native calibration and child experiment in the prepared wrapper.
+Source compilation and script validation passed locally. This revision has
+not yet completed its first Windows runtime execution.
+
+## Primary contracts and observed-page provenance
+
+- Exact page observation: [run 40695413656, job 122840761797](https://github.com/TechWisard/platform-checks/actions/runs/40695413656/job/122840761797), commit `da86cbf68d3303e70d4d46525f4881bd71bb0750`.
+- [UI Automation Invoke](https://learn.microsoft.com/en-us/windows/win32/api/uiautomationclient/nf-uiautomationclient-iuiautomationinvokepattern-invoke).
+- [UI Automation threading](https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-threading).
+- [DisablePrivacyExperience](https://learn.microsoft.com/en-us/windows/client-management/mdm/policy-csp-privacy#disableprivacyexperience).
+- [EnableFirstLogonAnimation](https://learn.microsoft.com/en-us/windows/client-management/mdm/policy-csp-windowslogon#enablefirstlogonanimation).
+
+The button ID and heading are runtime observations from that page, not a claim
+that every Windows build or language exposes this UI contract. A mismatch fails
+without an alternative UI action.
