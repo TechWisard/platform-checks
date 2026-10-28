@@ -312,6 +312,7 @@ internal sealed class ExperimentForm : Form
     private string parentSid = "";
     private object? control;
     private ExtendedSettings? extended;
+    private RdpConnectionEvents? connectionEvents;
     private dynamic? taskFolder;
     private dynamic? registeredTask;
     private bool ownTask;
@@ -361,6 +362,7 @@ internal sealed class ExperimentForm : Form
                 evidence.EnableChanged = true;
             }
             control = host.ControlObject;
+            connectionEvents = new RdpConnectionEvents(control, evidence.Event);
             extended = new ExtendedSettings(control, evidence.Event);
             evidence.Event("extended_settings_typelib_verified", new { put_slot = extended.PutSlot, get_slot = extended.GetSlot });
             Dispatch.Set(control, "Server", "localhost");
@@ -373,6 +375,13 @@ internal sealed class ExperimentForm : Form
             bool credSspAfter = Convert.ToBoolean(Dispatch.Get(advanced, "EnableCredSspSupport"), CultureInfo.InvariantCulture);
             evidence.Event("connection_credssp", new { before = credSspBefore, after = credSspAfter });
             if (!credSspAfter) throw new ExperimentFailure("connection_credssp_not_enabled");
+            int authenticationBefore = Convert.ToInt32(Dispatch.Get(advanced, "AuthenticationLevel"), CultureInfo.InvariantCulture);
+            // Require server authentication. Value 1 fails instead of asking the
+            // unattended host to continue after an authentication failure.
+            Dispatch.Set(advanced, "AuthenticationLevel", 1);
+            int authenticationAfter = Convert.ToInt32(Dispatch.Get(advanced, "AuthenticationLevel"), CultureInfo.InvariantCulture);
+            evidence.Event("server_authentication_required", new { before = authenticationBefore, after = authenticationAfter });
+            if (authenticationAfter != 1) throw new ExperimentFailure("server_authentication_requirement_not_set");
             foreach (string property in new[] { "RedirectClipboard", "RedirectDrives", "RedirectPrinters", "RedirectPorts", "RedirectSmartCards" })
                 Dispatch.Set(advanced, property, false);
             extended.Set("ConnectToChildSession", true);
@@ -389,10 +398,13 @@ internal sealed class ExperimentForm : Form
             Stopwatch deadline = Stopwatch.StartNew();
             evidence.ConnectCalled = true;
             evidence.Event("connect_invocation_started");
+            connectionEvents.Arm();
             Dispatch.Call(control, "Connect");
             evidence.Event("connect_called");
+            connectionEvents.ThrowIfConnectionFailed();
             while (deadline.Elapsed < timeout)
             {
+                connectionEvents.ThrowIfConnectionFailed();
                 uint id = Native.ChildId();
                 if (id != Native.NoSession)
                 {
@@ -431,6 +443,7 @@ internal sealed class ExperimentForm : Form
             bool witnessVerified = false;
             while (deadline.Elapsed < timeout)
             {
+                connectionEvents.ThrowIfConnectionFailed();
                 if (!evidence.ParentAndChildActive || Native.State(evidence.ParentSessionId) != 0 ||
                     Native.State(evidence.ChildSessionId!.Value) != 0)
                     throw new ExperimentFailure("parallel_session_lost");
@@ -543,6 +556,8 @@ internal sealed class ExperimentForm : Form
     private async Task Cleanup()
     {
         bool cleanupFailed = false;
+        try { connectionEvents?.BeginCleanup(); }
+        catch (Exception ex) { evidence.Error("event_cleanup_start_failed", ex); cleanupFailed = true; }
         if (ownTask)
         {
             try
@@ -621,6 +636,8 @@ internal sealed class ExperimentForm : Form
             if (preconditions && !evidence.ConsoleSessionUnchanged) throw new ExperimentFailure("console_session_changed_after_cleanup");
         }
         catch (Exception ex) { evidence.Error("parent_cleanup_check_failed", ex); cleanupFailed = true; }
+        try { connectionEvents?.Dispose(); }
+        catch (Exception ex) { evidence.Error("event_cleanup_failed", ex); cleanupFailed = true; }
         extended?.Dispose();
         try { if (Directory.Exists(work)) Directory.Delete(work, true); }
         catch (Exception ex) { evidence.Error("temporary_files_cleanup_failed", ex); cleanupFailed = true; }
