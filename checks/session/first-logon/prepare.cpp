@@ -18,6 +18,8 @@
 namespace {
 constexpr wchar_t TargetFamily[] = L"Microsoft.Windows.CloudExperienceHost_cw5n1h2txyewy";
 constexpr wchar_t TargetApplication[] = L"Microsoft.Windows.CloudExperienceHost_cw5n1h2txyewy!App";
+constexpr wchar_t SearchFamily[] = L"MicrosoftWindows.Client.CBS_cw5n1h2txyewy";
+constexpr wchar_t SearchApplication[] = L"MicrosoftWindows.Client.CBS_cw5n1h2txyewy!CortanaUI";
 constexpr wchar_t TargetClass[] = L"Windows.UI.Core.CoreWindow";
 constexpr wchar_t PrivacyHeading[] = L"Choose privacy settings for your device";
 constexpr wchar_t AcceptId[] = L"OobeSettingsAcceptButton";
@@ -33,6 +35,9 @@ constexpr const wchar_t* KnownHeadings[]{PrivacyHeading, L"Privacy settings", L"
 constexpr const wchar_t* KnownButtonLabels[]{L"Accept", L"Next", L"Back", L"Yes", L"No", L"More", L"Continue",
     L"Done", L"OK", L"Cancel", L"Learn more", L"Save", L"Try again", L"Retry", L"Skip for now", L"Sign in",
     L"Use recommended settings"};
+constexpr const wchar_t* SearchNames[]{L"Search", L"Type here to search", L"Type to search", L"Search highlights",
+    L"All", L"Apps", L"Documents", L"Settings"};
+constexpr const wchar_t* DismissNames[]{L"Close", L"Back", L"Cancel"};
 struct ButtonLabel {
     const char* status{"not_read"};
     HRESULT error{S_OK};
@@ -50,17 +55,34 @@ struct PostPage {
     ButtonLabel label;
     PostPage() { headings.fill(-1); known_buttons.fill(-1); }
 };
+struct DismissButton {
+    int count{-1};
+    bool identity_verified{}, enabled{}, offscreen{true}, invoke_available{}, id_read{}, id_safe{};
+    HRESULT invoke_error{S_OK}, id_error{S_OK};
+    std::array<char, 129> automation_id{};
+};
+struct SearchPage {
+    const char* stage{"not_attempted"};
+    HRESULT error{S_OK}, window_pattern_error{S_OK}, interaction_error{S_OK}, modal_error{S_OK}, topmost_error{S_OK};
+    bool attempted{}, owner_verified{}, owner_stable{}, root_verified{}, completed{}, window_pattern_available{};
+    bool modal{}, topmost{};
+    int root_control_type{}, interaction_state{-1};
+    std::array<int, sizeof(SearchNames) / sizeof(SearchNames[0])> name_counts{};
+    std::array<DismissButton, sizeof(DismissNames) / sizeof(DismissNames[0])> buttons;
+    SearchPage() { name_counts.fill(-1); }
+};
 struct FreshForeground {
     const char* stage{"not_attempted"};
     HRESULT error{S_OK}, class_error{S_OK}, package_error{S_OK}, application_error{S_OK};
     ULONGLONG after_second_ms{}, elapsed_ms{};
     bool attempted{}, active_desktop_verified{}, original_target_destroyed{}, owner_verified{}, owner_stable{};
     bool class_read{}, package_read{}, application_read{}, class_safe{}, package_safe{}, application_safe{};
-    bool exact_cloud_identity{}, content_attempted{};
+    bool exact_cloud_identity{}, exact_search_identity{}, content_attempted{};
     unsigned class_category{}, package_category{}, application_category{};
     std::array<char, 129> class_identifier{};
     std::array<char, 257> package_identifier{}, application_identifier{};
     PostPage page;
+    SearchPage search_page;
 };
 struct SecondAction {
     const char* stage{"not_attempted"};
@@ -561,6 +583,113 @@ void verify_fresh_foreground(HWND root, DWORD owner, DWORD thread, HANDLE proces
         GetProcessId(process) == owner && GetExitCodeProcess(process, &exit_code) != FALSE && exit_code == STILL_ACTIVE,
         "fresh_foreground_owner_changed");
 }
+void verify_search_target(HWND root, DWORD owner, DWORD thread, HANDLE process, Result& out) {
+    verify_fresh_foreground(root, owner, thread, process, out);
+    need(class_equals(root, TargetClass), "search_target_class");
+    std::array<wchar_t, 257> family{}, app{}; UINT32 family_size = static_cast<UINT32>(family.size());
+    const LONG family_result = GetPackageFamilyName(process, &family_size, family.data());
+    need(family_result == ERROR_SUCCESS && family_size > 1 && family_size <= family.size() &&
+        family[family_size - 1] == L'\0' && std::wcscmp(family.data(), SearchFamily) == 0,
+        "search_target_family", family_result == ERROR_SUCCESS ? E_UNEXPECTED : HRESULT_FROM_WIN32(family_result));
+    UINT32 app_size = static_cast<UINT32>(app.size());
+    const LONG app_result = GetApplicationUserModelId(process, &app_size, app.data());
+    need(app_result == ERROR_SUCCESS && app_size > 1 && app_size <= app.size() && app[app_size - 1] == L'\0' &&
+        std::wcscmp(app.data(), SearchApplication) == 0, "search_target_application",
+        app_result == ERROR_SUCCESS ? E_UNEXPECTED : HRESULT_FROM_WIN32(app_result));
+}
+Com<IUIAutomationElementArray> fixed_search_name(IUIAutomation2* automation, IUIAutomationElement* root,
+    DWORD owner, const wchar_t* name, bool button, ULONGLONG end) {
+    need(owner <= static_cast<DWORD>(INT_MAX), "search_process_range");
+    std::array<Com<IUIAutomationCondition>, 5> conditions{
+        number_property(automation, UIA_ProcessIdPropertyId, static_cast<int>(owner), end),
+        bool_property(automation, UIA_IsPasswordPropertyId, false, end),
+        bool_property(automation, UIA_IsOffscreenPropertyId, false, end),
+        text_property(automation, UIA_NamePropertyId, name, end),
+        number_property(automation, UIA_ControlTypePropertyId, UIA_ButtonControlTypeId, end)};
+    std::array<IUIAutomationCondition*, 5> raw{};
+    for (std::size_t index = 0; index < raw.size(); ++index) raw[index] = conditions[index].get();
+    Com<IUIAutomationCondition> combined; Com<IUIAutomationElementArray> elements;
+    budget(end); hr(automation->CreateAndConditionFromNativeArray(raw.data(), button ? 5 : 4, combined.put()), "search_name_condition");
+    const auto subtree = static_cast<TreeScope>(TreeScope_Element | TreeScope_Children | TreeScope_Descendants);
+    budget(end); hr(root->FindAll(subtree, combined.get(), elements.put()), "search_fixed_name");
+    need(elements.get() != nullptr, "search_null_elements"); return elements;
+}
+SearchPage observe_search_page(HWND window, DWORD owner, DWORD thread, HANDLE process, ULONGLONG end, Result& out) {
+    SearchPage observation; observation.attempted = true;
+    try {
+        budget(end); verify_search_target(window, owner, thread, process, out); observation.owner_verified = true;
+        Apartment apartment(out); Com<IUIAutomation2> automation; Com<IUIAutomationElement> root;
+        hr(CoCreateInstance(__uuidof(CUIAutomation8), nullptr, CLSCTX_INPROC_SERVER,
+            __uuidof(IUIAutomation2), reinterpret_cast<void**>(automation.put())), "search_automation_create");
+        need(automation.get() != nullptr, "search_automation_null");
+        hr(automation->put_AutoSetFocus(FALSE), "search_no_focus");
+        hr(automation->put_ConnectionTimeout(1000), "search_connection_timeout");
+        hr(automation->put_TransactionTimeout(1000), "search_transaction_timeout");
+        budget(end); hr(automation->ElementFromHandle(window, root.put()), "search_root");
+        need(root.get() != nullptr, "search_null_root");
+        UIA_HWND native{}; int root_owner{};
+        budget(end); hr(root->get_CurrentNativeWindowHandle(&native), "search_root_handle");
+        budget(end); hr(root->get_CurrentProcessId(&root_owner), "search_root_owner");
+        need(native == window && root_owner > 0 && static_cast<DWORD>(root_owner) == owner, "search_root_identity");
+        observation.root_verified = true;
+        budget(end); hr(root->get_CurrentControlType(&observation.root_control_type), "search_root_control_type");
+        Com<IUIAutomationWindowPattern> window_pattern;
+        budget(end); observation.window_pattern_error = root->GetCurrentPatternAs(UIA_WindowPatternId,
+            __uuidof(IUIAutomationWindowPattern), reinterpret_cast<void**>(window_pattern.put()));
+        observation.window_pattern_available = SUCCEEDED(observation.window_pattern_error) && window_pattern.get() != nullptr;
+        if (observation.window_pattern_available) {
+            WindowInteractionState interaction{}; BOOL modal{}, topmost{};
+            budget(end); observation.interaction_error = window_pattern->get_CurrentWindowInteractionState(&interaction);
+            if (SUCCEEDED(observation.interaction_error)) observation.interaction_state = static_cast<int>(interaction);
+            budget(end); observation.modal_error = window_pattern->get_CurrentIsModal(&modal);
+            budget(end); observation.topmost_error = window_pattern->get_CurrentIsTopmost(&topmost);
+            observation.modal = modal != FALSE; observation.topmost = topmost != FALSE;
+        }
+        for (std::size_t index = 0; index < observation.name_counts.size(); ++index) {
+            auto elements = fixed_search_name(automation.get(), root.get(), owner, SearchNames[index], false, end);
+            budget(end); hr(elements->get_Length(&observation.name_counts[index]), "search_name_count");
+            need(observation.name_counts[index] >= 0 && observation.name_counts[index] <= 8, "search_name_count_bound");
+        }
+        for (std::size_t index = 0; index < observation.buttons.size(); ++index) {
+            auto& metadata = observation.buttons[index];
+            auto elements = fixed_search_name(automation.get(), root.get(), owner, DismissNames[index], true, end);
+            budget(end); hr(elements->get_Length(&metadata.count), "search_button_count");
+            need(metadata.count >= 0 && metadata.count <= 8, "search_button_count_bound");
+            if (metadata.count != 1) continue;
+            Com<IUIAutomationElement> button;
+            budget(end); hr(elements->GetElement(0, button.put()), "search_button_element");
+            need(button.get() != nullptr, "search_null_button");
+            int actual_owner{}, type{}; BOOL password = TRUE, enabled = FALSE, offscreen = TRUE;
+            budget(end); hr(button->get_CurrentProcessId(&actual_owner), "search_button_owner");
+            budget(end); hr(button->get_CurrentControlType(&type), "search_button_type");
+            budget(end); hr(button->get_CurrentIsPassword(&password), "search_button_password");
+            need(actual_owner > 0 && static_cast<DWORD>(actual_owner) == owner && type == UIA_ButtonControlTypeId &&
+                !password, "search_button_identity");
+            metadata.identity_verified = true;
+            budget(end); hr(button->get_CurrentIsEnabled(&enabled), "search_button_enabled");
+            budget(end); hr(button->get_CurrentIsOffscreen(&offscreen), "search_button_offscreen");
+            metadata.enabled = enabled != FALSE; metadata.offscreen = offscreen != FALSE;
+            Text id; budget(end); metadata.id_error = button->get_CurrentAutomationId(&id.value);
+            metadata.id_read = SUCCEEDED(metadata.id_error);
+            if (metadata.id_read) metadata.id_safe = safe_identifier(id.value, id.value ? SysStringLen(id.value) : 0,
+                metadata.automation_id, false);
+            Com<IUIAutomationInvokePattern> pattern;
+            budget(end); metadata.invoke_error = button->GetCurrentPatternAs(UIA_InvokePatternId,
+                __uuidof(IUIAutomationInvokePattern), reinterpret_cast<void**>(pattern.put()));
+            metadata.invoke_available = SUCCEEDED(metadata.invoke_error) && pattern.get() != nullptr;
+        }
+        observation.completed = true; observation.stage = "completed";
+    } catch (const Failure& failure) { observation.stage = failure.stage; observation.error = failure.result; }
+    catch (...) { observation.stage = "search_observation_exception"; observation.error = E_UNEXPECTED; }
+    if (observation.owner_verified) {
+        try { verify_search_target(window, owner, thread, process, out); observation.owner_stable = true; }
+        catch (const Failure& failure) {
+            observation = SearchPage{}; observation.attempted = true;
+            observation.stage = failure.stage; observation.error = failure.result;
+        }
+    }
+    return observation; // No WindowPattern.Close, Invoke, focus, input or value reads.
+}
 FreshForeground observe_fresh_foreground(HWND original, ULONGLONG second_completed, ULONGLONG end, Result& out) {
     const ULONGLONG started = GetTickCount64(); FreshForeground observation;
     observation.attempted = true; observation.after_second_ms = started - second_completed;
@@ -583,20 +712,28 @@ FreshForeground observe_fresh_foreground(HWND original, ULONGLONG second_complet
             else if (family_result == ERROR_SUCCESS && family_size > 1 && family_size <= family.size() && family[family_size - 1] == L'\0') {
                 observation.package_read = true;
                 observation.package_safe = safe_identifier(family.data(), family_size - 1, observation.package_identifier, true);
-                observation.package_category = std::wcscmp(family.data(), TargetFamily) == 0 ? 2U : 3U;
+                observation.package_category = std::wcscmp(family.data(), TargetFamily) == 0 ? 2U :
+                    (std::wcscmp(family.data(), SearchFamily) == 0 ? 4U : 3U);
             } else observation.package_error = family_result == ERROR_SUCCESS ? E_UNEXPECTED : HRESULT_FROM_WIN32(family_result);
             UINT32 app_size = static_cast<UINT32>(app.size());
             budget(end); const LONG app_result = GetApplicationUserModelId(process.value, &app_size, app.data());
             if (app_result == ERROR_SUCCESS && app_size > 1 && app_size <= app.size() && app[app_size - 1] == L'\0') {
                 observation.application_read = true;
                 observation.application_safe = safe_identifier(app.data(), app_size - 1, observation.application_identifier, true);
-                observation.application_category = std::wcscmp(app.data(), TargetApplication) == 0 ? 2U : 3U;
+                observation.application_category = std::wcscmp(app.data(), TargetApplication) == 0 ? 2U :
+                    (std::wcscmp(app.data(), SearchApplication) == 0 ? 4U : 3U);
             } else observation.application_error = app_result == ERROR_SUCCESS ? E_UNEXPECTED : HRESULT_FROM_WIN32(app_result);
             observation.exact_cloud_identity = observation.class_category == 6 && observation.package_category == 2 &&
                 observation.application_category == 2;
+            observation.exact_search_identity = observation.class_category == 6 && observation.package_category == 4 &&
+                observation.application_category == 4;
             if (observation.exact_cloud_identity) {
                 observation.content_attempted = true;
                 observation.page = observe_after_invoke(root, owner, thread, process.value, end, out, true);
+            }
+            if (observation.exact_search_identity) {
+                observation.content_attempted = true;
+                observation.search_page = observe_search_page(root, owner, thread, process.value, end, out);
             }
         } catch (const Failure& failure) { observation.stage = failure.stage; observation.error = failure.result; }
         catch (...) { observation.stage = "fresh_content_exception"; observation.error = E_UNEXPECTED; }
@@ -607,7 +744,9 @@ FreshForeground observe_fresh_foreground(HWND original, ULONGLONG second_complet
             observation.stage = failure.stage; observation.error = failure.result;
         }
         if (observation.owner_stable && SUCCEEDED(observation.error)) observation.stage = observation.exact_cloud_identity ?
-            (observation.page.completed ? "cloud_page_observed" : "cloud_page_unavailable") : "other_foreground_observed";
+            (observation.page.completed ? "cloud_page_observed" : "cloud_page_unavailable") :
+            (observation.exact_search_identity ? (observation.search_page.completed ? "search_page_observed" : "search_page_unavailable") :
+             "other_foreground_observed");
     } catch (const Failure& failure) { observation.stage = failure.stage; observation.error = failure.result; }
     catch (...) { observation.stage = "fresh_unexpected_exception"; observation.error = E_UNEXPECTED; }
     observation.after_second_ms = started - second_completed; observation.elapsed_ms = GetTickCount64() - started;
@@ -698,6 +837,29 @@ void write_page(const PostPage& page) {
     write_counts(page.headings); std::cout << ",\"known_button_label_counts\":"; write_counts(page.known_buttons);
     std::cout << ",\"button_label\":"; write_label(page.label); std::cout << '}';
 }
+void write_search_page(const SearchPage& page) {
+    std::cout << "{\"attempted\":" << page.attempted << ",\"stage\":\"" << page.stage
+        << "\",\"hresult\":" << static_cast<std::uint32_t>(page.error) << ",\"owner_verified\":" << page.owner_verified
+        << ",\"owner_stable\":" << page.owner_stable << ",\"root_verified\":" << page.root_verified
+        << ",\"completed\":" << page.completed << ",\"root_control_type\":" << page.root_control_type
+        << ",\"window_pattern_available\":" << page.window_pattern_available
+        << ",\"window_pattern_hresult\":" << static_cast<std::uint32_t>(page.window_pattern_error)
+        << ",\"interaction_state\":" << page.interaction_state << ",\"interaction_hresult\":" << static_cast<std::uint32_t>(page.interaction_error)
+        << ",\"modal\":" << page.modal << ",\"modal_hresult\":" << static_cast<std::uint32_t>(page.modal_error)
+        << ",\"topmost\":" << page.topmost << ",\"topmost_hresult\":" << static_cast<std::uint32_t>(page.topmost_error)
+        << ",\"fixed_name_counts\":";
+    write_counts(page.name_counts); std::cout << ",\"buttons\":[";
+    for (std::size_t index = 0; index < page.buttons.size(); ++index) {
+        if (index) std::cout << ',';
+        const auto& button = page.buttons[index];
+        std::cout << "{\"label_index\":" << index << ",\"count\":" << button.count << ",\"identity_verified\":" << button.identity_verified
+            << ",\"enabled\":" << button.enabled << ",\"offscreen\":" << button.offscreen << ",\"invoke_available\":" << button.invoke_available
+            << ",\"invoke_hresult\":" << static_cast<std::uint32_t>(button.invoke_error) << ",\"automation_id_read\":" << button.id_read
+            << ",\"automation_id_safe\":" << button.id_safe << ",\"automation_id_hresult\":" << static_cast<std::uint32_t>(button.id_error)
+            << ",\"automation_id\":\"" << button.automation_id.data() << "\"}";
+    }
+    std::cout << "]}";
+}
 void write_fresh(const FreshForeground& fresh) {
     std::cout << "{\"attempted\":" << fresh.attempted << ",\"stage\":\"" << fresh.stage
         << "\",\"hresult\":" << static_cast<std::uint32_t>(fresh.error) << ",\"after_second_ms\":" << fresh.after_second_ms
@@ -713,8 +875,8 @@ void write_fresh(const FreshForeground& fresh) {
         << ",\"package_identifier_safe\":" << fresh.package_safe << ",\"application_identifier_safe\":" << fresh.application_safe
         << ",\"class_identifier\":\"" << fresh.class_identifier.data() << "\",\"package_family\":\"" << fresh.package_identifier.data()
         << "\",\"application_id\":\"" << fresh.application_identifier.data() << "\",\"exact_cloud_identity\":" << fresh.exact_cloud_identity
-        << ",\"content_attempted\":" << fresh.content_attempted << ",\"page\":";
-    write_page(fresh.page); std::cout << '}';
+        << ",\"exact_search_identity\":" << fresh.exact_search_identity << ",\"content_attempted\":" << fresh.content_attempted << ",\"page\":";
+    write_page(fresh.page); std::cout << ",\"search_page\":"; write_search_page(fresh.search_page); std::cout << '}';
 }
 void write(const Result& out, ULONGLONG elapsed) {
     std::cout << std::boolalpha << "{\"schema\":\"first-logon-prepare/v1\",\"status\":\"" << out.status

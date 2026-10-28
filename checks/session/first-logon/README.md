@@ -298,11 +298,14 @@ distinguish a missing or unavailable identity from a successfully read value.
 
 Class categories use the existing mapping. Package category 0 means
 unread/unavailable, 1 no package, 2 the exact CloudExperienceHost family, 3
-another package. Application category 0 means unread/unavailable, 2 the exact
-CloudExperienceHost!App AUMID, 3 another successfully read AUMID.
+another package, 4 the exact observed MicrosoftWindows.Client.CBS family.
+Application category 0 means unread/unavailable, 2 the exact
+CloudExperienceHost!App AUMID, 3 another successfully read AUMID, 4 the exact
+MicrosoftWindows.Client.CBS!CortanaUI AUMID observed in the run below.
 
-UIA content is queried only when the fresh class, family and AUMID exactly
-match the known CloudExperienceHost target. The fresh UIA root HWND/process
+The existing privacy UIA reader runs only when the fresh class, family and AUMID
+exactly match the known CloudExperienceHost target. A separate passive reader
+for the newly observed exact CBS identity is described below. The fresh UIA root HWND/process
 and the full pinned owner are rechecked by the existing page reader. It
 queries the eleven fixed headings above, the already known button ID, and
 these seventeen fixed visible non-password Button Name conditions:
@@ -341,3 +344,64 @@ wrapper's active-desktop/cleanup/owned-action/calibration requirements or the
 child frame/input assertions. The 32-second helper and 40-second outer wait
 remain; synchronous provider overrun is still bounded by that outer process
 timeout and is never a cleanup or functionality pass.
+
+## Passive inspection of the observed CBS foreground
+
+[Run 40705320545, ARM job 122875750341](https://github.com/TechWisard/platform-checks/actions/runs/40705320545/job/122875750341)
+independently measured the same component identity in both fresh foreground
+snapshots: class `Windows.UI.Core.CoreWindow`, package family
+`MicrosoftWindows.Client.CBS_cw5n1h2txyewy`, and application ID
+`MicrosoftWindows.Client.CBS_cw5n1h2txyewy!CortanaUI`. Each observation had a
+stable own-session owner and successful metadata API results. The name alone
+did not identify the displayed page. That run performed no UIA read of this
+component because it was outside the previous content allowlist.
+
+This revision permits a separate **read-only** UIA branch for exactly that
+class/family/AUMID combination. It uses the existing two snapshot deadlines.
+Before reading and after reading it rechecks the live pinned process, current
+foreground HWND, process/thread/session and complete class/package/application
+identity. The UIA root HWND and process must independently match. Changed
+ownership discards the content. It does not reuse the destroyed privacy HWND
+or authorize a new GUI action.
+
+`search_page.fixed_name_counts` records only visible non-password elements
+whose Name exactly matches one of these provider-side query conditions. The
+query includes the verified root and its descendants and does not retrieve the
+Name string, search text, Value, TextPattern, account field or arbitrary title.
+There is no enumeration of other names. Counts are limited to eight; -1 means
+unread, zero means the fixed query completed without a visible match.
+
+| Index | Exact fixed Name |
+|---:|---|
+| 0 | Search |
+| 1 | Type here to search |
+| 2 | Type to search |
+| 3 | Search highlights |
+| 4 | All |
+| 5 | Apps |
+| 6 | Documents |
+| 7 | Settings |
+
+The `buttons` array independently searches three exact visible non-password
+Button Names: index 0 Close, 1 Back, 2 Cancel. Disabled matches are included.
+Only a unique candidate exposes metadata, after process/type/password flag
+rechecks: enabled/offscreen flags, Invoke pattern availability/HRESULT, and an
+AutomationId from its dedicated property API. That ID is emitted only in full
+at 1..128 ASCII characters from A-Z, a-z, 0-9, underscore and dot. No candidate
+Name is retrieved and no pattern is invoked. Counts or patterns are passive
+observations, not permission to act on a cached element.
+
+For the independently verified UIA root, the reader reports its numeric
+control type and WindowPattern availability/HRESULT. If the pattern exists,
+only the interaction-state, modal and topmost getters are called, each with a
+separate HRESULT. Property values require an available pattern and a successful
+corresponding getter; otherwise they are not established. An interaction state
+of -1 means unread. See the primary
+[IUIAutomationWindowPattern contract](https://learn.microsoft.com/en-us/windows/win32/api/uiautomationclient/nn-uiautomationclient-iuiautomationwindowpattern).
+
+There is **no Close call**, Escape, focus change, third Invoke, keyboard input,
+scroll, visual-state change or process termination in this branch. The existing
+privacy action guards, active desktop and cleanup requirements, independent
+calibration, child frame/input gates, policy restoration and runtime budgets
+remain unchanged. A conventional dismissal must be evaluated from actual
+observations in a later reviewed change; this revision only obtains evidence.
