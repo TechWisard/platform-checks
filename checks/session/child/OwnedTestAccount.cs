@@ -53,9 +53,10 @@ internal sealed class OwnedTestAccount : IDisposable
     private static extern uint NetApiBufferFree(IntPtr buffer);
 
     internal static bool DisposableHostedRunnerRequested() =>
-        string.Equals(Environment.GetEnvironmentVariable("GITHUB_ACTIONS"), "true", StringComparison.OrdinalIgnoreCase) &&
-        string.Equals(Environment.GetEnvironmentVariable("RUNNER_ENVIRONMENT"), "github-hosted", StringComparison.Ordinal) &&
-        string.Equals(Environment.GetEnvironmentVariable("RUNNER_OS"), "Windows", StringComparison.Ordinal);
+        (string.Equals(Environment.GetEnvironmentVariable("GITHUB_ACTIONS"), "true", StringComparison.OrdinalIgnoreCase) &&
+         string.Equals(Environment.GetEnvironmentVariable("RUNNER_ENVIRONMENT"), "github-hosted", StringComparison.Ordinal) &&
+         string.Equals(Environment.GetEnvironmentVariable("RUNNER_OS"), "Windows", StringComparison.Ordinal)) ||
+        DisposableGuestReceipt.IsRequested();
 
     internal void Create()
     {

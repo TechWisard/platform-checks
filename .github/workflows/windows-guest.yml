@@ -1,0 +1,70 @@
+name: One disposable Windows client guest
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - checks/guest/run-request.json
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Validate source only, or execute one disposable evaluation guest
+        required: true
+        default: validate-only
+        type: choice
+        options:
+          - validate-only
+          - execute
+
+permissions:
+  contents: read
+
+concurrency:
+  group: one-windows-guest-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  guest:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+      DOTNET_SKIP_FIRST_TIME_EXPERIENCE: '1'
+      DOTNET_GENERATE_ASPNET_CERTIFICATE: 'false'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@d4c94342e560b34958eacfc5d055d21461ed1c5d # v5.0.0
+        with:
+          dotnet-version: 8.0.427
+      - name: Validate the explicit run-request commit
+        if: ${{ github.event_name == 'push' }}
+        run: |
+          python3 - <<'PY'
+          import json, re
+          from pathlib import Path
+          path = Path('checks/guest/run-request.json')
+          assert path.is_file() and not path.is_symlink() and 0 < path.stat().st_size <= 4096
+          value = json.loads(path.read_text())
+          assert value.get('schema') == 'windows-guest-run-request/v1'
+          assert re.fullmatch(r'[a-z0-9][a-z0-9-]{7,95}', value.get('request_id', ''))
+          print('run_request_schema_validated=true')
+          PY
+      - name: Check local parser and bounded process handling
+        run: python3 -m unittest discover -s checks/guest -p 'test_*.py' -v
+      - name: Build guest supervisor without executing Windows code
+        working-directory: checks/guest
+        run: >-
+          dotnet build GuestSupervisor/GuestSupervisor.csproj
+          --configuration Release --output build
+          --configfile NuGet.Config --nologo
+          -p:UseSharedCompilation=false -p:NuGetAudit=false -nodeReuse:false
+      - name: Validate fixed media facts and unattended XML
+        run: python3 checks/guest/run_guest.py
+      - name: Execute one owned evaluation guest
+        if: ${{ github.event_name == 'push' || inputs.mode == 'execute' }}
+        run: >-
+          sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_OS,RUNNER_TEMP
+          python3 checks/guest/run_guest.py --execute
+          --source checks/session/child --supervisor checks/guest/build

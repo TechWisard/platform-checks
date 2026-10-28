@@ -1,0 +1,27 @@
+{
+  "schema": "windows-evaluation-media/v1",
+  "selected_profile": "ltsc-2024-en-us-x64",
+  "profiles": {
+    "ltsc-2024-en-us-x64": {
+      "url": "https://go.microsoft.com/fwlink/?linkid=2289029",
+      "bytes": 5112850432,
+      "sha256": null,
+      "sha256_source": null,
+      "expected_edition": "EnterpriseSEval",
+      "expected_build": 26100,
+      "final_url": "https://software-static.download.prss.microsoft.com/dbazure/888969d5-f34g-4e03-ac9d-1f9786c66749/26100.1742.240906-0331.ge_release_svc_refresh_CLIENT_LTSC_EVAL_x64FRE_en-us.iso",
+      "image_index": 1,
+      "image_name": "Windows 11 Enterprise LTSC 2024 Evaluation"
+    }
+  },
+  "license_review": {
+    "profile": "ltsc-2024-en-us-x64",
+    "scope": "single_operator_automated_evaluation",
+    "evaluation_terms_sha256": "6b5d4b32236a921bacdefe19852ec0699ca2eacd72d4e57f50a2de06ede21c8e",
+    "evaluation_terms_bytes": 128342,
+    "evaluation_terms_wim_path": "/Windows/System32/en-US/Licenses/Eval/EnterpriseSEval/license.rtf",
+    "terms_revision": "April 2024",
+    "source_description": "Actual image1 EnterpriseSEval WIM license stream from the official Microsoft ISO; extracted and read in full before preparing installation. SHA1 of original matched WIM metadata.",
+    "scope_note": "Exactly one disposable guest for synthetic, single-operator API evaluation only; no production, revenue service, OS redistribution, expiry reset, remote human seat, or additional user entitlement. Standard activation is observed; actual registration/account/setup blockers stop the run."
+  }
+}

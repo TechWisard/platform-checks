@@ -1,0 +1,4 @@
+{
+  "schema": "windows-guest-run-request/v1",
+  "request_id": "w11-ltsc-x64-example-only"
+}

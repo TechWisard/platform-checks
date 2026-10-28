@@ -9,6 +9,8 @@ on:
       - '.github/workflows/host-inventory.yml'
       - 'checks/presentation/**'
       - '.github/workflows/presentation.yml'
+      - 'checks/guest/**'
+      - '.github/workflows/windows-guest.yml'
   pull_request:
   workflow_dispatch:
 
