@@ -27,3 +27,7 @@ Primary contracts:
 - https://learn.microsoft.com/en-us/previous-versions/windows/desktop/legacy/mt786991(v=vs.85)
 - https://learn.microsoft.com/en-us/previous-versions/windows/desktop/legacy/mt786992(v=vs.85)
 - https://learn.microsoft.com/en-us/windows/win32/api/oaidl/ns-oaidl-typeattr
+
+Execution request 1 (2026-10-29): observe the installed contracts on the two
+configured Windows runners using source revision
+`ae10177f16c456f15c5e6561111bd954ff4c0481`. This request is not an execution result.
