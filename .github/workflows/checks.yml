@@ -1,0 +1,57 @@
+name: Independent platform checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Windows API checks (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Configure
+        run: cmake -S . -B build -A x64
+      - name: Compile independent checks
+        run: cmake --build build --config Release --parallel 2
+      - name: Execute checks and report skips
+        run: ctest --test-dir build -C Release --verbose --timeout 30
+
+  linux:
+    name: Portable checks and sanitizers
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Configure release
+        run: cmake -S . -B build/release -DCMAKE_BUILD_TYPE=Release
+      - name: Compile release checks
+        run: cmake --build build/release --parallel 2
+      - name: Execute release checks
+        run: ctest --test-dir build/release --verbose --timeout 30
+      - name: Configure sanitizers
+        run: cmake -S . -B build/sanitize -DCMAKE_BUILD_TYPE=Debug -DCHECKS_SANITIZERS=ON
+      - name: Compile sanitizer checks
+        run: cmake --build build/sanitize --parallel 2
+      - name: Execute sanitizer checks
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ctest --test-dir build/sanitize --verbose --timeout 30
