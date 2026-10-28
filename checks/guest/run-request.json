@@ -1,5 +1,5 @@
 {
   "schema": "windows-guest-run-request/v1",
-  "request_id": "w11-ltsc-x64-20261029-native-activation-once",
-  "previous_execution_commit": "b7937e19ced8a2b505941b31e5ac06dbd746dff9"
+  "request_id": "w11-ltsc-x64-20261029-returned-status-window",
+  "previous_execution_commit": "23dd22cb4a29f508086e3b7da46358d3bd87f980"
 }
