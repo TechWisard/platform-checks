@@ -16,9 +16,10 @@ cleanup:
 3. The documented RDP ActiveX control accepts `ConnectToChildSession=true` and
    `Connect()` leads to a newly observed child session ID.
 4. The parent and child are both active, with a connected RDP control.
-5. Windows resolves both session users to the same SID; no account names or SIDs
-   are emitted. This comparison is a measured result, not an assumption that two
-   sessions represent two different users.
+5. Windows resolves the child to the expected SID: the parent account in the
+   default mode, or the exact newly created account in the opt-in account fixture.
+   No account names or SIDs are emitted. Identity is measured, not inferred from
+   two different session numbers or the requested RDP user name.
 6. A temporary Task Scheduler task starts this program's witness mode in that
    exact new session, using its existing interactive token and no password.
 7. The witness reports its real session ID and a per-run salted identity digest.
@@ -31,12 +32,47 @@ cleanup:
 `native_multiseat_verified` and `physical_input_isolation_verified` stay false.
 An active child session with the same account is **not** proof of separate
 accounts, physical keyboard/mouse isolation, independent locking, physical GPU
-output ownership, 3D performance, or ASTER compatibility.
+output ownership, 3D performance, or general application compatibility.
 
-If the child's resolved account differs from the parent, the program records
-that observation, stops before scheduling the witness, and reports failure.
-This experiment intentionally only launches its helper with the current user's
-existing interactive identity.
+If the child's resolved account differs from the expected identity, the program
+records that observation and fails before scheduling the witness. Its helper can
+run only in its recorded new child with the exact expected interactive token.
+
+## Optional owned-account fixture
+
+`-AlternateTestAccount` explicitly selects an additional test on a fresh
+GitHub-hosted Windows VM. The default executable path creates no account. This
+fixture requires an already elevated parent, the hosted-runner environment
+markers, and a matching system Windows Desktop runtime. Environment markers
+protect against accidental invocation; they do not certify an arbitrary host.
+
+The fixture creates one unique ordinary local account with a fresh random
+40-character password. It never adopts an existing name, changes group
+membership or logon rights, or obtains an existing user's password. The created
+account must have a different SID and no Administrators membership. Credentials
+are supplied only to the documented RDP properties from zeroed temporary native
+buffers and a short-lived SecureString; they are not in arguments, environment,
+reports, files, or Task Scheduler.
+
+The child must actually resolve to that created SID while the parent remains
+active in the same console. Only then is the witness copied to a new protected
+directory and launched with `TASK_LOGON_INTERACTIVE_TOKEN`, `TASK_RUNLEVEL_LUA`,
+and `TASK_RUN_USE_SESSION_ID | TASK_RUN_USER_SID`. B can read/execute the three
+test payload files and write only its result directory. No system, window
+station, desktop, profile, or repository ACL is changed. The witness reads its
+native token groups, including deny-only entries, to reject administrator tokens.
+
+The created task instances must actually stop before deletion. The owned child
+and RDP control must be gone before deleting the exact original account SID;
+unexpected sessions or reused names are left untouched. `NetUserDel` removes
+the account, not a possibly created profile. Discard the VM after every run.
+Forced termination leaves cleanup unverified. The existing child-session limits
+apply even if a different-account result succeeds.
+
+```powershell
+# Fresh disposable GitHub-hosted Windows VM only:
+.\run.ps1 -ResultsDirectory "$env:RUNNER_TEMP\account-contract-new" -AllowEnableChildSessions -AlternateTestAccount
+```
 
 ## Run only in an isolated disposable test machine
 
@@ -72,15 +108,15 @@ dotnet build .\SessionContractExperiment.csproj -c Release -o .\bin\experiment
 .\bin\experiment\SessionContractExperiment.exe --output .\results\attempt-2.json --allow-enable-child-sessions --timeout-seconds 120
 ```
 
-The output file must be new. No credential input, saved passwords, authentication
+The output file must be new. No arbitrary credential input, saved passwords, authentication
 policy changes, certificate-validation bypasses, firewall changes, RDP listener
 reconfiguration, system-DLL changes or driver installation are performed. An
 authentication prompt, certificate failure or policy block must produce failure
 or timeout. The process never tries to fill or dismiss credential dialogs.
 
-The normal path has a finite connection/frame deadline and an additional
-20-second logoff verification window. The PowerShell wrapper bounds the whole
-process to the requested deadline plus 45 seconds. A forced process termination
+The normal path has a finite connection/frame deadline, with separate bounded
+cleanup checks for task instances, logoff and control disconnection. The wrapper
+bounds the whole process to the requested deadline plus 75 seconds. A forced process termination
 is reported as a failure with cleanup unverified. A CI job also has an outer timeout
 and discard its VM after an abnormal process crash or forced cancellation;
 cleanup cannot be claimed after a killed process. Such an outcome is not a pass.
@@ -113,6 +149,22 @@ at baseline.
 The per-run witness report is temporary and removed during cleanup. The final
 JSON contains identity equality booleans, session IDs, timing, architecture,
 operation codes and color counts, with no usernames, SIDs or passwords.
+
+The RDP event interface is verified against the installed type library. A real
+disconnect records its numeric reason and queries the read-only extended reason
+before intentional cleanup. `GetErrorDescription` supplies the client's bounded
+diagnostic text. `AuthenticationLevel=1` requires successful server authentication;
+CredSSP is enabled and credential prompting is disabled for this connection.
+
+The wrapper also emits bounded read-only environment snapshots: two RDP services,
+selected numeric registry settings, and listener-port/address classes. Following
+the process it reads at most 16 Security 4625 events from that attempt's time
+window, retaining only numeric status/substatus, logon type, timestamps, record
+IDs and fixed package/address classifications. No usernames, SIDs, domains,
+messages, IP addresses or full event XML are emitted. These are explicitly
+`time_window_only` observations, not proof that every event came from this test.
+Missing auditing or denied access remains unavailable/no-events; audit policy
+is never changed. These diagnostic records cannot make a failed test pass.
 
 `EnableFrameBufferRedirection` is requested as a documented optional loopback
 optimization. Its accepted setting does not prove that the optimized transport
@@ -149,6 +201,13 @@ identifiers and contracts are from these Microsoft references:
 - [TASK_LOGON_TYPE](https://learn.microsoft.com/en-us/windows/win32/api/taskschd/ne-taskschd-task_logon_type)
 - [ITaskFolder::RegisterTaskDefinition](https://learn.microsoft.com/en-us/windows/win32/api/taskschd/nf-taskschd-itaskfolder-registertaskdefinition)
 - [Power Automate picture-in-picture](https://learn.microsoft.com/en-us/power-automate/desktop-flows/run-desktop-flows-pip)
+- [Server authentication level](https://learn.microsoft.com/en-us/windows/win32/termserv/imsrdpclientadvancedsettings4-authenticationlevel)
+- [Disconnect events and codes](https://learn.microsoft.com/en-us/windows/win32/termserv/imstscaxevents-ondisconnected)
+- [Extended disconnect reason](https://learn.microsoft.com/en-us/windows/win32/termserv/imsrdpclient-extendeddisconnectreason)
+- [NetUserAdd](https://learn.microsoft.com/en-us/windows/win32/api/lmaccess/nf-lmaccess-netuseradd)
+- [NetUserDel](https://learn.microsoft.com/en-us/windows/win32/api/lmaccess/nf-lmaccess-netuserdel)
+- [ClearTextPassword](https://learn.microsoft.com/en-us/windows/win32/termserv/imstscnonscriptable-cleartextpassword)
+- [GetTokenInformation](https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-gettokeninformation)
 
 The `IMsRdpExtendedSettings` method offsets, calling convention, HRESULT return,
 BSTR/VARIANT-pointer parameters and direction flags are validated against the

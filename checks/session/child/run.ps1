@@ -2,6 +2,7 @@ param(
     [Parameter(Mandatory = $true)]
     [string] $ResultsDirectory,
     [switch] $AllowEnableChildSessions,
+    [switch] $AlternateTestAccount,
     [ValidateRange(15, 300)]
     [int] $TimeoutSeconds = 120
 )
@@ -25,6 +26,10 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $program = Join-Path $buildDirectory 'SessionContractExperiment.exe'
 $programArgs = @('--output', $evidencePath, '--timeout-seconds', $TimeoutSeconds.ToString())
 if ($AllowEnableChildSessions) { $programArgs += '--allow-enable-child-sessions' }
+if ($AlternateTestAccount) { $programArgs += '--alternate-test-account' }
+. (Join-Path $PSScriptRoot 'environment-snapshot.ps1')
+'environment_snapshot_phase=before'
+Write-SessionEnvironmentSnapshot
 $start = [System.Diagnostics.ProcessStartInfo]::new()
 $start.FileName = $program
 $start.UseShellExecute = $false
@@ -33,10 +38,11 @@ $start.RedirectStandardError = $true
 foreach ($argument in $programArgs) { $start.ArgumentList.Add($argument) }
 $process = [System.Diagnostics.Process]::new()
 $process.StartInfo = $start
+$authWindowStart = [datetime]::UtcNow
 if (-not $process.Start()) { throw 'Could not start the experiment process.' }
 $stdout = $process.StandardOutput.ReadToEndAsync()
 $stderr = $process.StandardError.ReadToEndAsync()
-$timedOut = -not $process.WaitForExit(($TimeoutSeconds + 45) * 1000)
+$timedOut = -not $process.WaitForExit(($TimeoutSeconds + 75) * 1000)
 if ($timedOut) {
     # Stop only the process tree that this wrapper started. A forced termination
     # does not establish cleanup of an OS-owned session or global enablement.
@@ -50,6 +56,9 @@ if ($timedOut) {
 if ($stdout.Wait(10000)) { Write-Output $stdout.Result }
 if ($stderr.Wait(10000) -and $stderr.Result) { Write-Output $stderr.Result }
 $process.Dispose()
+Write-RecentAuthFailures -StartTime $authWindowStart
+'environment_snapshot_phase=after'
+Write-SessionEnvironmentSnapshot
 if (Test-Path -LiteralPath $evidencePath) {
     Get-Content -LiteralPath $evidencePath -Raw
 } elseif ($timedOut) {

@@ -213,8 +213,34 @@ internal sealed class RdpConnectionEvents : IDisposable
     {
         RequireOwner();
         while (pending.TryDequeue(out Observed? item))
+        {
             record("rdp_connection_event", new { stage = item.Name, dispid = item.Dispid,
                 code = item.Code, cleanup = item.DuringCleanup });
+            if (item.Name == "OnDisconnected" && !item.DuringCleanup)
+            {
+                // Query after returning from the event callback, before our
+                // intentional cleanup can replace the disconnect state.
+                try
+                {
+                    int extended = Convert.ToInt32(Dispatch.Get(control, "ExtendedDisconnectReason"),
+                        System.Globalization.CultureInfo.InvariantCulture);
+                    record("rdp_extended_disconnect", new { code = extended });
+                    string? description = Dispatch.Call(control, "GetErrorDescription",
+                        unchecked((uint)item.Code!.Value), unchecked((uint)extended)) as string;
+                    if (!string.IsNullOrEmpty(description))
+                    {
+                        string text = description.Replace('\r', ' ').Replace('\n', ' ').Trim();
+                        record("rdp_disconnect_description", new { message = text[..Math.Min(text.Length, 2048)] });
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // Missing diagnostics never turn a disconnect into a pass.
+                    Exception cause = ex is System.Reflection.TargetInvocationException { InnerException: Exception inner } ? inner : ex;
+                    record("rdp_extended_disconnect_query_failed", new { code = cause.HResult });
+                }
+            }
+        }
     }
 
     internal void ThrowIfConnectionFailed()

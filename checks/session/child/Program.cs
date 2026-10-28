@@ -250,8 +250,8 @@ internal static class Dispatch
         member, BindingFlags.GetProperty, null, target, null, CultureInfo.InvariantCulture);
     internal static void Set(object target, string member, object value) => target.GetType().InvokeMember(
         member, BindingFlags.SetProperty, null, target, new[] { value }, CultureInfo.InvariantCulture);
-    internal static void Call(object target, string member) => target.GetType().InvokeMember(
-        member, BindingFlags.InvokeMethod, null, target, null, CultureInfo.InvariantCulture);
+    internal static object? Call(object target, string member, params object[] arguments) => target.GetType().InvokeMember(
+        member, BindingFlags.InvokeMethod, null, target, arguments, CultureInfo.InvariantCulture);
 }
 
 internal sealed class Evidence
@@ -275,6 +275,16 @@ internal sealed class Evidence
     public bool ChildCreated { get; set; }
     public bool ParentAndChildActive { get; set; }
     public bool? SameUserSid { get; set; }
+    public bool AlternateTestAccountRequested { get; set; }
+    public bool TestAccountCreated { get; set; }
+    public bool TestAccountNonAdministratorVerified { get; set; }
+    public bool TestAccountRemoteDesktopUsersMembership { get; set; }
+    public bool TestCredentialsApplied { get; set; }
+    public bool? ChildMatchesCreatedAccountSid { get; set; }
+    public bool? WitnessAdministratorGroupPresent { get; set; }
+    public bool DifferentAccountVerified { get; set; }
+    public bool TestAccountRemoved { get; set; } = true;
+    public bool WitnessSandboxRemoved { get; set; } = true;
     public bool WitnessInExpectedSession { get; set; }
     public bool WitnessIdentityMatches { get; set; }
     public bool FrameChallengeVerified { get; set; }
@@ -283,6 +293,7 @@ internal sealed class Evidence
     public bool ChildRemoved { get; set; }
     public bool EnableStateRestored { get; set; }
     public bool TaskRemoved { get; set; } = true;
+    public bool TaskInstancesStopped { get; set; } = true;
     public bool ParentStillActiveAfterCleanup { get; set; }
     public List<object> Events { get; set; } = new();
     internal void Event(string stage, object? details = null)
@@ -303,6 +314,7 @@ internal sealed class ExperimentForm : Form
 {
     private readonly Evidence evidence;
     private readonly bool allowEnable;
+    private readonly bool alternateTestAccount;
     private readonly TimeSpan timeout;
     private readonly RdpHost host = new() { Dock = DockStyle.Fill };
     private readonly string nonce = Convert.ToHexString(RandomNumberGenerator.GetBytes(24));
@@ -310,9 +322,13 @@ internal sealed class ExperimentForm : Form
     private readonly string taskName = "SessionContractExperiment-" + Guid.NewGuid().ToString("N");
     private HashSet<uint> baseline = new();
     private string parentSid = "";
+    private string expectedWitnessSid = "";
     private object? control;
     private ExtendedSettings? extended;
     private RdpConnectionEvents? connectionEvents;
+    private OwnedTestAccount? testAccount;
+    private RdpPasswordControl? passwordControl;
+    private WitnessSandbox? witnessSandbox;
     private dynamic? taskFolder;
     private dynamic? registeredTask;
     private bool ownTask;
@@ -320,9 +336,10 @@ internal sealed class ExperimentForm : Form
     private bool preconditions;
     internal int ExitCode { get; private set; } = 1;
 
-    internal ExperimentForm(Evidence evidence, bool allowEnable, TimeSpan timeout)
+    internal ExperimentForm(Evidence evidence, bool allowEnable, TimeSpan timeout, bool alternateTestAccount)
     {
         this.evidence = evidence; this.allowEnable = allowEnable; this.timeout = timeout;
+        this.alternateTestAccount = alternateTestAccount;
         Text = "Session contract experiment — local child session";
         ClientSize = new Size(1024, 768);
         StartPosition = FormStartPosition.Manual;
@@ -351,10 +368,16 @@ internal sealed class ExperimentForm : Form
             { Skip("explicit_enable_permission_required"); return; }
             baseline = Native.SessionIds();
             parentSid = Native.SessionSid(evidence.ParentSessionId);
+            expectedWitnessSid = parentSid;
             using (WindowsIdentity identity = WindowsIdentity.GetCurrent())
             {
                 if (identity.User?.Value != parentSid) { Skip("process_identity_differs_from_parent_user"); return; }
+                if (alternateTestAccount && !OwnedTestAccount.DisposableHostedRunnerRequested())
+                { Skip("alternate_account_requires_disposable_github_hosted_vm"); return; }
+                if (alternateTestAccount && !new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator))
+                { Skip("alternate_account_requires_existing_elevated_test_process"); return; }
             }
+            if (alternateTestAccount) _ = WitnessSandbox.ResolveSystemRuntimeExecutable();
             preconditions = true;
             if (!enabled)
             {
@@ -395,6 +418,32 @@ internal sealed class ExperimentForm : Form
             catch (Exception ex) { evidence.Error("optional_shared_framebuffer_request_failed", ex); }
             using (CredentialPromptControl prompts = new(control, evidence.Event))
                 prompts.DisableAndVerify(evidence.Event);
+            if (alternateTestAccount)
+            {
+                evidence.Event("test_account_creation_started");
+                // Assign before Create: cleanup retains the ownership receipt
+                // even if a later SID/group read fails after NetUserAdd succeeds.
+                testAccount = new OwnedTestAccount();
+                try { testAccount.Create(); }
+                finally
+                {
+                    evidence.TestAccountCreated = testAccount.Created;
+                    evidence.TestAccountRemoved = !testAccount.Created;
+                }
+                if (testAccount.Sid == parentSid) throw new ExperimentFailure("test_account_is_not_a_different_sid");
+                expectedWitnessSid = testAccount.Sid;
+                evidence.TestAccountNonAdministratorVerified = testAccount.NonAdministratorVerified;
+                evidence.TestAccountRemoteDesktopUsersMembership = testAccount.RemoteDesktopUsersMembership;
+                evidence.Event("distinct_nonadministrator_test_account_created");
+                passwordControl = new RdpPasswordControl(control, evidence.Event);
+                if (Convert.ToInt32(Dispatch.Get(control, "Connected"), CultureInfo.InvariantCulture) != 0)
+                    throw new ExperimentFailure("credential_properties_require_disconnected_control");
+                Dispatch.Set(control, "UserName", testAccount.Name);
+                Dispatch.Set(control, "Domain", Environment.MachineName);
+                testAccount.SetControlPassword(passwordControl);
+                evidence.TestCredentialsApplied = true;
+                evidence.Event("owned_test_credentials_applied");
+            }
             Stopwatch deadline = Stopwatch.StartNew();
             evidence.ConnectCalled = true;
             evidence.Event("connect_invocation_started");
@@ -419,6 +468,9 @@ internal sealed class ExperimentForm : Form
                         {
                             string childSid = Native.SessionSid(id);
                             evidence.SameUserSid = childSid == parentSid;
+                            if (alternateTestAccount) evidence.ChildMatchesCreatedAccountSid = childSid == expectedWitnessSid;
+                            if (Native.SessionSid(evidence.ParentSessionId) != parentSid)
+                                throw new ExperimentFailure("parent_identity_changed_during_connect");
                             evidence.ParentAndChildActive = true;
                             break;
                         }
@@ -435,17 +487,35 @@ internal sealed class ExperimentForm : Form
             if (Native.WTSGetActiveConsoleSessionId() != evidence.ConsoleSessionBefore)
                 throw new ExperimentFailure("console_session_changed_during_child_connect");
             evidence.Event("simultaneous_sessions_observed", new { same_user_sid = evidence.SameUserSid });
-            if (evidence.SameUserSid != true)
+            if (alternateTestAccount)
+            {
+                if (evidence.SameUserSid != false || evidence.ChildMatchesCreatedAccountSid != true)
+                    throw new ExperimentFailure("child_identity_is_not_created_account_witness_not_started");
+            }
+            else if (evidence.SameUserSid != true)
                 throw new ExperimentFailure("child_identity_is_not_current_user_witness_not_started");
-            Directory.CreateDirectory(work);
-            string witnessFile = Path.Combine(work, "witness.json");
+            string witnessFile;
+            if (alternateTestAccount)
+            {
+                witnessSandbox = new WitnessSandbox();
+                try { witnessSandbox.Create(parentSid, expectedWitnessSid); }
+                finally { evidence.WitnessSandboxRemoved = !witnessSandbox.Created; }
+                witnessFile = witnessSandbox.ResultPath;
+                evidence.Event("owned_witness_payload_prepared");
+            }
+            else
+            {
+                Directory.CreateDirectory(work);
+                witnessFile = Path.Combine(work, "witness.json");
+            }
             StartWitness(evidence.ChildSessionId!.Value, witnessFile);
             bool witnessVerified = false;
             while (deadline.Elapsed < timeout)
             {
                 connectionEvents.ThrowIfConnectionFailed();
                 if (!evidence.ParentAndChildActive || Native.State(evidence.ParentSessionId) != 0 ||
-                    Native.State(evidence.ChildSessionId!.Value) != 0)
+                    Native.State(evidence.ChildSessionId!.Value) != 0 || Native.SessionSid(evidence.ParentSessionId) != parentSid ||
+                    Native.WTSGetActiveConsoleSessionId() != evidence.ConsoleSessionBefore)
                     throw new ExperimentFailure("parallel_session_lost");
                 if (!witnessVerified && File.Exists(witnessFile))
                 {
@@ -453,16 +523,21 @@ internal sealed class ExperimentForm : Form
                     JsonElement root = witness.RootElement;
                     if (root.GetProperty("nonce").GetString() != nonce) throw new ExperimentFailure("witness_nonce_mismatch");
                     evidence.WitnessInExpectedSession = root.GetProperty("session_id").GetUInt32() == evidence.ChildSessionId;
-                    evidence.WitnessIdentityMatches = root.GetProperty("identity_digest").GetString() == Program.IdentityDigest(nonce, parentSid);
+                    evidence.WitnessIdentityMatches = root.GetProperty("identity_digest").GetString() == Program.IdentityDigest(nonce, expectedWitnessSid);
+                    evidence.WitnessAdministratorGroupPresent = root.GetProperty("administrator_group_present").GetBoolean();
                     if (!evidence.WitnessInExpectedSession || !evidence.WitnessIdentityMatches)
                         throw new ExperimentFailure("witness_session_or_identity_mismatch");
+                    if (alternateTestAccount && evidence.WitnessAdministratorGroupPresent != false)
+                        throw new ExperimentFailure("witness_test_account_has_administrator_group");
                     witnessVerified = true;
                     evidence.Event("witness_process_verified");
                 }
                 if (witnessVerified && CheckFrame())
                 {
                     evidence.FrameChallengeVerified = true;
-                    evidence.Status = "child_session_and_frame_verified";
+                    evidence.DifferentAccountVerified = alternateTestAccount && evidence.SameUserSid == false &&
+                        evidence.ChildMatchesCreatedAccountSid == true && evidence.WitnessIdentityMatches;
+                    evidence.Status = alternateTestAccount ? "different_account_child_and_frame_verified" : "child_session_and_frame_verified";
                     ExitCode = 0;
                     break;
                 }
@@ -493,18 +568,14 @@ internal sealed class ExperimentForm : Form
 
     private void StartWitness(uint session, string result)
     {
-        // These checks precede registration and execution. Never run a helper in
-        // another account or a pre-existing session.
-        if (!evidence.ChildCreated || baseline.Contains(session) || Native.ChildId() != session ||
-            Native.SessionSid(session) != parentSid)
-            throw new ExperimentFailure("witness_ownership_recheck_failed");
+        VerifyWitnessOwnership(session);
         Type schedulerType = Type.GetTypeFromProgID("Schedule.Service", throwOnError: true)!;
         dynamic service = Activator.CreateInstance(schedulerType)!;
         service.Connect();
         taskFolder = service.GetFolder("\\");
         dynamic definition = service.NewTask(0);
         definition.RegistrationInfo.Description = "Temporary local child-session rendering contract test";
-        definition.Principal.UserId = parentSid;
+        definition.Principal.UserId = expectedWitnessSid;
         definition.Principal.LogonType = 3; // TASK_LOGON_INTERACTIVE_TOKEN: no password.
         definition.Principal.RunLevel = 0;  // TASK_RUNLEVEL_LUA.
         definition.Settings.Enabled = true;
@@ -513,19 +584,49 @@ internal sealed class ExperimentForm : Form
         definition.Settings.StopIfGoingOnBatteries = false;
         definition.Settings.ExecutionTimeLimit = "PT3M";
         dynamic action = definition.Actions.Create(0); // TASK_ACTION_EXEC.
-        string executable = Environment.ProcessPath ?? throw new ExperimentFailure("process_path_missing");
+        string executable;
         List<string> arguments = new();
-        if (string.Equals(Path.GetFileNameWithoutExtension(executable), "dotnet", StringComparison.OrdinalIgnoreCase))
-            arguments.Add(Assembly.GetExecutingAssembly().Location);
+        if (witnessSandbox is not null)
+        {
+            executable = witnessSandbox.RuntimeExecutable;
+            arguments.Add(witnessSandbox.AssemblyPath);
+        }
+        else
+        {
+            executable = Environment.ProcessPath ?? throw new ExperimentFailure("process_path_missing");
+            if (string.Equals(Path.GetFileNameWithoutExtension(executable), "dotnet", StringComparison.OrdinalIgnoreCase))
+                arguments.Add(Assembly.GetExecutingAssembly().Location);
+        }
         arguments.AddRange(new[] { "--witness", session.ToString(CultureInfo.InvariantCulture), nonce, result });
         action.Path = executable;
         action.Arguments = string.Join(" ", arguments.Select(Program.QuoteArgument));
-        action.WorkingDirectory = AppContext.BaseDirectory;
-        registeredTask = taskFolder.RegisterTaskDefinition(taskName, definition, 2 /* TASK_CREATE */, parentSid, null, 3, null);
+        action.WorkingDirectory = witnessSandbox?.BinaryDirectory ?? AppContext.BaseDirectory;
+        registeredTask = taskFolder.RegisterTaskDefinition(taskName, definition, 2 /* TASK_CREATE */, expectedWitnessSid, null, 3, null);
         ownTask = true;
         evidence.TaskRemoved = false;
-        registeredTask.RunEx(null, 4 /* TASK_RUN_USE_SESSION_ID */, checked((int)session), null);
+        evidence.TaskInstancesStopped = false;
+        // Recheck after registration, immediately before RunEx. An account or
+        // session change during registration never authorizes execution there.
+        VerifyWitnessOwnership(session);
+        registeredTask.RunEx(null, 4 | 8 /* TASK_RUN_USE_SESSION_ID | TASK_RUN_USER_SID */, checked((int)session), expectedWitnessSid);
         evidence.Event("witness_task_requested");
+    }
+
+    private void VerifyWitnessOwnership(uint session)
+    {
+        if (!evidence.ChildCreated || baseline.Contains(session) || session == evidence.ParentSessionId ||
+            Native.ChildId() != session || Native.State(session) != 0 || Native.State(evidence.ParentSessionId) != 0 ||
+            Native.SessionSid(session) != expectedWitnessSid || Native.SessionSid(evidence.ParentSessionId) != parentSid ||
+            Native.WTSGetActiveConsoleSessionId() != evidence.ConsoleSessionBefore)
+            throw new ExperimentFailure("witness_ownership_recheck_failed");
+        if (alternateTestAccount)
+        {
+            if (testAccount is null || expectedWitnessSid != testAccount.Sid || expectedWitnessSid == parentSid)
+                throw new ExperimentFailure("witness_test_account_receipt_missing");
+            testAccount.RequireOwnership();
+            testAccount.VerifyNoAdministratorMembership();
+        }
+        else if (expectedWitnessSid != parentSid) throw new ExperimentFailure("witness_default_identity_mismatch");
     }
 
     private bool CheckFrame()
@@ -556,6 +657,8 @@ internal sealed class ExperimentForm : Form
     private async Task Cleanup()
     {
         bool cleanupFailed = false;
+        bool controlDisconnected = control is null;
+        evidence.Event("cleanup_started");
         try { connectionEvents?.BeginCleanup(); }
         catch (Exception ex) { evidence.Error("event_cleanup_start_failed", ex); cleanupFailed = true; }
         if (ownTask)
@@ -563,8 +666,16 @@ internal sealed class ExperimentForm : Form
             try
             {
                 if (registeredTask!.GetInstances(0).Count > 0) registeredTask.Stop(0);
+                // Stop can return S_FALSE without throwing. Observe that all
+                // instances of this unique task actually stopped before delete.
+                Stopwatch taskWait = Stopwatch.StartNew();
+                while (registeredTask!.GetInstances(0).Count != 0 && taskWait.Elapsed < TimeSpan.FromSeconds(5))
+                    await Task.Delay(250);
+                if (registeredTask!.GetInstances(0).Count != 0)
+                    throw new ExperimentFailure("own_task_instances_not_stopped");
+                evidence.TaskInstancesStopped = true;
             }
-            catch (Exception ex) { evidence.Error("own_task_stop_failed", ex); }
+            catch (Exception ex) { evidence.Error("own_task_stop_failed", ex); cleanupFailed = true; }
             try
             {
                 taskFolder!.DeleteTask(taskName, 0);
@@ -609,6 +720,21 @@ internal sealed class ExperimentForm : Form
             {
                 if (Convert.ToInt32(Dispatch.Get(control, "Connected"), CultureInfo.InvariantCulture) != 0)
                     Dispatch.Call(control, "Disconnect");
+                Stopwatch disconnectWait = Stopwatch.StartNew();
+                while (Convert.ToInt32(Dispatch.Get(control, "Connected"), CultureInfo.InvariantCulture) != 0 &&
+                    disconnectWait.Elapsed < TimeSpan.FromSeconds(20)) await Task.Delay(250);
+                controlDisconnected = Convert.ToInt32(Dispatch.Get(control, "Connected"), CultureInfo.InvariantCulture) == 0;
+                if (!controlDisconnected) throw new ExperimentFailure("control_disconnect_timeout");
+                if (passwordControl is not null)
+                {
+                    passwordControl.ResetAfterDisconnect();
+                    evidence.Event("control_password_reset");
+                }
+                if (evidence.ConnectCalled && Native.ChildId() != Native.NoSession)
+                {
+                    evidence.ChildRemoved = false;
+                    throw new ExperimentFailure("child_link_present_after_disconnect_do_not_delete_account");
+                }
             }
             catch (Exception ex) { evidence.Error("control_disconnect_failed", ex); cleanupFailed = true; }
         }
@@ -636,6 +762,28 @@ internal sealed class ExperimentForm : Form
             if (preconditions && !evidence.ConsoleSessionUnchanged) throw new ExperimentFailure("console_session_changed_after_cleanup");
         }
         catch (Exception ex) { evidence.Error("parent_cleanup_check_failed", ex); cleanupFailed = true; }
+        if (witnessSandbox is not null)
+        {
+            try
+            {
+                witnessSandbox.Remove(evidence.ChildRemoved, evidence.TaskRemoved && evidence.TaskInstancesStopped);
+                evidence.WitnessSandboxRemoved = !witnessSandbox.Created || witnessSandbox.Removed;
+            }
+            catch (Exception ex) { evidence.Error("witness_sandbox_cleanup_failed", ex); cleanupFailed = true; }
+        }
+        if (testAccount is not null)
+        {
+            try
+            {
+                evidence.Event("test_account_cleanup_started");
+                testAccount.DeleteAfterSessionsRemoved(evidence.ChildRemoved, evidence.TaskRemoved && evidence.TaskInstancesStopped, controlDisconnected);
+                evidence.TestAccountRemoved = !testAccount.Created || testAccount.Removed;
+                evidence.Event("test_account_cleanup_verified");
+            }
+            catch (Exception ex) { evidence.Error("own_test_account_cleanup_failed", ex); cleanupFailed = true; }
+            finally { testAccount.Dispose(); }
+        }
+        passwordControl?.Dispose();
         try { connectionEvents?.Dispose(); }
         catch (Exception ex) { evidence.Error("event_cleanup_failed", ex); cleanupFailed = true; }
         extended?.Dispose();
@@ -681,16 +829,18 @@ internal static class Program
         if (args.Length == 4 && args[0] == "--witness") return RunWitness(args);
         string? output = null;
         bool allowEnable = false;
+        bool alternateTestAccount = false;
         int timeout = 120;
         for (int i = 0; i < args.Length; i++)
         {
             if (args[i] == "--output" && i + 1 < args.Length) output = Path.GetFullPath(args[++i]);
             else if (args[i] == "--allow-enable-child-sessions") allowEnable = true;
+            else if (args[i] == "--alternate-test-account") alternateTestAccount = true;
             else if (args[i] == "--timeout-seconds" && i + 1 < args.Length && int.TryParse(args[++i], out int value) && value is >= 15 and <= 300) timeout = value;
-            else { Console.Error.WriteLine("Usage: SessionContractExperiment --output FILE [--allow-enable-child-sessions] [--timeout-seconds 15..300]"); return 64; }
+            else { Console.Error.WriteLine("Usage: SessionContractExperiment --output FILE [--allow-enable-child-sessions] [--timeout-seconds 15..300] [--alternate-test-account]"); return 64; }
         }
         if (output is null || File.Exists(output)) { Console.Error.WriteLine("A new --output file is required."); return 64; }
-        Evidence evidence = new();
+        Evidence evidence = new() { AlternateTestAccountRequested = alternateTestAccount };
         int result = 1;
         using Mutex mutex = new(false, "Local\\SessionContractExperiment");
         bool acquired = false;
@@ -713,7 +863,7 @@ internal static class Program
                 Application.SetUnhandledExceptionMode(UnhandledExceptionMode.ThrowException);
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
-                using ExperimentForm form = new(evidence, allowEnable, TimeSpan.FromSeconds(timeout));
+                using ExperimentForm form = new(evidence, allowEnable, TimeSpan.FromSeconds(timeout), alternateTestAccount);
                 Application.Run(form);
                 result = form.ExitCode;
             }
@@ -745,7 +895,9 @@ internal static class Program
         using WindowsIdentity identity = WindowsIdentity.GetCurrent();
         string? sid = identity.User?.Value;
         if (sid is null) return 2;
-        string json = JsonSerializer.Serialize(new { nonce = args[2], session_id = actual, identity_digest = IdentityDigest(args[2], sid) });
+        bool administratorGroupPresent = TokenEvidence.HasAdministratorGroupIncludingDenyOnly(identity);
+        string json = JsonSerializer.Serialize(new { nonce = args[2], session_id = actual, identity_digest = IdentityDigest(args[2], sid),
+            administrator_group_present = administratorGroupPresent });
         string temporary = output + "." + Guid.NewGuid().ToString("N") + ".tmp";
         File.WriteAllText(temporary, json, new UTF8Encoding(false));
         File.Move(temporary, output, false);
