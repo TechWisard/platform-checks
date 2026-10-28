@@ -1,0 +1,34 @@
+name: Startup presentation observation
+
+on:
+  push:
+    paths:
+      - 'checks/presentation/**'
+      - '.github/workflows/presentation.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: presentation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  observe:
+    runs-on: windows-11-arm
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Configure the standalone probe
+        run: cmake -S checks/presentation -B build/presentation -A ARM64
+      - name: Compile the native probe
+        run: cmake --build build/presentation --config Release --parallel 2
+      - name: Observe predefined labels without UI actions
+        timeout-minutes: 1
+        shell: pwsh
+        run: |
+          & .\checks\presentation\run.ps1 -Program .\build\presentation\Release\presentation_observation.exe
+          exit $LASTEXITCODE

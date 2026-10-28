@@ -7,6 +7,8 @@ on:
       - '.github/workflows/session-contracts.yml'
       - 'checks/host/**'
       - '.github/workflows/host-inventory.yml'
+      - 'checks/presentation/**'
+      - '.github/workflows/presentation.yml'
   pull_request:
   workflow_dispatch:
 
