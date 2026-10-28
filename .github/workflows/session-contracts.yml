@@ -1,0 +1,48 @@
+name: Session API contracts
+
+on:
+  push:
+    paths:
+      - 'checks/session/**'
+      - '.github/workflows/session-contracts.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: session-contracts-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  environment:
+    name: Session environment (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-11-arm
+            arch: ARM64
+          - os: windows-2025
+            arch: x64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Configure
+        run: cmake -S . -B build -A ${{ matrix.arch }}
+      - name: Compile read-only environment probe
+        run: cmake --build build --config Release --target win32_session_environment --parallel 2
+      - name: Query actual environment
+        shell: pwsh
+        run: |
+          & .\build\Release\win32_session_environment.exe
+          $probeExit = $LASTEXITCODE
+          "probe_exit=$probeExit"
+          if ($probeExit -eq 77) {
+            "::notice::Session preflight unavailable; no connection attempted."
+            exit 0
+          }
+          exit $probeExit
