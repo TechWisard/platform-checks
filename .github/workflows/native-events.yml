@@ -1,0 +1,42 @@
+name: Native event delivery observation
+
+on:
+  push:
+    paths:
+      - 'checks/events/**'
+      - '.github/workflows/native-events.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-events-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  observe:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-11-arm
+            architecture: ARM64
+          - runner: windows-2025
+            architecture: x64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Configure isolated native event observation
+        run: cmake -S checks/events -B build/events -A ${{ matrix.architecture }}
+      - name: Compile isolated native event observation
+        run: cmake --build build/events --config Release --parallel 2
+      - name: Observe actual callbacks and owned teardown
+        timeout-minutes: 1
+        shell: pwsh
+        run: |
+          & .\checks\events\run.ps1 -Executable .\build\events\Release\native_event_delivery_probe.exe
+          exit $LASTEXITCODE
