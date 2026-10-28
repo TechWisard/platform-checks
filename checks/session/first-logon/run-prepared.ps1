@@ -140,6 +140,69 @@ function Invoke-OwnedProcess {
     }
 }
 
+function Test-SearchEscape {
+    param([object] $Report)
+    $property = $Report.PSObject.Properties['search_escape']
+    if ($null -eq $property -or $null -eq $property.Value) { return $false }
+    $action = $property.Value
+    $numbers = @('hresult', 'initial_search_count', 'recheck_search_count', 'async_down_mask', 'queue_down_mask',
+        'send_call_count', 'requested_input_count', 'inserted_input_count', 'send_last_error', 'cleanup_call_count',
+        'cleanup_inserted_count', 'cleanup_last_error', 'release_observations', 'virtual_key', 'after_second_ms', 'elapsed_ms')
+    foreach ($name in $numbers) {
+        $field = $action.PSObject.Properties[$name]
+        if ($null -eq $field -or ($field.Value -isnot [int] -and $field.Value -isnot [long]) -or
+            $field.Value -lt 0 -or $field.Value -gt 4294967295L) { return $false }
+    }
+    $flags = @('checked', 'first_snapshot_verified', 'original_target_destroyed', 'owner_verified', 'owner_reverified',
+        'first_page_verified', 'recheck_page_verified', 'same_root_reverified', 'key_state_checked',
+        'keyboard_state_query_succeeded', 'async_highbits_up', 'queue_highbits_up', 'send_attempted', 'pair_inserted',
+        'release_cleanup_attempted', 'release_event_inserted', 'escape_up_observed', 'key_cleanup_verified',
+        'physical_key_state_proven', 'delivery_to_target_proven')
+    foreach ($name in $flags) {
+        $field = $action.PSObject.Properties[$name]
+        if ($null -eq $field -or $field.Value -isnot [bool]) { return $false }
+    }
+    if ($action.virtual_key -ne 27 -or $action.physical_key_state_proven -ne $false -or
+        $action.delivery_to_target_proven -ne $false -or $action.hresult -ne 0 -or
+        $action.key_cleanup_verified -ne $true) { return $false }
+    if (-not $action.checked) {
+        if ($action.stage -ne 'not_attempted') { return $false }
+        foreach ($name in $numbers) {
+            if ($name -ne 'virtual_key' -and $action.$name -ne 0) { return $false }
+        }
+        foreach ($name in $flags) {
+            if ($name -ne 'key_cleanup_verified' -and $action.$name -ne $false) { return $false }
+        }
+        return $true
+    }
+    # One guarded pair only. A partial insertion fails eligibility even if its
+    # sole permitted key-up cleanup succeeds. No API count claims UI delivery.
+    $fresh = @($Report.fresh_foreground)
+    if ($fresh.Count -ne 2) { return $false }
+    $observed = $fresh[0]
+    return $Report.invoke_count -eq 2 -and $Report.second_action.invoke_succeeded -eq $true -and
+        $action.stage -eq 'pair_inserted' -and $action.after_second_ms -ge 5000 -and
+        $action.send_attempted -eq $true -and $action.send_call_count -eq 1 -and
+        $action.requested_input_count -eq 2 -and $action.inserted_input_count -eq 2 -and $action.pair_inserted -eq $true -and
+        $action.cleanup_call_count -eq 0 -and $action.cleanup_inserted_count -eq 0 -and $action.cleanup_last_error -eq 0 -and
+        $action.release_cleanup_attempted -eq $false -and $action.release_event_inserted -eq $true -and
+        $action.escape_up_observed -eq $true -and $action.release_observations -ge 1 -and
+        $action.first_snapshot_verified -eq $true -and $action.original_target_destroyed -eq $true -and
+        $action.owner_verified -eq $true -and $action.owner_reverified -eq $true -and
+        $action.first_page_verified -eq $true -and $action.recheck_page_verified -eq $true -and
+        $action.same_root_reverified -eq $true -and $action.initial_search_count -eq 1 -and $action.recheck_search_count -eq 1 -and
+        $action.key_state_checked -eq $true -and $action.keyboard_state_query_succeeded -eq $true -and
+        $action.async_highbits_up -eq $true -and $action.queue_highbits_up -eq $true -and
+        $action.async_down_mask -eq 0 -and $action.queue_down_mask -eq 0 -and
+        $observed.attempted -eq $true -and $observed.exact_search_identity -eq $true -and $observed.hresult -eq 0 -and
+        $observed.active_desktop_verified -eq $true -and $observed.original_target_destroyed -eq $true -and
+        $observed.owner_verified -eq $true -and $observed.owner_stable -eq $true -and
+        $observed.search_page.completed -eq $true -and $observed.search_page.hresult -eq 0 -and
+        $observed.search_page.owner_verified -eq $true -and $observed.search_page.owner_stable -eq $true -and
+        $observed.search_page.root_verified -eq $true -and $observed.search_page.root_control_type -eq 50032 -and
+        @($observed.search_page.fixed_name_counts).Count -eq 8 -and $observed.search_page.fixed_name_counts[0] -eq 1
+}
+
 function Test-PreparationEligibility {
     param([object] $Report, [int] $ExitCode)
     if ($Report.schema -ne 'first-logon-prepare/v1' -or $Report.opted_in -ne $true -or
@@ -148,7 +211,9 @@ function Test-PreparationEligibility {
         $Report.cleanup_verified -ne $true -or $Report.cleanup_hresult -ne 0 -or
         $Report.session_functionality_verified -ne $false -or $Report.other_ui_invoked -ne $false -or
         $Report.force_closed_window -ne $false -or $Report.credential_fields_read -ne $false -or
+        $Report.search_values_read -ne $false -or $Report.other_keys_sent -ne $false -or $Report.focus_changed_by_helper -ne $false -or
         $Report.privacy_toggle_values_changed_by_helper -ne $false) { return $false }
+    if (-not (Test-SearchEscape -Report $Report)) { return $false }
     $second = $Report.second_action
     $firstKnownAccept = $Report.button_label_before.category -eq 3 -or
         $Report.button_label_before.safe_ascii -ceq 'Accept these privacy settings'
@@ -242,7 +307,8 @@ try {
     $policiesApplied = $true
     $phase = 'prepare_parent_first_logon'
     # 40s wait + <=3s stop + <=2s output completion stays within 45s. The
-    # helper may Invoke once; an external timeout never proves native cleanup.
+    # The helper has at most two privacy Invokes and one guarded Escape pair;
+    # an external timeout never proves native cleanup.
     $prepared = Invoke-OwnedProcess -Executable $PreparationProgram -WaitMilliseconds 40000 -MaximumOutput 16384 `
         -Arguments @('--allow-disposable-privacy-preparation')
     $preparationExit = $prepared.ExitCode

@@ -94,6 +94,19 @@ struct SecondAction {
     bool invoke_attempted{}, invoke_succeeded{};
     ButtonLabel first_label, recheck_label;
 };
+struct SearchEscape {
+    const char* stage{"not_attempted"};
+    HRESULT error{S_OK}, target_observation_error{S_OK};
+    ULONGLONG after_second_ms{}, elapsed_ms{};
+    unsigned initial_search_count{}, recheck_search_count{}, async_down_mask{}, queue_down_mask{};
+    unsigned send_call_count{}, requested_input_count{}, inserted_input_count{}, send_last_error{};
+    unsigned cleanup_call_count{}, cleanup_inserted_count{}, cleanup_last_error{}, release_observations{}, target_observations{};
+    bool checked{}, first_snapshot_verified{}, original_target_destroyed{}, owner_verified{}, owner_reverified{};
+    bool first_page_verified{}, recheck_page_verified{}, same_root_reverified{}, key_state_checked{};
+    bool keyboard_state_query_succeeded{}, async_highbits_up{}, queue_highbits_up{}, send_attempted{}, pair_inserted{};
+    bool release_cleanup_attempted{}, release_event_inserted{}, escape_up_observed{}, key_cleanup_verified{true};
+    bool target_observation_valid{}, target_exists{}, target_visible{}, target_foreground{}, target_hidden_or_destroyed{};
+};
 struct Failure { const char* stage; HRESULT result; };
 void need(bool value, const char* stage, HRESULT error = E_UNEXPECTED) {
     if (!value) throw Failure{stage, error};
@@ -140,6 +153,7 @@ struct Result {
     PostPage post;
     SecondAction second;
     std::array<FreshForeground, 2> fresh_foreground;
+    SearchEscape search_escape;
 };
 struct Handle final {
     HANDLE value{};
@@ -152,6 +166,12 @@ struct Handle final {
     }
     Handle(const Handle&) = delete;
     Handle& operator=(const Handle&) = delete;
+};
+struct SearchEscapeTarget {
+    HWND window{};
+    DWORD owner{}, thread{};
+    Handle process;
+    explicit SearchEscapeTarget(Result& out) : process(nullptr, out) {}
 };
 struct Apartment final {
     Result& result;
@@ -690,6 +710,149 @@ SearchPage observe_search_page(HWND window, DWORD owner, DWORD thread, HANDLE pr
     }
     return observation; // No WindowPattern.Close, Invoke, focus, input or value reads.
 }
+bool observed_search_candidate(const FreshForeground& fresh) noexcept {
+    const auto& page = fresh.search_page;
+    return fresh.attempted && fresh.exact_search_identity && fresh.owner_verified && fresh.owner_stable &&
+        fresh.active_desktop_verified && fresh.original_target_destroyed && SUCCEEDED(fresh.error) &&
+        page.completed && page.owner_verified && page.owner_stable && page.root_verified && SUCCEEDED(page.error) &&
+        page.root_control_type == UIA_WindowControlTypeId && page.name_counts[0] == 1;
+}
+Com<IUIAutomationElement> read_search_action_root(IUIAutomation2* automation, HWND window, DWORD owner,
+    ULONGLONG end, unsigned& count) {
+    Com<IUIAutomationElement> root; budget(end);
+    hr(automation->ElementFromHandle(window, root.put()), "escape_search_root");
+    need(root.get() != nullptr, "escape_search_null_root");
+    UIA_HWND native{}; int actual_owner{}, type{}; BOOL password = TRUE, offscreen = TRUE;
+    budget(end); hr(root->get_CurrentNativeWindowHandle(&native), "escape_search_root_handle");
+    budget(end); hr(root->get_CurrentProcessId(&actual_owner), "escape_search_root_owner");
+    budget(end); hr(root->get_CurrentControlType(&type), "escape_search_root_type");
+    budget(end); hr(root->get_CurrentIsPassword(&password), "escape_search_root_password");
+    budget(end); hr(root->get_CurrentIsOffscreen(&offscreen), "escape_search_root_offscreen");
+    need(native == window && actual_owner > 0 && static_cast<DWORD>(actual_owner) == owner &&
+        type == UIA_WindowControlTypeId && !password && !offscreen, "escape_search_root_identity");
+    // Only the fixed Name predicate is evaluated. No Name, Value or Text getter
+    // reads a search query, arbitrary control, account field or password.
+    auto elements = fixed_search_name(automation, root.get(), owner, L"Search", false, end);
+    int length{}; budget(end); hr(elements->get_Length(&length), "escape_search_name_count");
+    need(length >= 0 && length <= 8, "escape_search_name_count_bound"); count = static_cast<unsigned>(length);
+    need(count == 1, "escape_search_name_not_unique");
+    Com<IUIAutomationElement> match; budget(end);
+    hr(elements->GetElement(0, match.put()), "escape_search_name_element");
+    need(match.get() != nullptr, "escape_search_null_match");
+    budget(end); hr(match->get_CurrentProcessId(&actual_owner), "escape_search_name_owner");
+    budget(end); hr(match->get_CurrentIsPassword(&password), "escape_search_name_password");
+    budget(end); hr(match->get_CurrentIsOffscreen(&offscreen), "escape_search_name_offscreen");
+    need(actual_owner > 0 && static_cast<DWORD>(actual_owner) == owner && !password && !offscreen,
+        "escape_search_name_identity");
+    return root;
+}
+void observe_search_escape_target(const SearchEscapeTarget& target, Result& out) {
+    auto& action = out.search_escape;
+    if (!action.send_attempted || !target.window) return;
+    ++action.target_observations; action.target_observation_valid = false; action.target_observation_error = S_OK;
+    action.target_exists = false; action.target_visible = false; action.target_foreground = false;
+    action.target_hidden_or_destroyed = false;
+    try {
+        verify_desktop(out);
+        action.target_exists = IsWindow(target.window) != FALSE;
+        if (!action.target_exists) {
+            action.target_hidden_or_destroyed = true; action.target_observation_valid = true; return;
+        }
+        DWORD thread{}, exit_code{};
+        need(window_owner(target.window, out.session, &thread) == target.owner && thread == target.thread &&
+            GetProcessId(target.process.value) == target.owner &&
+            GetExitCodeProcess(target.process.value, &exit_code) != FALSE && exit_code == STILL_ACTIVE,
+            "escape_observed_target_owner_changed");
+        action.target_visible = IsWindowVisible(target.window) != FALSE;
+        action.target_foreground = GetAncestor(GetForegroundWindow(), GA_ROOT) == target.window;
+        action.target_hidden_or_destroyed = !action.target_visible;
+        action.target_observation_valid = true;
+    } catch (const Failure& failure) { action.target_observation_error = failure.result; }
+    // This observes only the pinned target HWND. It is not a claim that no new
+    // Search window exists; ordinary-desktop and independent pixel proof differ.
+}
+void consider_search_escape(HWND original, ULONGLONG second_completed, const FreshForeground& snapshot,
+    SearchEscapeTarget& target, ULONGLONG end, Result& out) {
+    auto& action = out.search_escape;
+    need(!action.checked && !action.send_attempted, "escape_action_already_considered");
+    const ULONGLONG started = GetTickCount64(); action.checked = true; action.after_second_ms = started - second_completed;
+    try {
+        need(observed_search_candidate(snapshot), "escape_initial_observation_unverified"); action.first_snapshot_verified = true;
+        budget(end); verify_desktop(out);
+        need(original && !IsWindow(original), "escape_original_page_still_exists"); action.original_target_destroyed = true;
+        target.window = GetAncestor(GetForegroundWindow(), GA_ROOT);
+        need(target.window != nullptr, "escape_foreground_unavailable");
+        target.owner = window_owner(target.window, out.session, &target.thread);
+        target.process.value = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, target.owner);
+        need(target.process.value != nullptr, "escape_process_open", last_error());
+        budget(end); verify_search_target(target.window, target.owner, target.thread, target.process.value, out);
+        action.owner_verified = true;
+        Apartment apartment(out); Com<IUIAutomation2> automation;
+        budget(end); hr(CoCreateInstance(__uuidof(CUIAutomation8), nullptr, CLSCTX_INPROC_SERVER,
+            __uuidof(IUIAutomation2), reinterpret_cast<void**>(automation.put())), "escape_automation_create");
+        need(automation.get() != nullptr, "escape_automation_null");
+        hr(automation->put_AutoSetFocus(FALSE), "escape_no_focus");
+        hr(automation->put_ConnectionTimeout(1000), "escape_connection_timeout");
+        hr(automation->put_TransactionTimeout(1000), "escape_transaction_timeout");
+        auto first = read_search_action_root(automation.get(), target.window, target.owner, end, action.initial_search_count);
+        action.first_page_verified = true;
+        budget(end); verify_search_target(target.window, target.owner, target.thread, target.process.value, out);
+        auto fresh = read_search_action_root(automation.get(), target.window, target.owner, end, action.recheck_search_count);
+        action.recheck_page_verified = true;
+        BOOL same{}; budget(end); hr(automation->CompareElements(first.get(), fresh.get(), &same), "escape_compare_roots");
+        need(same != FALSE, "escape_search_root_replaced"); action.same_root_reverified = true;
+        budget(end); verify_search_target(target.window, target.owner, target.thread, target.process.value, out);
+        constexpr int keys[]{VK_SHIFT, VK_LSHIFT, VK_RSHIFT, VK_CONTROL, VK_LCONTROL, VK_RCONTROL,
+            VK_MENU, VK_LMENU, VK_RMENU, VK_LWIN, VK_RWIN, VK_ESCAPE};
+        std::array<BYTE, 256> queued{}; action.key_state_checked = true;
+        win32(GetKeyboardState(queued.data()), "escape_keyboard_state_unavailable"); action.keyboard_state_query_succeeded = true;
+        for (unsigned index = 0; index < sizeof(keys) / sizeof(keys[0]); ++index) {
+            if (queued[keys[index]] & 0x80U) action.queue_down_mask |= 1U << index;
+            if (static_cast<unsigned short>(GetAsyncKeyState(keys[index])) & 0x8000U) action.async_down_mask |= 1U << index;
+        }
+        action.queue_highbits_up = action.queue_down_mask == 0; action.async_highbits_up = action.async_down_mask == 0;
+        need(action.queue_highbits_up && action.async_highbits_up, "escape_key_already_down", HRESULT_FROM_WIN32(ERROR_BUSY));
+        // GetAsyncKeyState's zero is ambiguous on API access failure. These are
+        // observed high bits under verified active-desktop/owner guards, not a
+        // proof of physical keyboard state or an atomic guard against a human.
+        budget(end); verify_search_target(target.window, target.owner, target.thread, target.process.value, out);
+        action.owner_reverified = true;
+        INPUT pair[2]{}; pair[0].type = INPUT_KEYBOARD; pair[0].ki.wVk = VK_ESCAPE;
+        pair[1].type = INPUT_KEYBOARD; pair[1].ki.wVk = VK_ESCAPE; pair[1].ki.dwFlags = KEYEVENTF_KEYUP;
+        budget(end);
+        action.send_attempted = true; action.send_call_count = 1; action.requested_input_count = 2;
+        SetLastError(ERROR_SUCCESS);
+        action.inserted_input_count = SendInput(2, pair, sizeof(INPUT)); action.send_last_error = GetLastError();
+        action.pair_inserted = action.inserted_input_count == 2;
+        action.key_cleanup_verified = action.inserted_input_count == 0;
+        action.release_event_inserted = action.pair_inserted;
+        // A partial result is never retried. Only the release matching our own
+        // single possible down event may be inserted, once, before any throw.
+        if (action.inserted_input_count == 1) {
+            action.release_cleanup_attempted = true; action.cleanup_call_count = 1;
+            SetLastError(ERROR_SUCCESS);
+            action.cleanup_inserted_count = SendInput(1, &pair[1], sizeof(INPUT)); action.cleanup_last_error = GetLastError();
+            action.release_event_inserted = action.cleanup_inserted_count == 1;
+        }
+        if (action.release_event_inserted) {
+            const ULONGLONG release_end = GetTickCount64() + 250;
+            do {
+                verify_desktop(out); ++action.release_observations;
+                action.escape_up_observed = (static_cast<unsigned short>(GetAsyncKeyState(VK_ESCAPE)) & 0x8000U) == 0;
+                if (action.escape_up_observed) break;
+                Sleep(10);
+            } while (GetTickCount64() < release_end && GetTickCount64() < end);
+            action.key_cleanup_verified = action.escape_up_observed;
+        }
+        observe_search_escape_target(target, out);
+        need(action.pair_inserted, "escape_input_incomplete",
+            HRESULT_FROM_WIN32(action.send_last_error ? action.send_last_error : ERROR_GEN_FAILURE));
+        need(action.key_cleanup_verified, "escape_release_unverified", HRESULT_FROM_WIN32(ERROR_GEN_FAILURE));
+        action.stage = "pair_inserted"; action.elapsed_ms = GetTickCount64() - started;
+    } catch (const Failure& failure) {
+        action.stage = failure.stage; action.error = failure.result; action.elapsed_ms = GetTickCount64() - started; throw;
+    }
+}
 FreshForeground observe_fresh_foreground(HWND original, ULONGLONG second_completed, ULONGLONG end, Result& out) {
     const ULONGLONG started = GetTickCount64(); FreshForeground observation;
     observation.attempted = true; observation.after_second_ms = started - second_completed;
@@ -754,6 +917,7 @@ FreshForeground observe_fresh_foreground(HWND original, ULONGLONG second_complet
 }
 void prepare(Result& out, ULONGLONG end) {
     const ULONGLONG wait_end = end - PostReadBudgetMs;
+    SearchEscapeTarget search_target(out);
     need(environment_equals(L"GITHUB_ACTIONS", L"true") && environment_equals(L"RUNNER_ENVIRONMENT", L"github-hosted") &&
         environment_equals(L"RUNNER_OS", L"Windows"), "disposable_hosted_windows_required");
     out.disposable_environment_verified = true; verify_desktop(out);
@@ -798,9 +962,15 @@ void prepare(Result& out, ULONGLONG end) {
             const ULONGLONG limit = GetTickCount64() + 2000;
             out.fresh_foreground[0] = observe_fresh_foreground(observed_target, out.second.completed_tick,
                 limit < wait_end ? limit : wait_end, out);
+            if (observed_search_candidate(out.fresh_foreground[0])) {
+                const ULONGLONG action_limit = GetTickCount64() + 2000;
+                consider_search_escape(observed_target, out.second.completed_tick, out.fresh_foreground[0], search_target,
+                    action_limit < wait_end ? action_limit : wait_end, out);
+            }
         }
         ++out.wait_observations;
         const bool ready = ordinary_desktop(observed_target, out);
+        observe_search_escape_target(search_target, out);
         stable = ready ? stable + 1 : 0; out.stable_observations = stable;
         if (stable >= 5) {
             out.ordinary_desktop_verified = true; break;
@@ -810,6 +980,7 @@ void prepare(Result& out, ULONGLONG end) {
     if (out.invoke_succeeded) out.post = observe_after_invoke(observed_target, owner, thread, process.value, end, out);
     if (out.second.invoke_succeeded && !out.ordinary_desktop_verified)
         out.fresh_foreground[1] = observe_fresh_foreground(observed_target, out.second.completed_tick, end, out);
+    observe_search_escape_target(search_target, out);
     verify_desktop(out); out.final_active_input_desktop_verified = true;
     if (out.ordinary_desktop_verified) {
         out.stage = "completed"; out.status = out.invoke_attempted ? "completed" : "not_needed"; return;
@@ -859,6 +1030,24 @@ void write_search_page(const SearchPage& page) {
             << ",\"automation_id\":\"" << button.automation_id.data() << "\"}";
     }
     std::cout << "]}";
+}
+void write_search_escape(const SearchEscape& action) {
+    std::cout << "{\"stage\":\"" << action.stage << "\",\"hresult\":" << static_cast<std::uint32_t>(action.error)
+        << ",\"after_second_ms\":" << action.after_second_ms << ",\"elapsed_ms\":" << action.elapsed_ms;
+#define ACTION(name) std::cout << ",\"" #name "\":" << action.name
+    ACTION(checked); ACTION(first_snapshot_verified); ACTION(original_target_destroyed);
+    ACTION(owner_verified); ACTION(owner_reverified); ACTION(first_page_verified); ACTION(recheck_page_verified);
+    ACTION(same_root_reverified); ACTION(initial_search_count); ACTION(recheck_search_count);
+    ACTION(key_state_checked); ACTION(keyboard_state_query_succeeded); ACTION(async_highbits_up); ACTION(queue_highbits_up);
+    ACTION(async_down_mask); ACTION(queue_down_mask); ACTION(send_attempted); ACTION(send_call_count);
+    ACTION(requested_input_count); ACTION(inserted_input_count); ACTION(send_last_error); ACTION(pair_inserted);
+    ACTION(release_cleanup_attempted); ACTION(cleanup_call_count); ACTION(cleanup_inserted_count); ACTION(cleanup_last_error);
+    ACTION(release_event_inserted); ACTION(escape_up_observed); ACTION(release_observations); ACTION(key_cleanup_verified);
+    ACTION(target_observations); ACTION(target_observation_valid); ACTION(target_exists); ACTION(target_visible);
+    ACTION(target_foreground); ACTION(target_hidden_or_destroyed);
+#undef ACTION
+    std::cout << ",\"target_observation_hresult\":" << static_cast<std::uint32_t>(action.target_observation_error)
+        << ",\"virtual_key\":" << VK_ESCAPE << ",\"physical_key_state_proven\":false,\"delivery_to_target_proven\":false}";
 }
 void write_fresh(const FreshForeground& fresh) {
     std::cout << "{\"attempted\":" << fresh.attempted << ",\"stage\":\"" << fresh.stage
@@ -913,9 +1102,11 @@ void write(const Result& out, ULONGLONG elapsed) {
     std::cout << ",\"post_invoke\":"; write_page(out.post);
     std::cout << ",\"fresh_foreground\":[";
     write_fresh(out.fresh_foreground[0]); std::cout << ','; write_fresh(out.fresh_foreground[1]); std::cout << ']';
+    std::cout << ",\"search_escape\":"; write_search_escape(out.search_escape);
     std::cout << ",\"foreground_class_hresult\":" << static_cast<std::uint32_t>(out.foreground_class_hresult)
         << ",\"observed_target_cloak_hresult\":" << static_cast<std::uint32_t>(out.observed_target_cloak_hresult)
         << ",\"privacy_toggle_values_changed_by_helper\":false,\"credential_fields_read\":false,"
+        "\"search_values_read\":false,\"other_keys_sent\":false,\"focus_changed_by_helper\":false,"
         "\"other_ui_invoked\":false,\"force_closed_window\":false,\"session_functionality_verified\":false,"
         "\"remote_frame_verified\":false,\"input_channel_verified\":false,\"physical_isolation_verified\":false}\n";
 }
@@ -928,8 +1119,11 @@ int main(int argc, char** argv) {
         prepare(out, start + TotalBudgetMs);
     } catch (const Failure& failure) { out.stage = failure.stage; out.error = failure.result; out.status = "failed"; }
     catch (...) { out.stage = "unexpected_exception"; out.error = E_UNEXPECTED; out.status = "failed"; }
+    if (!out.search_escape.key_cleanup_verified) { out.cleanup_verified = false; out.cleanup_error = E_FAIL; }
     if (!out.cleanup_verified) { out.status = "failed"; out.stage = "own_cleanup_failed"; }
     const bool success = out.ordinary_desktop_verified && out.final_active_input_desktop_verified && out.cleanup_verified && SUCCEEDED(out.error) &&
+        (!out.search_escape.checked || (out.search_escape.pair_inserted && out.search_escape.key_cleanup_verified &&
+         out.search_escape.owner_reverified && out.search_escape.same_root_reverified && SUCCEEDED(out.search_escape.error))) &&
         ((out.invoke_count == 0 && !out.target_initially_foreground) ||
          (((out.invoke_count == 1 && !out.second.invoke_attempted) ||
            (out.invoke_count == 2 && !out.first_label_is_known_accept && out.second.invoke_succeeded &&

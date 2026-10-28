@@ -1,8 +1,11 @@
 # Disposable first-logon preparation
 
-This is a separate, explicitly opted-in CI helper. It invokes only the exact
-privacy page previously observed on an owned disposable GitHub-hosted Windows
-runner. It is not a general OOBE, login, activation, credential or popup handler.
+This is a separate, explicitly opted-in CI helper. It permits at most two
+normal Invokes of the exact privacy page previously observed on an owned
+disposable GitHub-hosted Windows runner. After the verified transition it may
+send one guarded Escape pair to the separately verified Search foreground,
+as specified below. It is not a general OOBE, login, activation, credential or
+popup handler.
 It creates no windows and performs no action unless the fixed checks below
 succeed. It does not change the original read-only presentation probe.
 
@@ -34,9 +37,10 @@ No switch values are toggled. The first action invokes the fixed privacy-page
 button; its current label is observed rather than assuming that its ID means
 the page has completed. A missing/changed page, a duplicate or disabled
 button, an owner change or an API failure stops the helper. The only possible
-second action is the separately verified exact Accept transition below. There
-is no generic retry, fallback button, key injection, focus request, process
-kill or window close directed at Windows UI.
+second privacy action is the separately verified exact Accept transition below.
+There is no generic retry or fallback button. The distinct Search Escape
+operation below is the only keyboard action; no focus request, process kill,
+other key or window-close API is used on Windows UI.
 
 After the permitted action or actions, the helper waits for the observed page HWND to become
 hidden or cease to exist. It also requires the active Default input desktop,
@@ -268,7 +272,7 @@ guards remain in force for this revision.
 measured the guarded second Accept with S_OK and then destruction of the
 original HWND. A different foreground CoreWindow remained; native calibration
 still failed its ownership/eight-color proof. That run did not establish the
-new window's package or page, so this revision adds only read-only observations.
+new window's package or page, so the earlier observation revision added the passive snapshots below.
 
 `fresh_foreground` has two fixed slots. Slot 0 is attempted during the ordinary
 wait, no earlier than five seconds after the second Invoke completed, with a
@@ -338,8 +342,8 @@ remains the only source of a safely emitted variable button label. Unknown
 page headings or button names are not enumerated, so zero counts do not
 establish an empty page or completed setup.
 
-No new Invoke, focus, keyboard, scrolling, window close or process stop is
-introduced. Snapshots do not authorize a third action and do not affect the
+The snapshot functions perform no Invoke, focus, keyboard, scrolling, window
+close or process stop. Snapshots alone do not authorize another action and do not affect the
 wrapper's active-desktop/cleanup/owned-action/calibration requirements or the
 child frame/input assertions. The 32-second helper and 40-second outer wait
 remain; synchronous provider overrun is still bounded by that outer process
@@ -356,7 +360,7 @@ stable own-session owner and successful metadata API results. The name alone
 did not identify the displayed page. That run performed no UIA read of this
 component because it was outside the previous content allowlist.
 
-This revision permits a separate **read-only** UIA branch for exactly that
+The passive observer permits a separate **read-only** UIA branch for exactly that
 class/family/AUMID combination. It uses the existing two snapshot deadlines.
 Before reading and after reading it rechecks the live pinned process, current
 foreground HWND, process/thread/session and complete class/package/application
@@ -399,9 +403,80 @@ corresponding getter; otherwise they are not established. An interaction state
 of -1 means unread. See the primary
 [IUIAutomationWindowPattern contract](https://learn.microsoft.com/en-us/windows/win32/api/uiautomationclient/nn-uiautomationclient-iuiautomationwindowpattern).
 
-There is **no Close call**, Escape, focus change, third Invoke, keyboard input,
-scroll, visual-state change or process termination in this branch. The existing
-privacy action guards, active desktop and cleanup requirements, independent
-calibration, child frame/input gates, policy restoration and runtime budgets
-remain unchanged. A conventional dismissal must be evaluated from actual
-observations in a later reviewed change; this revision only obtains evidence.
+The passive reader calls no Close, Invoke, keyboard, focus, scrolling,
+visual-state or process-termination API. The separate operation below uses
+fresh checks; it never acts on cached UIA elements from this reader.
+
+## One guarded Search Escape operation
+
+Actual attempt16 (`030e9376776f456cf7f1f8bc4c4dd1ee8e81795c`, run
+40707570426) verified the exact CBS family/application and a UIA Window root
+with exactly one visible non-password fixed Name `Search`. Both observations
+found no exact Close, Back or Cancel button and no WindowPattern interface.
+That evidence supports testing one ordinary Escape; it does not guarantee
+that this component will dismiss it.
+
+After the first successful passive Search observation, the helper considers
+this operation once, within an additional two-second slice of the existing
+32-second native budget. The initial privacy HWND must already be destroyed.
+The current root is obtained anew; its process handle remains pinned through
+the rest of preparation. Active own-console session, Default input desktop,
+foreground HWND, thread/process ownership, exact CoreWindow class, exact CBS
+family and exact CBS `!CortanaUI` application identity are required.
+
+Two fresh UIA roots must independently match that HWND and process, be visible
+and non-password, and have control type 50032 (Window). Both roots must contain
+exactly one visible non-password `Search` match in the fixed provider-side
+Name query. Match ownership and password/offscreen flags are reread;
+`CompareElements` must confirm the same root. No search Name value, Value,
+TextPattern, query text or arbitrary control is retrieved. Session, desktop,
+foreground and process/package/application identity are checked again just
+before input insertion. No SetFocus or AttachThreadInput is used.
+
+The keyboard guard requires successful `GetKeyboardState` and zero high bits
+from both that queue snapshot and `GetAsyncKeyState` for Shift, Control, Alt,
+their left/right variants, both Windows keys and Escape. A down bit or an
+observed API/ownership/desktop failure stops the operation without input. The
+12 fixed down-bit masks are reported; no other key state is retained. Low bits
+are ignored. `GetKeyboardState` describes the caller's queue, while
+`GetAsyncKeyState == 0` can also mean access failure: these guards are separate
+observations, not proof of physical absence of presses or atomic exclusion of
+another operator. This is an explicitly opted-in disposable unattended test
+fixture. No modifier is released, reset or otherwise changed by this helper.
+
+One `SendInput` call requests exactly two zero-initialized `INPUT_KEYBOARD`
+events: `VK_ESCAPE` down, then `VK_ESCAPE` with `KEYEVENTF_KEYUP`. It records the
+requested and inserted counts and observed last error. A full insertion is
+not a delivery or UI-effect claim, and a zero count does not establish UIPI as
+the cause. If exactly one event was inserted, the only additional permitted
+call inserts one matching Escape key-up. There is no retry of the pair or its
+down event. A partial result fails preparation even when that release succeeds.
+An unverified release also fails native cleanup. The normal full-pair path
+requires an observed Escape-up high bit on the still-active input desktop,
+within at most 250 ms; no extra input is used for this observation.
+
+`search_escape` contains typed counts, guard flags, errors, release observation
+and the outcome of the bounded operation. `stage=pair_inserted` means the two
+events were inserted with the required guards; it does not mean the target
+received them or closed. Passive follow-up separately records whether the
+pinned target HWND is still present/visible/foreground. Destroyed or hidden
+means only that observed target, not global absence of every Search window.
+Owner changes invalidate that observation. The ordinary-desktop predicate
+and independent native screen calibration remain separate.
+
+The wrapper validates either complete absence of this operation or exactly
+one guarded full pair with verified key-release cleanup. Missing ownership,
+nonunique Search, malformed numeric/boolean fields, partial insertion,
+additional calls, other keys, focus changes or failed release block the child
+experiment. Calibration still runs diagnostically after a completed helper
+result, and its unchanged eight-color/count/511-mask/own-cleanup gate is
+mandatory before the unchanged real child frame/input contract. Existing
+policy values are restored in the same finally block. No policy, credential,
+authentication, licensing or Secure Boot behavior is added or weakened.
+
+Primary contracts:
+
+- [Windows keyboard shortcuts](https://support.microsoft.com/en-gb/accessibility/windows/keyboard-shortcuts-in-windows): Escape is a conventional way to stop/leave a task or dismiss a dialog; application behavior can vary.
+- [SendInput](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendinput): event counts, serial insertion, UIPI and existing keyboard-state limits.
+- [GetAsyncKeyState](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getasynckeystate): high-bit state, ambiguous zero on failure, and unreliable low bit.
+- [GetKeyboardState](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getkeyboardstate): success indication and per-thread message-queue semantics.
