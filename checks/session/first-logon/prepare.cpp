@@ -30,6 +30,9 @@ constexpr const wchar_t* KnownHeadings[]{PrivacyHeading, L"Privacy settings", L"
     L"Just a moment", L"Getting things ready", L"We're getting things ready for you",
     L"This might take a few minutes", L"Let's finish setting up your device", L"Something went wrong",
     L"Microsoft account"};
+constexpr const wchar_t* KnownButtonLabels[]{L"Accept", L"Next", L"Back", L"Yes", L"No", L"More", L"Continue",
+    L"Done", L"OK", L"Cancel", L"Learn more", L"Save", L"Try again", L"Retry", L"Skip for now", L"Sign in",
+    L"Use recommended settings"};
 struct ButtonLabel {
     const char* status{"not_read"};
     HRESULT error{S_OK};
@@ -43,13 +46,27 @@ struct PostPage {
     bool enabled{}, offscreen{true}, invoke_available{};
     int button_count{-1};
     std::array<int, sizeof(KnownHeadings) / sizeof(KnownHeadings[0])> headings{};
+    std::array<int, sizeof(KnownButtonLabels) / sizeof(KnownButtonLabels[0])> known_buttons{};
     ButtonLabel label;
-    PostPage() { headings.fill(-1); }
+    PostPage() { headings.fill(-1); known_buttons.fill(-1); }
+};
+struct FreshForeground {
+    const char* stage{"not_attempted"};
+    HRESULT error{S_OK}, class_error{S_OK}, package_error{S_OK}, application_error{S_OK};
+    ULONGLONG after_second_ms{}, elapsed_ms{};
+    bool attempted{}, active_desktop_verified{}, original_target_destroyed{}, owner_verified{}, owner_stable{};
+    bool class_read{}, package_read{}, application_read{}, class_safe{}, package_safe{}, application_safe{};
+    bool exact_cloud_identity{}, content_attempted{};
+    unsigned class_category{}, package_category{}, application_category{};
+    std::array<char, 129> class_identifier{};
+    std::array<char, 257> package_identifier{}, application_identifier{};
+    PostPage page;
 };
 struct SecondAction {
     const char* stage{"not_attempted"};
     HRESULT invoke_error{S_OK};
     ULONGLONG delay_ms{};
+    ULONGLONG completed_tick{}; // Internal scheduling only; never a window/process identifier.
     unsigned initial_heading_count{}, recheck_heading_count{}, initial_button_count{}, recheck_button_count{};
     bool checked{}, first_page_verified{}, recheck_page_verified{}, owner_verified{}, owner_reverified{}, same_button_reverified{};
     bool invoke_attempted{}, invoke_succeeded{};
@@ -100,6 +117,7 @@ struct Result {
     ButtonLabel button_before;
     PostPage post;
     SecondAction second;
+    std::array<FreshForeground, 2> fresh_foreground;
 };
 struct Handle final {
     HANDLE value{};
@@ -251,19 +269,33 @@ bool explorer_image(HANDLE process) {
     const wchar_t* basename = last ? last + 1 : path.value.data();
     return CompareStringOrdinal(basename, -1, L"explorer.exe", -1, TRUE) == CSTR_EQUAL;
 }
-unsigned foreground_class(HWND window, Result& out) {
-    std::array<wchar_t, 128> value{};
+template<std::size_t Size> bool safe_identifier(const wchar_t* value, std::size_t length,
+    std::array<char, Size>& output, bool allow_bang) noexcept {
+    if (!length || length >= Size) return false;
+    std::array<char, Size> candidate{};
+    for (std::size_t index = 0; index < length; ++index) {
+        const auto c = static_cast<std::uint16_t>(value[index]);
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+            c == '_' || c == '.' || (allow_bang && c == '!'))) return false;
+        candidate[index] = static_cast<char>(c);
+    }
+    output = candidate; return true; // No prefix is retained on rejection.
+}
+unsigned foreground_class(HWND window, bool& read, HRESULT& error, std::array<char, 129>* identifier = nullptr,
+    bool* identifier_safe = nullptr) {
+    std::array<wchar_t, 130> value{};
     const int size = GetClassNameW(window, value.data(), static_cast<int>(value.size()));
-    if (size <= 0 || size >= static_cast<int>(value.size() - 1)) {
-        out.foreground_class_hresult = size <= 0 ? last_error() : HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    if (size <= 0 || size > 128) {
+        error = size <= 0 ? last_error() : HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
         return 0;
     }
-    out.foreground_class_read = true;
+    read = true;
+    if (identifier && identifier_safe) *identifier_safe = safe_identifier(value.data(), static_cast<std::size_t>(size), *identifier, false);
     constexpr const wchar_t* classes[]{L"Progman", L"WorkerW", L"CabinetWClass", L"ConsoleWindowClass",
         L"CASCADIA_HOSTING_WINDOW_CLASS", L"Windows.UI.Core.CoreWindow", L"ApplicationFrameWindow"};
     for (unsigned index = 0; index < sizeof(classes) / sizeof(classes[0]); ++index)
         if (std::wcscmp(value.data(), classes[index]) == 0) return index + 1;
-    return 255; // Unknown class text is never emitted or used to widen the gate.
+    return 255; // Classification never widens readiness; a fresh snapshot may emit a separately filtered OS identifier.
 }
 bool ordinary_desktop(HWND original_target, Result& out) {
     verify_desktop(out);
@@ -290,7 +322,7 @@ bool ordinary_desktop(HWND original_target, Result& out) {
     out.foreground_is_shell = foreground && foreground == shell;
     out.foreground_matches_associated_console = foreground && console && foreground == GetAncestor(console, GA_ROOT);
     out.foreground_is_observed_target = foreground && original_target && foreground == original_target;
-    if (foreground) out.foreground_class_category = foreground_class(foreground, out);
+    if (foreground) out.foreground_class_category = foreground_class(foreground, out.foreground_class_read, out.foreground_class_hresult);
     if (!shell || !IsWindow(shell)) { out.wait_guard = 1; return false; }
     const DWORD shell_owner = window_owner(shell, out.session);
     Handle process{OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, shell_owner), out};
@@ -352,6 +384,24 @@ Com<IUIAutomationElementArray> matches(IUIAutomation2* automation, IUIAutomation
     Com<IUIAutomationElementArray> elements;
     budget(end); hr(root->FindAll(TreeScope_Descendants, combined.get(), elements.put()), "targeted_page_search");
     need(elements.get() != nullptr, "automation_null_elements"); return elements;
+}
+int fixed_button_label_count(IUIAutomation2* automation, IUIAutomationElement* root, DWORD owner,
+    const wchar_t* label, ULONGLONG end) {
+    need(owner <= static_cast<DWORD>(INT_MAX), "fixed_button_process_range");
+    std::array<Com<IUIAutomationCondition>, 5> conditions{
+        number_property(automation, UIA_ProcessIdPropertyId, static_cast<int>(owner), end),
+        bool_property(automation, UIA_IsPasswordPropertyId, false, end),
+        bool_property(automation, UIA_IsOffscreenPropertyId, false, end),
+        number_property(automation, UIA_ControlTypePropertyId, UIA_ButtonControlTypeId, end),
+        text_property(automation, UIA_NamePropertyId, label, end)};
+    std::array<IUIAutomationCondition*, 5> raw{};
+    for (std::size_t index = 0; index < raw.size(); ++index) raw[index] = conditions[index].get();
+    Com<IUIAutomationCondition> combined; Com<IUIAutomationElementArray> elements;
+    budget(end); hr(automation->CreateAndConditionFromNativeArray(raw.data(), static_cast<int>(raw.size()), combined.put()), "fixed_button_condition");
+    budget(end); hr(root->FindAll(TreeScope_Descendants, combined.get(), elements.put()), "fixed_button_search");
+    need(elements.get() != nullptr, "fixed_button_null_elements");
+    int count{}; budget(end); hr(elements->get_Length(&count), "fixed_button_count");
+    need(count >= 0 && count <= 8, "fixed_button_count_bound"); return count;
 }
 struct Page {
     Com<IUIAutomationElement> root, button;
@@ -424,9 +474,10 @@ void consider_observed_accept(IUIAutomation2* automation, HWND window, DWORD own
     out.stage = "invoke_observed_privacy_accept"; second.stage = "invoke_observed_accept";
     second.invoke_attempted = true; ++out.invoke_count;
     second.invoke_error = fresh.invoke->Invoke(); hr(second.invoke_error, "observed_accept_invoke");
-    second.invoke_succeeded = true; second.stage = "invoked";
+    second.invoke_succeeded = true; second.stage = "invoked"; second.completed_tick = GetTickCount64();
 }
-void observe_after_invoke(HWND window, DWORD owner, DWORD thread, HANDLE process, ULONGLONG end, Result& out) {
+PostPage observe_after_invoke(HWND window, DWORD owner, DWORD thread, HANDLE process, ULONGLONG end, Result& out,
+    bool fixed_buttons = false) {
     PostPage observation; observation.attempted = true;
     try {
         budget(end); verify_target(window, owner, thread, process, out); observation.owner_verified = true;
@@ -489,6 +540,8 @@ void observe_after_invoke(HWND window, DWORD owner, DWORD thread, HANDLE process
             budget(end); hr(headings->get_Length(&observation.headings[index]), "post_known_heading_count");
             need(observation.headings[index] >= 0 && observation.headings[index] <= 8, "post_known_heading_count_bound");
         }
+        if (fixed_buttons) for (std::size_t index = 0; index < observation.known_buttons.size(); ++index)
+            observation.known_buttons[index] = fixed_button_label_count(automation.get(), root.get(), owner, KnownButtonLabels[index], end);
         observation.completed = true; observation.stage = "completed";
     } catch (const Failure& failure) { observation.stage = failure.stage; observation.error = failure.result; }
     catch (...) { observation.stage = "post_unexpected_exception"; observation.error = E_UNEXPECTED; }
@@ -499,7 +552,66 @@ void observe_after_invoke(HWND window, DWORD owner, DWORD thread, HANDLE process
             observation.stage = failure.stage; observation.error = failure.result;
         }
     }
-    out.post = observation; // Discard content if ownership changed during the bounded read.
+    return observation; // Discard content if ownership changed during the bounded read.
+}
+void verify_fresh_foreground(HWND root, DWORD owner, DWORD thread, HANDLE process, Result& out) {
+    verify_desktop(out); DWORD actual_thread{}, exit_code{};
+    need(IsWindow(root) && IsWindowVisible(root) && GetAncestor(GetForegroundWindow(), GA_ROOT) == root &&
+        window_owner(root, out.session, &actual_thread) == owner && actual_thread == thread &&
+        GetProcessId(process) == owner && GetExitCodeProcess(process, &exit_code) != FALSE && exit_code == STILL_ACTIVE,
+        "fresh_foreground_owner_changed");
+}
+FreshForeground observe_fresh_foreground(HWND original, ULONGLONG second_completed, ULONGLONG end, Result& out) {
+    const ULONGLONG started = GetTickCount64(); FreshForeground observation;
+    observation.attempted = true; observation.after_second_ms = started - second_completed;
+    try {
+        budget(end); verify_desktop(out); observation.active_desktop_verified = true;
+        observation.original_target_destroyed = original && !IsWindow(original);
+        need(observation.original_target_destroyed, "original_target_not_destroyed");
+        const HWND root = GetAncestor(GetForegroundWindow(), GA_ROOT);
+        need(root != nullptr, "fresh_foreground_unavailable");
+        DWORD thread{}; const DWORD owner = window_owner(root, out.session, &thread);
+        Handle process{OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, owner), out};
+        need(process.value != nullptr, "fresh_process_open", last_error());
+        verify_fresh_foreground(root, owner, thread, process.value, out); observation.owner_verified = true;
+        try {
+            observation.class_category = foreground_class(root, observation.class_read, observation.class_error,
+                &observation.class_identifier, &observation.class_safe);
+            std::array<wchar_t, 257> family{}, app{}; UINT32 family_size = static_cast<UINT32>(family.size());
+            budget(end); const LONG family_result = GetPackageFamilyName(process.value, &family_size, family.data());
+            if (family_result == APPMODEL_ERROR_NO_PACKAGE) observation.package_category = 1;
+            else if (family_result == ERROR_SUCCESS && family_size > 1 && family_size <= family.size() && family[family_size - 1] == L'\0') {
+                observation.package_read = true;
+                observation.package_safe = safe_identifier(family.data(), family_size - 1, observation.package_identifier, true);
+                observation.package_category = std::wcscmp(family.data(), TargetFamily) == 0 ? 2U : 3U;
+            } else observation.package_error = family_result == ERROR_SUCCESS ? E_UNEXPECTED : HRESULT_FROM_WIN32(family_result);
+            UINT32 app_size = static_cast<UINT32>(app.size());
+            budget(end); const LONG app_result = GetApplicationUserModelId(process.value, &app_size, app.data());
+            if (app_result == ERROR_SUCCESS && app_size > 1 && app_size <= app.size() && app[app_size - 1] == L'\0') {
+                observation.application_read = true;
+                observation.application_safe = safe_identifier(app.data(), app_size - 1, observation.application_identifier, true);
+                observation.application_category = std::wcscmp(app.data(), TargetApplication) == 0 ? 2U : 3U;
+            } else observation.application_error = app_result == ERROR_SUCCESS ? E_UNEXPECTED : HRESULT_FROM_WIN32(app_result);
+            observation.exact_cloud_identity = observation.class_category == 6 && observation.package_category == 2 &&
+                observation.application_category == 2;
+            if (observation.exact_cloud_identity) {
+                observation.content_attempted = true;
+                observation.page = observe_after_invoke(root, owner, thread, process.value, end, out, true);
+            }
+        } catch (const Failure& failure) { observation.stage = failure.stage; observation.error = failure.result; }
+        catch (...) { observation.stage = "fresh_content_exception"; observation.error = E_UNEXPECTED; }
+        // Inventory and content never inherit the destroyed original HWND's ownership.
+        try { verify_fresh_foreground(root, owner, thread, process.value, out); observation.owner_stable = true; }
+        catch (const Failure& failure) {
+            observation = FreshForeground{}; observation.attempted = true;
+            observation.stage = failure.stage; observation.error = failure.result;
+        }
+        if (observation.owner_stable && SUCCEEDED(observation.error)) observation.stage = observation.exact_cloud_identity ?
+            (observation.page.completed ? "cloud_page_observed" : "cloud_page_unavailable") : "other_foreground_observed";
+    } catch (const Failure& failure) { observation.stage = failure.stage; observation.error = failure.result; }
+    catch (...) { observation.stage = "fresh_unexpected_exception"; observation.error = E_UNEXPECTED; }
+    observation.after_second_ms = started - second_completed; observation.elapsed_ms = GetTickCount64() - started;
+    return observation;
 }
 void prepare(Result& out, ULONGLONG end) {
     const ULONGLONG wait_end = end - PostReadBudgetMs;
@@ -542,6 +654,12 @@ void prepare(Result& out, ULONGLONG end) {
     out.stage = "wait_ordinary_desktop";
     unsigned stable{};
     while (GetTickCount64() < wait_end) {
+        if (out.second.invoke_succeeded && !out.fresh_foreground[0].attempted &&
+            GetTickCount64() - out.second.completed_tick >= 5000) {
+            const ULONGLONG limit = GetTickCount64() + 2000;
+            out.fresh_foreground[0] = observe_fresh_foreground(observed_target, out.second.completed_tick,
+                limit < wait_end ? limit : wait_end, out);
+        }
         ++out.wait_observations;
         const bool ready = ordinary_desktop(observed_target, out);
         stable = ready ? stable + 1 : 0; out.stable_observations = stable;
@@ -550,7 +668,9 @@ void prepare(Result& out, ULONGLONG end) {
         }
         Sleep(250);
     }
-    if (out.invoke_succeeded) observe_after_invoke(observed_target, owner, thread, process.value, end, out);
+    if (out.invoke_succeeded) out.post = observe_after_invoke(observed_target, owner, thread, process.value, end, out);
+    if (out.second.invoke_succeeded && !out.ordinary_desktop_verified)
+        out.fresh_foreground[1] = observe_fresh_foreground(observed_target, out.second.completed_tick, end, out);
     verify_desktop(out); out.final_active_input_desktop_verified = true;
     if (out.ordinary_desktop_verified) {
         out.stage = "completed"; out.status = out.invoke_attempted ? "completed" : "not_needed"; return;
@@ -560,6 +680,41 @@ void prepare(Result& out, ULONGLONG end) {
 void write_label(const ButtonLabel& label) {
     std::cout << "{\"status\":\"" << label.status << "\",\"hresult\":" << static_cast<std::uint32_t>(label.error)
         << ",\"category\":" << label.category << ",\"safe_ascii\":\"" << label.ascii.data() << "\"}";
+}
+template<std::size_t Size> void write_counts(const std::array<int, Size>& counts) {
+    std::cout << '[';
+    for (std::size_t index = 0; index < counts.size(); ++index) { if (index) std::cout << ','; std::cout << counts[index]; }
+    std::cout << ']';
+}
+void write_page(const PostPage& page) {
+    std::cout << "{\"attempted\":" << page.attempted << ",\"stage\":\"" << page.stage
+        << "\",\"hresult\":" << static_cast<std::uint32_t>(page.error) << ",\"owner_verified\":" << page.owner_verified
+        << ",\"owner_stable\":" << page.owner_stable << ",\"root_verified\":" << page.root_verified
+        << ",\"completed\":" << page.completed << ",\"button_count\":" << page.button_count
+        << ",\"button_verified\":" << page.button_verified << ",\"button_enabled\":" << page.enabled
+        << ",\"button_offscreen\":" << page.offscreen << ",\"invoke_available\":" << page.invoke_available
+        << ",\"invoke_pattern_hresult\":" << static_cast<std::uint32_t>(page.invoke_pattern_error)
+        << ",\"heading_counts\":";
+    write_counts(page.headings); std::cout << ",\"known_button_label_counts\":"; write_counts(page.known_buttons);
+    std::cout << ",\"button_label\":"; write_label(page.label); std::cout << '}';
+}
+void write_fresh(const FreshForeground& fresh) {
+    std::cout << "{\"attempted\":" << fresh.attempted << ",\"stage\":\"" << fresh.stage
+        << "\",\"hresult\":" << static_cast<std::uint32_t>(fresh.error) << ",\"after_second_ms\":" << fresh.after_second_ms
+        << ",\"elapsed_ms\":" << fresh.elapsed_ms << ",\"active_desktop_verified\":" << fresh.active_desktop_verified
+        << ",\"original_target_destroyed\":" << fresh.original_target_destroyed << ",\"owner_verified\":" << fresh.owner_verified
+        << ",\"owner_stable\":" << fresh.owner_stable << ",\"class_category\":" << fresh.class_category
+        << ",\"package_category\":" << fresh.package_category << ",\"application_category\":" << fresh.application_category
+        << ",\"class_hresult\":" << static_cast<std::uint32_t>(fresh.class_error)
+        << ",\"package_hresult\":" << static_cast<std::uint32_t>(fresh.package_error)
+        << ",\"application_hresult\":" << static_cast<std::uint32_t>(fresh.application_error)
+        << ",\"class_read\":" << fresh.class_read << ",\"package_read\":" << fresh.package_read
+        << ",\"application_read\":" << fresh.application_read << ",\"class_identifier_safe\":" << fresh.class_safe
+        << ",\"package_identifier_safe\":" << fresh.package_safe << ",\"application_identifier_safe\":" << fresh.application_safe
+        << ",\"class_identifier\":\"" << fresh.class_identifier.data() << "\",\"package_family\":\"" << fresh.package_identifier.data()
+        << "\",\"application_id\":\"" << fresh.application_identifier.data() << "\",\"exact_cloud_identity\":" << fresh.exact_cloud_identity
+        << ",\"content_attempted\":" << fresh.content_attempted << ",\"page\":";
+    write_page(fresh.page); std::cout << '}';
 }
 void write(const Result& out, ULONGLONG elapsed) {
     std::cout << std::boolalpha << "{\"schema\":\"first-logon-prepare/v1\",\"status\":\"" << out.status
@@ -593,19 +748,9 @@ void write(const Result& out, ULONGLONG elapsed) {
         << ",\"invoke_attempted\":" << out.second.invoke_attempted << ",\"invoke_succeeded\":" << out.second.invoke_succeeded
         << ",\"invoke_hresult\":" << static_cast<std::uint32_t>(out.second.invoke_error) << ",\"first_label\":";
     write_label(out.second.first_label); std::cout << ",\"recheck_label\":"; write_label(out.second.recheck_label); std::cout << '}';
-    std::cout << ",\"post_invoke\":{\"attempted\":" << out.post.attempted << ",\"stage\":\"" << out.post.stage
-        << "\",\"hresult\":" << static_cast<std::uint32_t>(out.post.error) << ",\"owner_verified\":" << out.post.owner_verified
-        << ",\"owner_stable\":" << out.post.owner_stable << ",\"root_verified\":" << out.post.root_verified
-        << ",\"completed\":" << out.post.completed << ",\"button_count\":" << out.post.button_count
-        << ",\"button_verified\":" << out.post.button_verified << ",\"button_enabled\":" << out.post.enabled
-        << ",\"button_offscreen\":" << out.post.offscreen << ",\"invoke_available\":" << out.post.invoke_available
-        << ",\"invoke_pattern_hresult\":" << static_cast<std::uint32_t>(out.post.invoke_pattern_error)
-        << ",\"heading_counts\":[";
-    for (std::size_t index = 0; index < out.post.headings.size(); ++index) {
-        if (index) std::cout << ',';
-        std::cout << out.post.headings[index];
-    }
-    std::cout << "],\"button_label\":"; write_label(out.post.label); std::cout << '}';
+    std::cout << ",\"post_invoke\":"; write_page(out.post);
+    std::cout << ",\"fresh_foreground\":[";
+    write_fresh(out.fresh_foreground[0]); std::cout << ','; write_fresh(out.fresh_foreground[1]); std::cout << ']';
     std::cout << ",\"foreground_class_hresult\":" << static_cast<std::uint32_t>(out.foreground_class_hresult)
         << ",\"observed_target_cloak_hresult\":" << static_cast<std::uint32_t>(out.observed_target_cloak_hresult)
         << ",\"privacy_toggle_values_changed_by_helper\":false,\"credential_fields_read\":false,"

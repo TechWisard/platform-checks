@@ -64,6 +64,9 @@ Forced termination is reported as failure and cannot prove native cleanup.
 Output consists only of a bounded JSON record with fixed status labels, numeric
 counts and HRESULTs, and booleans. The only variable UI text emitted is the
 bounded safe ASCII label of the fixed button on the verified privacy page.
+Fresh foreground diagnostics may additionally emit the bounded complete OS
+class/package/AUMID identifiers described below, obtained only from their
+specific Win32 metadata APIs.
 No arbitrary UI text, user/domain/SID,
 credentials, window handles, screenshots, or process paths are emitted. The
 exact Explorer image path is used transiently only to check the basename and
@@ -160,7 +163,8 @@ Shell presence and Explorer identity, foreground category, associated-console
 presence, and the original target HWND's existence/visibility are separate
 fields. `DWMWA_CLOAKED` is read only for that original observed target; its
 numeric HRESULT and flags are diagnostics and do not alter the readiness gate.
-No unknown window class text or UI name is emitted.
+No arbitrary UI name is emitted. The fresh foreground diagnostic may include a
+separately filtered complete OS class identifier, including an unclassified class.
 
 `wait_guard`: 0 = observation not yet completed; 1 = shell absent; 2 = foreground
 absent; 3 = foreground outside the existing ordinary categories; 4 = original
@@ -257,3 +261,83 @@ Read errors and the deadline are reported separately under `post_invoke`.
 A successful UIA Invoke, a known label, or a heading count does not prove setup,
 remote frames or input. The two-Invoke maximum and exact separate-transition
 guards remain in force for this revision.
+
+## Fresh foreground after the original window disappears
+
+[Run 40703133694, ARM job 122868011106](https://github.com/TechWisard/platform-checks/actions/runs/40703133694/job/122868011106)
+measured the guarded second Accept with S_OK and then destruction of the
+original HWND. A different foreground CoreWindow remained; native calibration
+still failed its ownership/eight-color proof. That run did not establish the
+new window's package or page, so this revision adds only read-only observations.
+
+`fresh_foreground` has two fixed slots. Slot 0 is attempted during the ordinary
+wait, no earlier than five seconds after the second Invoke completed, with a
+two-second query budget. Slot 1 is attempted at the final unsuccessful wait,
+within the existing 29-to-32-second interval. Neither slot runs without a
+successful second Invoke. Each additionally requires that the original HWND
+no longer exists. A desktop that satisfies the ordinary checks early does not
+need these late diagnostics. Actual offsets and elapsed time are reported.
+
+Each snapshot independently checks the active own console and Default input
+desktop, selects the current foreground root and opens a new
+PROCESS_QUERY_LIMITED_INFORMATION handle for that root's actual process.
+The process/thread/session, live pinned process, visible root and foreground
+are checked before metadata queries and again afterwards. It does not reuse
+the destroyed window's identity. If the final owner check fails, all collected
+identity and content data are discarded; only the fixed error stage and timing
+remain. The owned process handle is closed and participates in helper cleanup.
+
+The snapshot reads only GetClassNameW, GetPackageFamilyName and
+GetApplicationUserModelId for OS identities. Class identifiers are limited to
+128 complete ASCII characters from A-Z, a-z, 0-9, underscore and dot; package
+family/AUMID are limited to 256 with exclamation mark also allowed. There is
+no truncation or prefix output on rejection. These are OS identifiers, not
+window titles, paths, usernames or arbitrary UI text. No PID, thread ID or HWND
+is emitted by the snapshot. Independent read/safe flags and numeric HRESULTs
+distinguish a missing or unavailable identity from a successfully read value.
+
+Class categories use the existing mapping. Package category 0 means
+unread/unavailable, 1 no package, 2 the exact CloudExperienceHost family, 3
+another package. Application category 0 means unread/unavailable, 2 the exact
+CloudExperienceHost!App AUMID, 3 another successfully read AUMID.
+
+UIA content is queried only when the fresh class, family and AUMID exactly
+match the known CloudExperienceHost target. The fresh UIA root HWND/process
+and the full pinned owner are rechecked by the existing page reader. It
+queries the eleven fixed headings above, the already known button ID, and
+these seventeen fixed visible non-password Button Name conditions:
+
+| Index | Exact fixed button label |
+|---:|---|
+| 0 | Accept |
+| 1 | Next |
+| 2 | Back |
+| 3 | Yes |
+| 4 | No |
+| 5 | More |
+| 6 | Continue |
+| 7 | Done |
+| 8 | OK |
+| 9 | Cancel |
+| 10 | Learn more |
+| 11 | Save |
+| 12 | Try again |
+| 13 | Retry |
+| 14 | Skip for now |
+| 15 | Sign in |
+| 16 | Use recommended settings |
+
+`known_button_label_counts` includes visible disabled buttons; it is only a
+count of exact provider-filtered matches, not an actionable-element claim.
+Each count is bounded at eight; -1 means unread. These searches do not call
+get_CurrentName on their matches. The previous fixed-ID privacy button rule
+remains the only source of a safely emitted variable button label. Unknown
+page headings or button names are not enumerated, so zero counts do not
+establish an empty page or completed setup.
+
+No new Invoke, focus, keyboard, scrolling, window close or process stop is
+introduced. Snapshots do not authorize a third action and do not affect the
+wrapper's active-desktop/cleanup/owned-action/calibration requirements or the
+child frame/input assertions. The 32-second helper and 40-second outer wait
+remain; synchronous provider overrun is still bounded by that outer process
+timeout and is never a cleanup or functionality pass.
