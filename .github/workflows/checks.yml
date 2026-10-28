@@ -5,6 +5,8 @@ on:
     paths-ignore:
       - 'checks/session/**'
       - '.github/workflows/session-contracts.yml'
+      - 'checks/host/**'
+      - '.github/workflows/host-inventory.yml'
   pull_request:
   workflow_dispatch:
 

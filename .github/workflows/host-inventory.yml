@@ -1,0 +1,37 @@
+name: Hosted virtualization inventory
+
+on:
+  push:
+    paths:
+      - 'checks/host/**'
+      - '.github/workflows/host-inventory.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inventory:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # Existing repository pin, v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: checks/host
+
+      - name: Read host capabilities without starting a VM
+        shell: bash
+        run: /usr/bin/python3 -I checks/host/probe.py
+
+      - name: Separate privileged read-only KVM API query
+        shell: bash
+        run: |
+          set +e
+          sudo -n /usr/bin/python3 -I "$GITHUB_WORKSPACE/checks/host/probe.py" --kvm-only 2>/dev/null
+          probe_exit=$?
+          set -e
+          if (( probe_exit != 0 )); then
+            printf '{"schema":"windows-ci-host-preflight/v1","kind":"privileged_probe_unavailable","exit_code":%d}\n' "$probe_exit"
+          fi
