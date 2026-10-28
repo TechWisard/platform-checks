@@ -55,7 +55,7 @@ struct Result {
     std::array<Native, 4> native{};
     std::array<Method, 10> events{};
     std::array<Property, 15> properties{};
-    CloseEnumDiagnostic close_enum_diagnostic{};
+    CloseEnumDiagnostic close_enum_diagnostic{}, close_enum_alias_target_diagnostic{};
 };
 void failed(Result& result, const char* stage, HRESULT error) noexcept {
     if (SUCCEEDED(result.error)) { result.error = error; result.failure = stage; }
@@ -96,56 +96,76 @@ void capture_integer(const VARIANT& value, EnumConstant& output) noexcept {
     default: output.integer_present = false; break;
     }
 }
-void inspect_close_enum(ITypeInfo* owner, const FUNCDESC& method, CloseEnumDiagnostic& output) noexcept {
-    output.attempted = true;
+void capture_enum_type(ITypeInfo* info, CloseEnumDiagnostic& output) {
+    output.referenced_type_read = true;
+    TypeAttribute attributes(info); const TYPEATTR& type = *attributes.value;
+    output.attributes_read = true; output.type_kind = type.typekind; output.variable_count = type.cVars;
+    output.type_flags = type.wTypeFlags; output.instance_bytes = type.cbSizeInstance;
+    if (type.typekind == TKIND_ALIAS) {
+        output.alias_type = type.tdescAlias.vt;
+        if (type.tdescAlias.vt == VT_PTR && type.tdescAlias.lptdesc) output.alias_pointee = type.tdescAlias.lptdesc->vt;
+    }
+    TextResult name;
+    require(info->GetDocumentation(MEMBERID_NIL, &name.value, nullptr, nullptr, nullptr), "enum_diagnostic_type_name");
+    output.identifier_accepted = copy_identifier(name.view(), output.identifier);
+    output.type_name_matches = name.view() == L"ControlCloseStatus";
+    output.truncated = type.cVars > output.constants.size();
+    for (UINT index = 0; index < type.cVars && index < output.constants.size(); ++index) {
+        EnumConstant& row = output.constants[index]; ++output.count;
+        struct Variable {
+            ITypeInfo* owner; VARDESC* value{};
+            ~Variable() { if (value) owner->ReleaseVarDesc(value); }
+        } variable{info};
+        require(info->GetVarDesc(index, &variable.value), "enum_diagnostic_variable");
+        check(variable.value != nullptr, "enum_diagnostic_null_variable");
+        row.seen = true; row.variable_kind = variable.value->varkind;
+        row.declared_type = variable.value->elemdescVar.tdesc.vt;
+        TextResult member;
+        require(info->GetDocumentation(variable.value->memid, &member.value, nullptr, nullptr, nullptr), "enum_diagnostic_member_name");
+        row.identifier_accepted = copy_identifier(member.view(), row.identifier);
+        row.known_name_bits = member.view() == L"controlCloseCanProceed" ? 1U :
+            member.view() == L"controlCloseWaitForEvents" ? 2U : 0U;
+        output.known_name_bits |= row.known_name_bits;
+        if (variable.value->varkind == VAR_CONST && variable.value->lpvarValue) {
+            const VARIANT& value = *variable.value->lpvarValue;
+            row.value_present = true; row.variant_type = value.vt; capture_integer(value, row);
+            if (value.vt == VT_I4 && ((row.known_name_bits == 1 && value.lVal == 0) ||
+                (row.known_name_bits == 2 && value.lVal == 1))) row.strict_constant_bits = row.known_name_bits;
+            output.strict_constant_bits |= row.strict_constant_bits;
+        }
+    }
+    output.complete = !output.truncated;
+}
+void inspect_close_enum(ITypeInfo* owner, const FUNCDESC& method, CloseEnumDiagnostic& output,
+    CloseEnumDiagnostic& alias_target) noexcept {
+    output.attempted = true; ComPtr<ITypeInfo> info;
     try {
         check(method.cParams == 1 && method.lprgelemdescParam, "enum_diagnostic_parameter_shape");
         const TYPEDESC& descriptor = method.lprgelemdescParam[0].tdesc;
         check(descriptor.vt == VT_PTR && descriptor.lptdesc && descriptor.lptdesc->vt == VT_USERDEFINED,
             "enum_diagnostic_reference_shape");
-        ComPtr<ITypeInfo> info;
         require(owner->GetRefTypeInfo(descriptor.lptdesc->hreftype, info.put()), "enum_diagnostic_reference");
-        check(info.get() != nullptr, "enum_diagnostic_null_reference"); output.referenced_type_read = true;
+        check(info.get() != nullptr, "enum_diagnostic_null_reference");
+        capture_enum_type(info.get(), output);
+    } catch (const Failure& error) { output.error = error.result(); output.failure = error.what(); return; }
+    catch (...) { output.error = E_UNEXPECTED; output.failure = "enum_diagnostic_unexpected_exception"; return; }
+    // Only the measured named, 4-byte alias with no own constants can resolve
+    // one additional type. There are still at most 16 constant rows in total.
+    if (!output.type_name_matches || output.type_kind != TKIND_ALIAS || output.instance_bytes != sizeof(LONG) ||
+        output.variable_count != 0 || output.alias_type != VT_USERDEFINED) return;
+    alias_target.attempted = true;
+    try {
         TypeAttribute attributes(info.get()); const TYPEATTR& type = *attributes.value;
-        output.attributes_read = true; output.type_kind = type.typekind; output.variable_count = type.cVars;
-        output.type_flags = type.wTypeFlags; output.instance_bytes = type.cbSizeInstance;
-        if (type.typekind == TKIND_ALIAS) {
-            output.alias_type = type.tdescAlias.vt;
-            if (type.tdescAlias.vt == VT_PTR && type.tdescAlias.lptdesc) output.alias_pointee = type.tdescAlias.lptdesc->vt;
-        }
-        TextResult name;
-        require(info->GetDocumentation(MEMBERID_NIL, &name.value, nullptr, nullptr, nullptr), "enum_diagnostic_type_name");
-        output.identifier_accepted = copy_identifier(name.view(), output.identifier);
-        output.type_name_matches = name.view() == L"ControlCloseStatus";
-        output.truncated = type.cVars > output.constants.size();
-        for (UINT index = 0; index < type.cVars && index < output.constants.size(); ++index) {
-            EnumConstant& row = output.constants[index]; ++output.count;
-            struct Variable {
-                ITypeInfo* owner; VARDESC* value{};
-                ~Variable() { if (value) owner->ReleaseVarDesc(value); }
-            } variable{info.get()};
-            require(info->GetVarDesc(index, &variable.value), "enum_diagnostic_variable");
-            check(variable.value != nullptr, "enum_diagnostic_null_variable");
-            row.seen = true; row.variable_kind = variable.value->varkind;
-            row.declared_type = variable.value->elemdescVar.tdesc.vt;
-            TextResult member;
-            require(info->GetDocumentation(variable.value->memid, &member.value, nullptr, nullptr, nullptr), "enum_diagnostic_member_name");
-            row.identifier_accepted = copy_identifier(member.view(), row.identifier);
-            row.known_name_bits = member.view() == L"controlCloseCanProceed" ? 1U :
-                member.view() == L"controlCloseWaitForEvents" ? 2U : 0U;
-            output.known_name_bits |= row.known_name_bits;
-            if (variable.value->varkind == VAR_CONST && variable.value->lpvarValue) {
-                const VARIANT& value = *variable.value->lpvarValue;
-                row.value_present = true; row.variant_type = value.vt; capture_integer(value, row);
-                if (value.vt == VT_I4 && ((row.known_name_bits == 1 && value.lVal == 0) ||
-                    (row.known_name_bits == 2 && value.lVal == 1))) row.strict_constant_bits = row.known_name_bits;
-                output.strict_constant_bits |= row.strict_constant_bits;
-            }
-        }
-        output.complete = !output.truncated;
-    } catch (const Failure& error) { output.error = error.result(); output.failure = error.what(); }
-    catch (...) { output.error = E_UNEXPECTED; output.failure = "enum_diagnostic_unexpected_exception"; }
+        check(type.typekind == TKIND_ALIAS && type.cbSizeInstance == sizeof(LONG) && type.cVars == 0 &&
+            type.tdescAlias.vt == VT_USERDEFINED, "enum_diagnostic_alias_shape_changed");
+        ComPtr<ITypeInfo> target;
+        require(info->GetRefTypeInfo(type.tdescAlias.hreftype, target.put()), "enum_diagnostic_alias_target");
+        check(target.get() != nullptr, "enum_diagnostic_null_alias_target");
+        capture_enum_type(target.get(), alias_target);
+    } catch (const Failure& error) { alias_target.error = error.result(); alias_target.failure = error.what(); }
+    catch (...) { alias_target.error = E_UNEXPECTED; alias_target.failure = "enum_diagnostic_alias_exception"; }
 }
+
 ComPtr<ITypeLib> type_library() {
     std::array<wchar_t, 32768> path{};
     const UINT length = GetSystemDirectoryW(path.data(), static_cast<UINT>(path.size()));
@@ -187,7 +207,7 @@ void inspect_native(IUnknown* control, ITypeLib* library, REFIID iid, const char
                 check(!method.seen, "duplicate_native_member", TYPE_E_AMBIGUOUSNAME);
                 capture(method, *descriptor.value);
                 if (spec.specification.signature == Signature::close_out)
-                    inspect_close_enum(info.get(), *descriptor.value, result.close_enum_diagnostic);
+                    inspect_close_enum(info.get(), *descriptor.value, result.close_enum_diagnostic, result.close_enum_alias_target_diagnostic);
                 validate_method(info.get(), type, *descriptor.value, spec.specification.signature);
                 method.verified = true;
             }
@@ -446,6 +466,7 @@ int report(Result& result, ULONGLONG elapsed) {
         std::cout << "]}";
     }
     std::cout << "],\"close_enum_diagnostic\":"; close_enum_json(result.close_enum_diagnostic);
+    std::cout << ",\"close_enum_alias_target_diagnostic\":"; close_enum_json(result.close_enum_alias_target_diagnostic);
     std::cout << ",\"events\":[";
     for (std::size_t i = 0; i < result.events.size(); ++i) { if (i) std::cout << ','; method_json(result.events[i]); }
     std::cout << "],\"event_error_hresult\":" << static_cast<std::uint32_t>(result.event_error) << ",\"event_failure_operation\":\"" << result.event_failure << "\",\"properties\":[";

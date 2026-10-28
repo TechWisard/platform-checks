@@ -56,7 +56,7 @@ architectures while the other three native contracts, ten event signatures and
 all fifteen property readbacks passed. The initial record establishes the
 parameter shape (`VT_PTR` to `VT_USERDEFINED`, flags `FOUT | FRETVAL`), but does
 not identify which referenced enum condition failed. This diagnostic records
-that already-referenced type before invoking the unchanged strict validator:
+that already-referenced type before invoking the strict validator:
 
 - Actual type kind/name, variable count, flags, instance size and alias shape
   (if the immediate type is an alias); no recursive type-library inventory.
@@ -70,10 +70,29 @@ that already-referenced type before invoking the unchanged strict validator:
   `ControlCloseStatus` match flag. These diagnostic bits do not replace the
   strict validator or enter any PASS decision.
 
-Diagnostic read failure/truncation is explicit and does not overwrite the
-original contract failure. `abi_contract.hpp`, native calls, required success
-gates, connection state requirements and the wrapper deadline remain unchanged.
-RequestClose is still metadata-only and is never called.
+Run 40701169355 at commit `0222b25bcef874969097cd27efafb970a2beaa3c`
+measured the same immediate type on both architectures: exact public name
+`ControlCloseStatus`, `TKIND_ALIAS`, size 4, no own variables, and
+`tdescAlias.vt=VT_USERDEFINED`. The previous validator rejected that alias as
+though the parameter had to reference an enum directly. The alias target was
+not read in that run; its enum kind and constants remain unverified.
+
+The strict validator now accepts the measured public-name/size/alias shape and
+resolves exactly one reference. That target must itself be `TKIND_ENUM`, size
+4, with exactly two `VAR_CONST` values represented as `VT_I4`: the original
+exact names and values 0/1 are still required. A further alias, wrong type,
+wrong name/value, numeric conversion or unavailable descriptor is not accepted.
+The existing direct enum path also retains the exact public-name requirement.
+
+The diagnostic follows that same named four-byte alias shape at most once and
+records `close_enum_alias_target_diagnostic` with the same identifier filter and
+constant bounds. Because the alias has no own variables, at most sixteen
+constant rows are read across both type records. Diagnostic fields never
+replace validator results or enter a PASS decision. Diagnostic failure or
+truncation is explicit and does not overwrite the original contract failure.
+Native calls, required success gates, connection state requirements and the
+wrapper deadline remain unchanged. RequestClose remains metadata-only and is
+never called.
 
 ## Limits and execution
 
@@ -89,8 +108,10 @@ The dedicated native-component workflow builds and executes this standalone
 probe on ARM64 and x64 Windows. Run 40699247035 at commit
 `902aa5ec8aaed54a9a7ba108394fcaa2d4482bcf` failed the close-enum contract on
 Windows 11 ARM64 and Windows Server 2025 x64; both reported successful owned
-cleanup and Connected=0 before/after configuration. The diagnostic revision has
-not yet run on Windows; local cross-compilation alone is not an execution result.
+cleanup and Connected=0 before/after configuration. The next diagnostic run
+identified the immediate alias on both systems and preserved the strict FAIL.
+This one-level alias-resolution revision has not yet run on Windows; local
+cross-compilation alone is not an execution result.
 
 `run.ps1 -Executable <built-exe>` imposes a 20-second process deadline, followed
 by at most five seconds to confirm termination of its own process. It caps its
@@ -110,3 +131,4 @@ Primary references:
 - https://learn.microsoft.com/en-us/windows/win32/api/oaidl/ns-oaidl-typeattr
 - https://learn.microsoft.com/en-us/windows/win32/api/oaidl/ns-oaidl-vardesc
 - https://learn.microsoft.com/en-us/windows/win32/api/oaidl/nf-oaidl-itypeinfo-getvardesc
+- https://learn.microsoft.com/en-us/windows/win32/api/oaidl/nf-oaidl-itypeinfo-getreftypeinfo

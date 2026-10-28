@@ -57,11 +57,25 @@ bool out_parameter(const ELEMDESC& parameter, VARTYPE type, bool retval) noexcep
 
 bool close_enum(ITypeInfo* owner, const TYPEDESC& type) {
     if (type.vt != VT_PTR || !type.lptdesc || type.lptdesc->vt != VT_USERDEFINED) return false;
+    ComPtr<ITypeInfo> reference;
+    require(owner->GetRefTypeInfo(type.lptdesc->hreftype, reference.put()), "Read close enum type");
+    if (!reference) throw Failure("Null close enum type", E_UNEXPECTED);
     ComPtr<ITypeInfo> information;
-    require(owner->GetRefTypeInfo(type.lptdesc->hreftype, information.put()), "Read close enum type");
+    {
+        TypeAttribute attributes(reference.get());
+        TextResult name; require(reference->GetDocumentation(MEMBERID_NIL, &name.value, nullptr, nullptr, nullptr), "Read close enum name");
+        if (name.view() != L"ControlCloseStatus" || attributes.value->cbSizeInstance != sizeof(LONG)) return false;
+        if (attributes.value->typekind == TKIND_ALIAS) {
+            // The installed ARM64/x64 TLB exposes this public name as one
+            // 32-bit alias. Resolve only that measured shape, without recursion.
+            if (attributes.value->cVars != 0 || attributes.value->tdescAlias.vt != VT_USERDEFINED) return false;
+            require(reference->GetRefTypeInfo(attributes.value->tdescAlias.hreftype, information.put()), "Read close enum alias target");
+            if (!information) throw Failure("Null close enum alias target", E_UNEXPECTED);
+        } else if (attributes.value->typekind == TKIND_ENUM) information.copy_from(reference.get());
+        else return false;
+    }
     TypeAttribute attributes(information.get());
-    TextResult name; require(information->GetDocumentation(MEMBERID_NIL, &name.value, nullptr, nullptr, nullptr), "Read close enum name");
-    if (attributes.value->typekind != TKIND_ENUM || attributes.value->cVars != 2 || name.view() != L"ControlCloseStatus") return false;
+    if (attributes.value->typekind != TKIND_ENUM || attributes.value->cVars != 2 || attributes.value->cbSizeInstance != sizeof(LONG)) return false;
     unsigned found{};
     for (UINT index = 0; index < attributes.value->cVars; ++index) {
         VARDESC* descriptor{}; require(information->GetVarDesc(index, &descriptor), "Read close enum constant");
