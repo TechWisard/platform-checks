@@ -57,6 +57,7 @@ if ($stdout.Wait(10000)) { Write-Output $stdout.Result }
 if ($stderr.Wait(10000) -and $stderr.Result) { Write-Output $stderr.Result }
 $process.Dispose()
 Write-RecentAuthFailures -StartTime $authWindowStart
+Write-RecentRdpEvents -StartTime $authWindowStart
 'environment_snapshot_phase=after'
 Write-SessionEnvironmentSnapshot
 if (Test-Path -LiteralPath $evidencePath) {

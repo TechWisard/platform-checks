@@ -296,3 +296,163 @@ function Write-RecentAuthFailures {
         }
     }
 }
+
+function ConvertTo-SessionProbeErrorCode {
+    param([AllowNull()][string] $Text)
+    $unsignedCode = ConvertTo-SessionProbeUInt32 $Text
+    if ($null -ne $unsignedCode) { return $unsignedCode }
+    # HRESULTs may be recorded as signed decimal Int32 values. Preserve their bits.
+    if ($null -ne $Text -and $Text -match '^-[0-9]{1,10}$') {
+        $signedCode = [int]0
+        if ([int]::TryParse($Text, [System.Globalization.NumberStyles]::AllowLeadingSign,
+            [System.Globalization.CultureInfo]::InvariantCulture, [ref]$signedCode)) {
+            return [long]([long]$signedCode -band 4294967295L)
+        }
+    }
+    return $null
+}
+
+function ConvertFrom-SessionProbeRdpEvent {
+    param($Record)
+    $reader = $null
+    $textReader = $null
+    try {
+        # The same bounds and XML restrictions as the 4625 parser above.
+        $xmlText = $Record.ToXml()
+        if ($xmlText.Length -gt 65536) { throw [System.IO.InvalidDataException]::new() }
+        $settings = [System.Xml.XmlReaderSettings]::new()
+        $settings.DtdProcessing = [System.Xml.DtdProcessing]::Prohibit
+        $settings.XmlResolver = $null
+        $settings.MaxCharactersInDocument = 65536
+        $textReader = [System.IO.StringReader]::new($xmlText)
+        $reader = [System.Xml.XmlReader]::Create($textReader, $settings)
+        $document = [System.Xml.XmlDocument]::new()
+        $document.XmlResolver = $null
+        $document.Load($reader)
+        $namespaces = [System.Xml.XmlNamespaceManager]::new($document.NameTable)
+        $namespaces.AddNamespace('e', 'http://schemas.microsoft.com/win/2004/08/events/event')
+        $allowedFields = @{
+            'ErrorCode' = 'error_code'; 'Error Code' = 'error_code'; 'HResult' = 'hresult'
+            'Status' = 'status'; 'SubStatus' = 'substatus'; 'Reason' = 'reason'
+            'ReasonCode' = 'reason_code'; 'Reason Code' = 'reason_code'
+            'PreviousState' = 'previous_state'; 'NewState' = 'new_state'; 'Event' = 'state_event'
+        }
+        $numericFields = [ordered]@{}
+        $rejectedFields = 0
+        $dataNodes = @($document.SelectNodes('/e:Event/e:EventData/e:Data', $namespaces))
+        $userNodes = @($document.SelectNodes('/e:Event/e:UserData//*[not(*)]', $namespaces))
+        foreach ($node in @($dataNodes + $userNodes)) {
+            $fieldName = $node.LocalName
+            if ($node.ParentNode.LocalName -eq 'EventData' -and $node.LocalName -eq 'Data') {
+                $fieldName = $node.GetAttribute('Name')
+            }
+            if (-not $allowedFields.ContainsKey($fieldName)) { continue }
+            $code = ConvertTo-SessionProbeErrorCode $node.InnerText
+            if ($null -eq $code) { $rejectedFields++; continue }
+            $canonicalName = $allowedFields[$fieldName]
+            if ($numericFields.Contains($canonicalName)) {
+                if ($numericFields[$canonicalName] -ne $code) { throw [System.IO.InvalidDataException]::new() }
+            } else {
+                $numericFields.Add($canonicalName, $code)
+            }
+        }
+        if ($null -eq $Record.TimeCreated -or $null -eq $Record.RecordId) {
+            throw [System.IO.InvalidDataException]::new()
+        }
+        return [ordered]@{ availability = 'available'; hresult = 0
+            event_id = [int]$Record.Id
+            version = $(if ($null -ne $Record.Version) { [int]$Record.Version } else { $null })
+            level = $(if ($null -ne $Record.Level) { [int]$Record.Level } else { $null })
+            record_id = [long]$Record.RecordId; utc = $Record.TimeCreated.ToUniversalTime().ToString('o')
+            numeric_fields = $numericFields; rejected_numeric_fields = $rejectedFields }
+    } catch {
+        $failure = Get-SessionProbeError $_
+        return [ordered]@{ availability = 'invalid_event'; hresult = $failure.hresult }
+    } finally {
+        if ($null -ne $reader) { $reader.Dispose() }
+        if ($null -ne $textReader) { $textReader.Dispose() }
+    }
+}
+
+function Get-SessionProbeRdpChannelEvents {
+    param(
+        [ValidateSet('rdp_client', 'rdp_core_ts', 'local_session_manager')][string] $Channel,
+        [datetime] $StartUtc,
+        [datetime] $EndUtc
+    )
+    $channelNames = @{
+        'rdp_client' = 'Microsoft-Windows-TerminalServices-RDPClient/Operational'
+        'rdp_core_ts' = 'Microsoft-Windows-RemoteDesktopServices-RdpCoreTS/Operational'
+        'local_session_manager' = 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'
+    }
+    $limit = 16
+    $logConfigurations = @()
+    $records = @()
+    $enabled = $null
+    try {
+        $logConfigurations = @(Get-WinEvent -ListLog $channelNames[$Channel] `
+            -ErrorAction Stop -WarningAction SilentlyContinue -InformationAction SilentlyContinue `
+            -Verbose:$false -Debug:$false)
+        if ($logConfigurations.Count -eq 0) {
+            return [ordered]@{ channel = $Channel; availability = 'absent'; hresult = 0
+                enabled = $null; limit = $limit; events = @() }
+        }
+        if ($logConfigurations.Count -ne 1) { throw [System.IO.InvalidDataException]::new() }
+        $enabled = [bool]$logConfigurations[0].IsEnabled
+        if (-not $enabled) {
+            return [ordered]@{ channel = $Channel; availability = 'disabled'; hresult = 0
+                enabled = $false; limit = $limit; events = @() }
+        }
+        $query = @{ LogName = $channelNames[$Channel]; StartTime = $StartUtc; EndTime = $EndUtc }
+        $records = @(Get-WinEvent -FilterHashtable $query -MaxEvents $limit `
+            -ErrorAction Stop -WarningAction SilentlyContinue -InformationAction SilentlyContinue `
+            -Verbose:$false -Debug:$false)
+        $events = @(foreach ($record in $records) { ConvertFrom-SessionProbeRdpEvent $record })
+        return [ordered]@{ channel = $Channel
+            availability = $(if ($events.Count) { 'available' } else { 'no_events' }); hresult = 0
+            enabled = $true; limit = $limit; limit_reached = ($records.Count -eq $limit); events = $events }
+    } catch {
+        if ($_.FullyQualifiedErrorId -like 'NoMatchingEventsFound*') {
+            return [ordered]@{ channel = $Channel; availability = 'no_events'; hresult = 0
+                enabled = $enabled; limit = $limit; events = @() }
+        }
+        $failure = Get-SessionProbeError $_
+        $availability = $failure.availability
+        if ($_.FullyQualifiedErrorId -like 'NoMatchingLogsFound*') { $availability = 'absent' }
+        return [ordered]@{ channel = $Channel; availability = $availability; hresult = $failure.hresult
+            enabled = $enabled; limit = $limit; events = @() }
+    } finally {
+        foreach ($record in $records) {
+            if ($record -is [System.IDisposable]) { $record.Dispose() }
+        }
+        foreach ($configuration in $logConfigurations) {
+            if ($configuration -is [System.IDisposable]) { $configuration.Dispose() }
+        }
+    }
+}
+
+function Write-RecentRdpEvents {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][datetime] $StartTime)
+    $ErrorActionPreference = 'Stop'
+    try {
+        $endUtc = [datetime]::UtcNow
+        $startUtc = $StartTime.ToUniversalTime()
+        if ($startUtc -gt $endUtc) { throw [System.ArgumentOutOfRangeException]::new() }
+        $rangeClamped = $startUtc -lt $endUtc.AddMinutes(-30)
+        if ($rangeClamped) { $startUtc = $endUtc.AddMinutes(-30) }
+        $channels = @(foreach ($channel in @('rdp_client', 'rdp_core_ts', 'local_session_manager')) {
+            Get-SessionProbeRdpChannelEvents -Channel $channel -StartUtc $startUtc -EndUtc $endUtc
+        })
+        Write-SessionProbeJson ([ordered]@{ schema = 'session-rdp-events/v1'
+            attribution = 'time_window_only'; availability = 'snapshot'
+            start_utc = $startUtc.ToString('o'); end_utc = $endUtc.ToString('o')
+            time_range_clamped = $rangeClamped; channel_limit = 3; events_per_channel_limit = 16
+            channels = $channels })
+    } catch {
+        $failure = Get-SessionProbeError $_
+        Write-SessionProbeJson ([ordered]@{ schema = 'session-rdp-events/v1'
+            attribution = 'time_window_only'; availability = $failure.availability
+            hresult = $failure.hresult; channels = @() })
+    }
+}

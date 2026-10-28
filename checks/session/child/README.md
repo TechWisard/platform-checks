@@ -166,6 +166,28 @@ messages, IP addresses or full event XML are emitted. These are explicitly
 Missing auditing or denied access remains unavailable/no-events; audit policy
 is never changed. These diagnostic records cannot make a failed test pass.
 
+The same time window is read from three already enabled RDP Operational logs,
+up to 16 events per channel. Only event metadata and explicitly allowed numeric
+error/state fields are emitted. Disabled logs stay disabled. These records also
+have `attribution=time_window_only`.
+
+The witness's identity report is separate from a bounded, atomic
+`witness-render/v1` report. The latter records Shown/Paint observations, its own
+window geometry and desktop categories, UOI_IO results and aggregate color
+counts from its own client area. The parent verifies its nonce/session/identity
+binding and excludes the nonce/digest from published observations. Post-identity
+UI failures are recorded numerically and terminate the witness without an error
+dialog. No image or screen text is written.
+
+Parent capture still uses one `SourceCopy` of the same ActiveX region. `LockBits`
+and sampled-row copies replace per-pixel interop calls. The 4-pixel sample step,
+RGB tolerance 3 and minimum 80 samples for all eight colors remain unchanged.
+First, periodic (at most once per 10 seconds), and final observations include
+color counts, minimum distances, virtual/client geometry, DPI and window
+visibility/ownership measurements. None of those diagnostic fields substitutes
+for receiving the unpredictable frame challenge. This geometry probe targets
+modern Windows 10/11 and Server 2016+ APIs; the CI matrix records its actual OS.
+
 `EnableFrameBufferRedirection` is requested as a documented optional loopback
 optimization. Its accepted setting does not prove that the optimized transport
 was negotiated, and no performance claim follows from this experiment.

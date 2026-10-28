@@ -317,6 +317,7 @@ internal sealed class ExperimentForm : Form
     private readonly bool alternateTestAccount;
     private readonly TimeSpan timeout;
     private readonly RdpHost host = new() { Dock = DockStyle.Fill };
+    private readonly FrameProbe frameProbe = new();
     private readonly string nonce = Convert.ToHexString(RandomNumberGenerator.GetBytes(24));
     private readonly string work = Path.Combine(Path.GetTempPath(), "session-contract-" + Guid.NewGuid().ToString("N"));
     private readonly string taskName = "SessionContractExperiment-" + Guid.NewGuid().ToString("N");
@@ -329,6 +330,9 @@ internal sealed class ExperimentForm : Form
     private OwnedTestAccount? testAccount;
     private RdpPasswordControl? passwordControl;
     private WitnessSandbox? witnessSandbox;
+    private string? witnessRenderPath;
+    private long witnessRenderSequence = -1;
+    private bool witnessRenderReadErrorReported;
     private dynamic? taskFolder;
     private dynamic? registeredTask;
     private bool ownTask;
@@ -508,6 +512,7 @@ internal sealed class ExperimentForm : Form
                 Directory.CreateDirectory(work);
                 witnessFile = Path.Combine(work, "witness.json");
             }
+            witnessRenderPath = Path.Combine(Path.GetDirectoryName(witnessFile)!, "witness-render.json");
             StartWitness(evidence.ChildSessionId!.Value, witnessFile);
             bool witnessVerified = false;
             while (deadline.Elapsed < timeout)
@@ -532,6 +537,7 @@ internal sealed class ExperimentForm : Form
                     witnessVerified = true;
                     evidence.Event("witness_process_verified");
                 }
+                if (witnessVerified) ReadWitnessRendering();
                 if (witnessVerified && CheckFrame())
                 {
                     evidence.FrameChallengeVerified = true;
@@ -564,6 +570,40 @@ internal sealed class ExperimentForm : Form
         evidence.Status = "unsupported_environment";
         evidence.Event(reason);
         ExitCode = 77;
+    }
+
+    private void ReadWitnessRendering()
+    {
+        if (witnessRenderPath is null || !File.Exists(witnessRenderPath)) return;
+        try
+        {
+            using FileStream file = new(witnessRenderPath, FileMode.Open, FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete);
+            if (file.Length is <= 0 or > 65536) throw new ExperimentFailure("witness_render_report_size_invalid");
+            using JsonDocument document = JsonDocument.Parse(file);
+            JsonElement root = document.RootElement;
+            if (root.GetProperty("schema").GetString() != "witness-render/v1" ||
+                root.GetProperty("nonce").GetString() != nonce ||
+                root.GetProperty("session_id").GetUInt32() != evidence.ChildSessionId ||
+                root.GetProperty("identity_digest").GetString() != Program.IdentityDigest(nonce, expectedWitnessSid))
+                throw new ExperimentFailure("witness_render_report_binding_invalid");
+            long sequence = root.GetProperty("sequence").GetInt64();
+            if (sequence <= witnessRenderSequence) return;
+            Dictionary<string, JsonElement> observation = new(StringComparer.Ordinal);
+            foreach (JsonProperty property in root.EnumerateObject())
+                if (property.Name is not "nonce" and not "identity_digest")
+                    observation.Add(property.Name, property.Value.Clone());
+            evidence.Event("witness_render_observation", observation);
+            witnessRenderSequence = sequence;
+            witnessRenderReadErrorReported = false;
+        }
+        catch (Exception ex)
+        {
+            // This is supplementary diagnostics. Its absence or failure cannot
+            // satisfy or weaken the independent rendered-frame challenge.
+            if (!witnessRenderReadErrorReported) evidence.Error("witness_render_report_unavailable", ex);
+            witnessRenderReadErrorReported = true;
+        }
     }
 
     private void StartWitness(uint session, string result)
@@ -632,25 +672,9 @@ internal sealed class ExperimentForm : Form
     private bool CheckFrame()
     {
         if (control is null || Convert.ToInt32(Dispatch.Get(control, "Connected"), CultureInfo.InvariantCulture) != 1) return false;
-        Rectangle region = host.RectangleToScreen(host.ClientRectangle);
-        if (region.Width <= 0 || region.Height <= 0 || region.Width > 4096 || region.Height > 4096) return false;
-        Color[] palette = Program.ChallengeColors(nonce);
-        int[] counts = new int[palette.Length];
-        using Bitmap bitmap = new(region.Width, region.Height);
-        using (Graphics graphics = Graphics.FromImage(bitmap))
-            graphics.CopyFromScreen(region.Location, Point.Empty, region.Size, CopyPixelOperation.SourceCopy);
-        // No screenshot is written or uploaded. Only the random challenge colors
-        // drawn by our own process are counted; no desktop text is extracted.
-        for (int y = 0; y < bitmap.Height; y += 4)
-        for (int x = 0; x < bitmap.Width; x += 4)
-        {
-            Color pixel = bitmap.GetPixel(x, y);
-            for (int i = 0; i < palette.Length; i++)
-                if (Math.Abs(pixel.R - palette[i].R) <= 3 && Math.Abs(pixel.G - palette[i].G) <= 3 && Math.Abs(pixel.B - palette[i].B) <= 3)
-                    counts[i]++;
-        }
-        bool match = counts.All(count => count >= 80);
-        if (match) evidence.Event("rendered_frame_challenge_matched", new { distinct_colors = palette.Length, matched_samples = counts });
+        FrameSamples? samples = frameProbe.Capture(host, this, Program.ChallengeColors(nonce), evidence.Event);
+        bool match = samples?.MatchesChallenge == true;
+        if (match) evidence.Event("rendered_frame_challenge_matched", new { distinct_colors = 8, matched_samples = samples!.CountsWithin3 });
         return match;
     }
 
@@ -658,7 +682,9 @@ internal sealed class ExperimentForm : Form
     {
         bool cleanupFailed = false;
         bool controlDisconnected = control is null;
+        frameProbe.RecordFinal(evidence.Event);
         evidence.Event("cleanup_started");
+        ReadWitnessRendering();
         try { connectionEvents?.BeginCleanup(); }
         catch (Exception ex) { evidence.Error("event_cleanup_start_failed", ex); cleanupFailed = true; }
         if (ownTask)
@@ -796,9 +822,15 @@ internal sealed class ExperimentForm : Form
 internal sealed class WitnessForm : Form
 {
     private readonly Color[] colors;
+    private readonly WitnessRenderEvidence render;
     private readonly System.Windows.Forms.Timer lifetime = new() { Interval = 150000 };
-    internal WitnessForm(string nonce)
+    private readonly System.Windows.Forms.Timer diagnostics = new() { Interval = 1000 };
+    private readonly Stopwatch shownFor = new();
+    private static readonly int[] SnapshotSeconds = { 1, 5, 15, 30, 45, 60, 75, 90, 105, 115 };
+    private int nextSnapshot;
+    internal WitnessForm(string nonce, WitnessRenderEvidence render)
     {
+        this.render = render;
         colors = Program.ChallengeColors(nonce);
         Text = "Session rendering witness";
         FormBorderStyle = FormBorderStyle.None;
@@ -807,17 +839,44 @@ internal sealed class WitnessForm : Form
         BackColor = Color.Black;
         DoubleBuffered = true;
         lifetime.Tick += (_, _) => Close();
-        Shown += (_, _) => lifetime.Start();
-        FormClosed += (_, _) => lifetime.Dispose();
+        Shown += (_, _) =>
+        {
+            render.Shown(this);
+            shownFor.Start();
+            lifetime.Start();
+            diagnostics.Start();
+        };
+        diagnostics.Tick += (_, _) =>
+        {
+            if (nextSnapshot < SnapshotSeconds.Length && shownFor.Elapsed.TotalSeconds >= SnapshotSeconds[nextSnapshot])
+            {
+                // Coalesce missed intervals instead of emitting a burst after a
+                // busy UI thread. Sampling occurs outside OnPaint/double buffering.
+                while (nextSnapshot < SnapshotSeconds.Length && shownFor.Elapsed.TotalSeconds >= SnapshotSeconds[nextSnapshot]) nextSnapshot++;
+                render.Capture(this, "timer", captureFrame: true);
+            }
+            if (nextSnapshot == SnapshotSeconds.Length) diagnostics.Stop();
+        };
+        FormClosed += (_, _) => { lifetime.Dispose(); diagnostics.Dispose(); shownFor.Stop(); };
     }
     protected override void OnPaint(PaintEventArgs e)
     {
-        base.OnPaint(e);
-        for (int i = 0; i < colors.Length; i++)
+        try
         {
-            using SolidBrush brush = new(colors[i]);
-            e.Graphics.FillRectangle(brush, 40 + (i % 4) * 150, 40 + (i / 4) * 150, 120, 120);
+            base.OnPaint(e);
+            for (int i = 0; i < colors.Length; i++)
+            {
+                using SolidBrush brush = new(colors[i]);
+                e.Graphics.FillRectangle(brush, 40 + (i % 4) * 150, 40 + (i / 4) * 150, 120, 120);
+            }
+            render.PaintCompleted();
         }
+        catch (Exception ex) { render.RecordException("paint", ex); throw; }
+    }
+    protected override void OnFormClosing(FormClosingEventArgs e)
+    {
+        render.Capture(this, "form_closing", captureFrame: false, final: true, closeReason: (int)e.CloseReason);
+        base.OnFormClosing(e);
     }
 }
 
@@ -895,16 +954,49 @@ internal static class Program
         using WindowsIdentity identity = WindowsIdentity.GetCurrent();
         string? sid = identity.User?.Value;
         if (sid is null) return 2;
-        bool administratorGroupPresent = TokenEvidence.HasAdministratorGroupIncludingDenyOnly(identity);
-        string json = JsonSerializer.Serialize(new { nonce = args[2], session_id = actual, identity_digest = IdentityDigest(args[2], sid),
-            administrator_group_present = administratorGroupPresent });
-        string temporary = output + "." + Guid.NewGuid().ToString("N") + ".tmp";
-        File.WriteAllText(temporary, json, new UTF8Encoding(false));
-        File.Move(temporary, output, false);
-        Application.EnableVisualStyles();
-        Application.SetCompatibleTextRenderingDefault(false);
-        Application.Run(new WitnessForm(args[2]));
-        return 0;
+        WitnessRenderEvidence? render = null;
+        ThreadExceptionEventHandler? uiException = null;
+        int result = 2;
+        try
+        {
+            bool administratorGroupPresent = TokenEvidence.HasAdministratorGroupIncludingDenyOnly(identity);
+            string digest = IdentityDigest(args[2], sid);
+            render = new WitnessRenderEvidence(output, args[2], actual, digest);
+            string json = JsonSerializer.Serialize(new { nonce = args[2], session_id = actual, identity_digest = digest,
+                administrator_group_present = administratorGroupPresent });
+            string temporary = output + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            File.WriteAllText(temporary, json, new UTF8Encoding(false));
+            File.Move(temporary, output, false);
+            render.IdentityWritten();
+            // Handle this test process's own UI errors without opening an error
+            // dialog. Record only numeric errors and then terminate its UI loop.
+            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+            uiException = (_, error) =>
+            {
+                result = 2;
+                render.RecordException("ui_thread", error.Exception);
+                Application.ExitThread();
+            };
+            Application.ThreadException += uiException;
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+            using WitnessForm form = new(args[2], render);
+            result = 0;
+            Application.Run(form);
+            if (render.UiFailed) result = 2;
+        }
+        catch (Exception ex)
+        {
+            result = 2;
+            render?.RecordException("startup_or_message_loop", ex);
+            Console.Error.WriteLine("witness_ui_failed;hresult=" + ex.HResult.ToString(CultureInfo.InvariantCulture));
+        }
+        finally
+        {
+            if (uiException is not null) Application.ThreadException -= uiException;
+            render?.Returning(result);
+        }
+        return result;
     }
 
     internal static string IdentityDigest(string nonce, string sid) =>
