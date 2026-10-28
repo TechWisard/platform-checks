@@ -17,6 +17,9 @@ import run_guest as guest
 class HostContractTests(unittest.TestCase):
     nonce = "1A" * 24
 
+    def hello(self, nonce=None):
+        return b"\nGUEST_HELLO_V1 " + (nonce or self.nonce).encode("ascii") + b"\n"
+
     def frame(self, value):
         body = json.dumps(value, separators=(",", ":")).encode()
         return b"GUEST_RESULT_V1 " + str(len(body)).encode() + b" " + hashlib.sha256(body).hexdigest().upper().encode() + b"\n" + body + b"\n"
@@ -26,7 +29,7 @@ class HostContractTests(unittest.TestCase):
 
     def test_fragmented_frame_and_phase(self):
         reader = guest.SerialReader(self.nonce)
-        data = b"GUEST_PHASE_V1 supervisor_started\n" + self.frame(self.value())
+        data = self.hello() + b"GUEST_PHASE_V1 supervisor_started\n" + self.frame(self.value())
         phases = []
         for start in range(0, len(data), 7):
             phases.extend(reader.feed(data[start:start + 7]))
@@ -46,14 +49,75 @@ class HostContractTests(unittest.TestCase):
         for data in cases:
             with self.subTest(length=len(data)):
                 with self.assertRaises(guest.Failure):
-                    guest.SerialReader(self.nonce).feed(data)
+                    guest.SerialReader(self.nonce).feed(self.hello() + data)
 
     def test_no_phase_or_serial_startup_counts_as_success(self):
         reader = guest.SerialReader(self.nonce)
-        reader.feed(b"GUEST_PHASE_V1 supervisor_started\n")
+        reader.feed(self.hello() + b"GUEST_PHASE_V1 supervisor_started\n")
         self.assertIsNone(reader.result)
         with self.assertRaises(guest.Failure):
             reader.feed(b"GUEST_PHASE_V1 supervisor_started\n" * 32)
+
+    def test_ansi_no_newline_and_split_hello(self):
+        reader = guest.SerialReader(self.nonce)
+        noise = b"\x1b[2J\x1b[?25lBdsDxe: UEFI boot output without a final newline"
+        data = noise + self.hello() + b"GUEST_PHASE_V1 supervisor_started\n" + self.frame(self.value())
+        phases = []
+        for byte in data:
+            phases.extend(reader.feed(bytes([byte])))
+        self.assertTrue(reader.hello_verified)
+        self.assertEqual(reader.result, self.value())
+        self.assertEqual(phases, ["supervisor_started"])
+        observation = reader.startup_observation()
+        self.assertEqual(observation["pre_hello_bytes"], len(noise))
+        self.assertEqual(observation["marker_categories"], ["ansi_escape", "bdsdxe_marker", "uefi_marker"])
+        self.assertFalse(guest.successful_result(reader.result))
+
+    def test_noise_and_unbound_phase_are_never_supervisor_proof(self):
+        reader = guest.SerialReader(self.nonce)
+        noise = b"boot text\x1b[0m\nGUEST_PHASE_V1 supervisor_started\n"
+        self.assertEqual(reader.feed(noise), [])
+        self.assertFalse(reader.hello_verified)
+        self.assertIsNone(reader.result)
+        self.assertEqual(reader.startup_observation()["pre_hello_bytes"], len(noise))
+        self.assertEqual(reader.feed(self.hello()), [])
+        self.assertTrue(reader.hello_verified)
+        self.assertIsNone(reader.result)
+
+    def test_wrong_nonce_hello_and_oversize_hello_rejected(self):
+        for hello in (self.hello("2B" * 24), b"\nGUEST_HELLO_V1 " + b"A" * 49):
+            with self.subTest(size=len(hello)):
+                reader = guest.SerialReader(self.nonce)
+                with self.assertRaises(guest.Failure):
+                    reader.feed(hello)
+                self.assertFalse(reader.hello_verified)
+                self.assertIsNone(reader.result)
+
+    def test_preamble_byte_and_time_limits(self):
+        reader = guest.SerialReader(self.nonce)
+        oversized = b"x" * (reader.MAX_NOISE_BYTES + len(reader.HELLO_PREFIX))
+        with self.assertRaises(guest.Failure) as context:
+            reader.feed(oversized)
+        self.assertEqual(context.exception.stage, "serial_noise_limit")
+        self.assertEqual(reader.startup_observation()["pre_hello_bytes"], len(oversized))
+        reader = guest.SerialReader(self.nonce)
+        reader.noise_started -= reader.MAX_PRE_HELLO_SECONDS + 1
+        with self.assertRaises(guest.Failure) as context:
+            reader.feed(b"")
+        self.assertEqual(context.exception.stage, "serial_hello_timeout")
+        reader = guest.SerialReader(self.nonce)
+        reader.feed(self.hello())
+        with self.assertRaises(guest.Failure) as context:
+            reader.feed(b"x" * (2 * 1024 * 1024 + 1))
+        self.assertEqual(context.exception.stage, "serial_resource_limit")
+
+    def test_after_hello_firmware_text_and_second_hello_are_errors(self):
+        for unexpected in (b"\x1b[0mUEFI unexpected output\n", self.hello()):
+            reader = guest.SerialReader(self.nonce)
+            reader.feed(self.hello())
+            with self.assertRaises(guest.Failure) as context:
+                reader.feed(unexpected)
+            self.assertEqual(context.exception.stage, "unexpected_serial_frame")
 
     def test_success_requires_every_actual_gate(self):
         # Synthetic unit input exercises the predicate. It is never emitted as

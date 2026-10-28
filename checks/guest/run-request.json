@@ -1,5 +1,5 @@
 {
   "schema": "windows-guest-run-request/v1",
-  "request_id": "w11-ltsc-x64-20261028-core-supervisor",
-  "previous_execution_commit": "5378d937707af14181cd702dbaf5ffa28542c0c4"
+  "request_id": "w11-ltsc-x64-20261028-bound-supervisor-hello",
+  "previous_execution_commit": "94c49024077bca72439da592e4a15807f1c6d7ba"
 }

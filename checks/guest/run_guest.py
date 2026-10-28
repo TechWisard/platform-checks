@@ -520,7 +520,15 @@ def remove_setup_medium(qmp: Qmp, setup_iso: Path) -> None:
 
 
 class SerialReader:
+    HELLO_PREFIX = b"\nGUEST_HELLO_V1 "
+    MAX_NOISE_BYTES = 65536
+    MAX_PRE_HELLO_SECONDS = 50 * 60
+    NOISE_MARKERS = ((b"\x1b[", "ansi_escape"), (b"bdsdxe", "bdsdxe_marker"),
+                     (b"uefi", "uefi_marker"), (b"tianocore", "tianocore_marker"),
+                     (b"press any key", "press_any_key_marker"))
+
     def __init__(self, nonce: str):
+        require(re.fullmatch(r"[0-9A-Fa-f]{48}", nonce) is not None, "serial_nonce_invalid")
         self.nonce = nonce
         self.buffer = bytearray()
         self.length = None
@@ -528,12 +536,63 @@ class SerialReader:
         self.result = None
         self.phases = 0
         self.received = 0
+        self.hello_verified = False
+        self.noise_started = time.monotonic()
+        self.noise_bytes = 0
+        self.noise_tail = b""
+        self.noise_categories = set()
+
+    def _classify_noise(self, data: bytes) -> set[str]:
+        lowered = data.lower()
+        return {category for marker, category in self.NOISE_MARKERS if marker in lowered}
+
+    def _note_noise(self, data: bytes) -> None:
+        total = self.noise_bytes + len(data)
+        require(total <= self.MAX_NOISE_BYTES, "serial_noise_limit")
+        self.noise_bytes = total
+        combined = self.noise_tail + data
+        self.noise_categories.update(self._classify_noise(combined))
+        self.noise_tail = combined[-64:]
+
+    def startup_observation(self) -> dict:
+        # Only byte counts and fixed marker categories are public. Markers do
+        # not establish their emitter, a particular screen, or Windows boot.
+        pending = b"" if self.hello_verified else bytes(self.buffer)
+        categories = self.noise_categories | self._classify_noise(self.noise_tail + pending)
+        return {"hello_verified": self.hello_verified, "pre_hello_bytes": self.noise_bytes + len(pending),
+                "marker_categories": sorted(categories)}
+
+    def _accept_hello(self) -> bool:
+        require(time.monotonic() - self.noise_started < self.MAX_PRE_HELLO_SECONDS, "serial_hello_timeout")
+        position = self.buffer.find(self.HELLO_PREFIX)
+        if position < 0:
+            # Retain only enough bytes to recognize a prefix split between two
+            # reads; the rest is bounded, classified noise, never API evidence.
+            discard = max(0, len(self.buffer) - len(self.HELLO_PREFIX) + 1)
+            if discard:
+                self._note_noise(bytes(self.buffer[:discard]))
+                del self.buffer[:discard]
+            return False
+        if position:
+            self._note_noise(bytes(self.buffer[:position]))
+            del self.buffer[:position]
+        ending = self.buffer.find(b"\n", len(self.HELLO_PREFIX))
+        if ending < 0:
+            require(len(self.buffer) <= len(self.HELLO_PREFIX) + 48, "serial_hello_size_invalid")
+            return False
+        supplied = bytes(self.buffer[len(self.HELLO_PREFIX):ending])
+        require(supplied == self.nonce.encode("ascii"), "serial_hello_binding_invalid")
+        del self.buffer[:ending + 1]
+        self.hello_verified = True
+        return True
 
     def feed(self, data: bytes) -> list[str]:
         self.received += len(data)
         require(self.received <= 2 * 1024 * 1024 and len(self.buffer) + len(data) <= 131072, "serial_resource_limit")
         require(self.result is None or not data.strip(), "serial_data_after_result")
         self.buffer.extend(data)
+        if not self.hello_verified and not self._accept_hello():
+            return []
         stages = []
         while self.buffer:
             if self.length is not None:
@@ -610,6 +669,7 @@ def execute(args) -> int:
     os.chmod(work, 0o700)
     qemu = tpm = None
     qmp = None
+    reader = None
     logs = []
     outcome = 1
     cleanup = False
@@ -687,22 +747,45 @@ def execute(args) -> int:
         kvm = qmp.call("query-kvm")
         require(kvm.get("enabled") is True and kvm.get("present") is True, "qemu_kvm_not_actually_enabled")
         emit("qemu_kvm_verified", guest_ram_mib=8192, disk_virtual_gib=64, cpu_count=4, public_port_forwarding=False)
+        reader = SerialReader(nonce)
+        offset = 0
+        boot_start = time.monotonic()
+        first_logon = None
+        setup_detached = False
+        hello_reported = False
+
+        def observe_serial() -> None:
+            nonlocal offset, first_logon, setup_detached, hello_reported
+            block = b""
+            if serial_path.exists():
+                with serial_path.open("rb") as file:
+                    file.seek(offset)
+                    block = file.read(65536)
+                offset += len(block)
+            phases = reader.feed(block)
+            if reader.hello_verified and not hello_reported:
+                hello_reported = True
+                first_logon = time.monotonic()
+                emit("serial_hello_verified", **reader.startup_observation())
+            for phase in phases:
+                emit("guest_phase", phase=phase)
+                if phase == "setup_media_detach_requested":
+                    require(not setup_detached, "duplicate_setup_detach_request")
+                    remove_setup_medium(qmp, setup_iso)
+                    setup_detached = True
+
         qmp.call("cont")
         # Only the initial, owned VM boot gets a finite space-key burst for
         # Microsoft's stock CD prompt. No bootloader patch or OS check bypass.
         # Missing the prompt remains a real first-logon timeout, never a pass.
         for _ in range(24):
             require(qemu.poll() is None, "qemu_exited_during_initial_boot")
-            if serial_path.exists() and serial_path.stat().st_size:
+            observe_serial()
+            if reader.hello_verified:
                 break
             qmp.call("send-key", {"keys": [{"type": "qcode", "data": "spc"}], "hold-time": 60})
             time.sleep(0.5)
         emit("initial_cd_boot_keys_complete")
-        reader = SerialReader(nonce)
-        offset = 0
-        boot_start = time.monotonic()
-        first_logon = None
-        setup_detached = False
         next_heartbeat = boot_start
         while reader.result is None:
             deadline.seconds(1)
@@ -713,21 +796,11 @@ def execute(args) -> int:
             require(shutil.disk_usage(work).free >= 3 * GIB, "host_disk_reserve_exhausted")
             require((work / "qemu.log").stat().st_size <= 2 * 1024 * 1024 and (work / "swtpm.log").stat().st_size <= 2 * 1024 * 1024,
                     "hypervisor_log_limit")
-            if serial_path.exists():
-                with serial_path.open("rb") as file:
-                    file.seek(offset)
-                    block = file.read(65536)
-                offset += len(block)
-                for phase in reader.feed(block):
-                    first_logon = first_logon or time.monotonic()
-                    emit("guest_phase", phase=phase)
-                    if phase == "setup_media_detach_requested":
-                        require(not setup_detached, "duplicate_setup_detach_request")
-                        remove_setup_medium(qmp, setup_iso)
-                        setup_detached = True
+            observe_serial()
             if time.monotonic() >= next_heartbeat:
                 emit("awaiting_guest", first_logon_observed=first_logon is not None,
-                     elapsed_seconds=int(time.monotonic() - boot_start), storage=block_progress(qmp))
+                     elapsed_seconds=int(time.monotonic() - boot_start), storage=block_progress(qmp),
+                     serial_startup=reader.startup_observation())
                 next_heartbeat = time.monotonic() + 30
             time.sleep(0.25)
         value = reader.result
@@ -745,6 +818,8 @@ def execute(args) -> int:
         outcome = 0 if setup_detached and successful_result(value) else 1
     finally:
         cleanup_errors = []
+        if reader is not None:
+            emit("serial_startup_observation", **reader.startup_observation())
         if qmp is not None:
             try:
                 qmp.call("quit")

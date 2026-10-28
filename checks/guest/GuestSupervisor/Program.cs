@@ -83,7 +83,6 @@ internal static class GuestSupervisor
         string? work = null, runtime = null;
         bool ownWork = false, ownRuntime = false;
         using SerialChannel serial = new();
-        serial.Phase("supervisor_started");
         try
         {
             string media = Path.GetFullPath(args[1]);
@@ -95,6 +94,8 @@ internal static class GuestSupervisor
             JsonElement settings = config.RootElement;
             result.Nonce = settings.GetProperty("nonce").GetString() ?? "";
             Require(result.Nonce.Length == 48 && result.Nonce.All(Uri.IsHexDigit), "guest_nonce_invalid");
+            serial.Hello(result.Nonce);
+            serial.Phase("supervisor_started");
             Guid uuid = settings.GetProperty("firmware_uuid").GetGuid();
             string account = settings.GetProperty("account_name").GetString() ?? "";
             Require(account.Length is >= 8 and <= 20 && account.All(char.IsAsciiLetterOrDigit), "guest_account_name_invalid");
@@ -260,7 +261,9 @@ internal static class GuestSupervisor
             }
             result.GuestWorkDirectoriesRemoved = removed;
             if (!removed) { result.CleanupUnverified = true; result.Status = "failed"; }
-            serial.Result(JsonSerializer.SerializeToUtf8Bytes(result, JsonOptions));
+            // A failure before a valid per-run nonce cannot produce a bound
+            // result. The host's bounded HELLO/install timeout remains failure.
+            if (serial.HelloWritten) serial.Result(JsonSerializer.SerializeToUtf8Bytes(result, JsonOptions));
         }
         return result.Status == "verified" ? 0 : 1;
     }
@@ -492,6 +495,7 @@ internal sealed class SerialChannel : IDisposable
     private readonly SafeFileHandle handle;
     private readonly object gate = new();
     private int phases;
+    internal bool HelloWritten { get; private set; }
     [StructLayout(LayoutKind.Sequential)]
     private struct Dcb
     {
@@ -533,10 +537,27 @@ internal sealed class SerialChannel : IDisposable
         catch { handle.Dispose(); throw; }
     }
 
+    internal void Hello(string nonce)
+    {
+        if (nonce.Length != 48 || !nonce.All(Uri.IsHexDigit)) throw new InvalidOperationException("invalid_serial_nonce");
+        lock (gate)
+        {
+            if (HelloWritten) throw new InvalidOperationException("duplicate_serial_hello");
+            // Leading LF makes the boundary unambiguous even if firmware left
+            // ANSI bytes or an unterminated line on the same virtual UART.
+            Write(Encoding.ASCII.GetBytes("\nGUEST_HELLO_V1 " + nonce + "\n"));
+            HelloWritten = true;
+        }
+    }
+
     internal void Phase(string value)
     {
         if (!value.All(c => char.IsAsciiLetterOrDigit(c) || c == '_') || value.Length > 100) throw new InvalidOperationException("invalid_phase");
-        lock (gate) { if (phases++ < 32) Write(Encoding.ASCII.GetBytes("GUEST_PHASE_V1 " + value + "\n")); }
+        lock (gate)
+        {
+            if (!HelloWritten) throw new InvalidOperationException("serial_hello_required");
+            if (phases++ < 32) Write(Encoding.ASCII.GetBytes("GUEST_PHASE_V1 " + value + "\n"));
+        }
     }
 
     internal void Result(byte[] json)
@@ -544,6 +565,7 @@ internal sealed class SerialChannel : IDisposable
         if (json.Length is <= 0 or > 65536) throw new InvalidOperationException("serial_result_size_invalid");
         lock (gate)
         {
+            if (!HelloWritten) throw new InvalidOperationException("serial_hello_required");
             string header = "GUEST_RESULT_V1 " + json.Length + " " + Convert.ToHexString(SHA256.HashData(json)) + "\n";
             Write(Encoding.ASCII.GetBytes(header)); Write(json); Write(new byte[] { 10 });
         }
