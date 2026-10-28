@@ -10,6 +10,7 @@ internal static class WindowCoverageDiagnostics
 {
     private const int MaximumProcessBaseNameLength = 128;
     private const int MaximumWindowClassNameLength = 256;
+    private const int MaximumApplicationIdentityLength = 256;
 
     internal static WindowCoverageDiagnosticSnapshot Capture(Form form, IntPtr ownRoot,
         IntPtr foregroundRoot, IntPtr[] hitRoots)
@@ -70,8 +71,9 @@ internal static class WindowCoverageDiagnostics
         bool mayIdentifyOther = !isOwn && currentSessionOkay && sessionOkay && session == currentSession;
         (string classCategory, bool classOkay, int classError, string? otherClassName) =
             ReadClass(window, isOwn, mayIdentifyOther);
-        (string processCategory, bool? imageOkay, int imageError, string? otherProcessBaseName) = isOwn ?
-            ("own", null, 0, null) : ReadProcessCategory(process, mayIdentifyOther);
+        ProcessObservation processObservation = isOwn ? new("own", null, 0, null, null) :
+            ReadProcessCategory(process, mayIdentifyOther);
+        (string processCategory, bool? imageOkay, int imageError, string? otherProcessBaseName, _) = processObservation;
         NativeStyle style = ReadStyle(window);
 
         // HWND/process lifetime can change during any read-only snapshot.
@@ -94,6 +96,7 @@ internal static class WindowCoverageDiagnostics
             ProcessImageQueryWin32Error = imageError,
             OtherProcessBaseName = stable && mayIdentifyOther && imageOkay == true && processCategory == "other" ?
                 otherProcessBaseName : null,
+            HostApplicationIdentity = stable && mayIdentifyOther ? processObservation.HostIdentity : null,
             ClassCategory = stable ? classCategory : "unavailable",
             ClassQuerySucceeded = classOkay,
             ClassQueryWin32Error = classError,
@@ -146,18 +149,18 @@ internal static class WindowCoverageDiagnostics
         finally { Array.Clear(buffer); }
     }
 
-    private static (string Category, bool? Succeeded, int Error, string? OtherName)
+    private static ProcessObservation
         ReadProcessCategory(uint process, bool mayIdentifyOther)
     {
         using SafeProcessHandle handle = OpenProcess(0x1000 /* PROCESS_QUERY_LIMITED_INFORMATION */, false, process);
-        if (handle.IsInvalid) return ("unavailable", false, Marshal.GetLastWin32Error(), null);
+        if (handle.IsInvalid) return new("unavailable", false, Marshal.GetLastWin32Error(), null, null);
         char[] buffer = new char[1024];
         try
         {
             uint length = checked((uint)buffer.Length);
             if (!QueryFullProcessImageNameW(handle, 0, buffer, ref length))
-                return ("unavailable", false, Marshal.GetLastWin32Error(), null);
-            if (length == 0 || length >= buffer.Length) return ("unavailable", false, 13, null);
+                return new("unavailable", false, Marshal.GetLastWin32Error(), null, null);
+            if (length == 0 || length >= buffer.Length) return new("unavailable", false, 13, null, null);
             ReadOnlySpan<char> image = buffer.AsSpan(0, checked((int)length));
             int separator = Math.Max(image.LastIndexOf('\\'), image.LastIndexOf('/'));
             ReadOnlySpan<char> name = image[(separator + 1)..];
@@ -171,9 +174,41 @@ internal static class WindowCoverageDiagnostics
                 name.Equals("startmenuexperiencehost.exe", StringComparison.OrdinalIgnoreCase) ? "shell" : "other";
             string? otherName = category == "other" && mayIdentifyOther ?
                 SafeShortName(name, MaximumProcessBaseNameLength, windowClass: false) : null;
-            return (category, true, 0, otherName);
+            // WWAHost is only a generic application host. Query its documented
+            // package identity on this same limited-information handle; never
+            // inspect command lines, window text, URLs, or another process.
+            HostApplicationIdentity? hostIdentity = mayIdentifyOther &&
+                name.Equals("WWAHost.exe", StringComparison.OrdinalIgnoreCase) ? ReadHostIdentity(handle) : null;
+            return new(category, true, 0, otherName, hostIdentity);
         }
         finally { Array.Clear(buffer); }
+    }
+
+    private static HostApplicationIdentity ReadHostIdentity(SafeProcessHandle process)
+    {
+        char[] family = new char[MaximumApplicationIdentityLength + 1];
+        char[] application = new char[MaximumApplicationIdentityLength + 1];
+        try
+        {
+            uint familyLength = checked((uint)family.Length);
+            uint applicationLength = checked((uint)application.Length);
+            int familyResult = GetPackageFamilyName(process, ref familyLength, family);
+            int applicationResult = GetApplicationUserModelId(process, ref applicationLength, application);
+            return new(familyResult, ReadApplicationIdentity(family, familyLength, familyResult),
+                applicationResult, ReadApplicationIdentity(application, applicationLength, applicationResult));
+        }
+        finally { Array.Clear(family); Array.Clear(application); }
+    }
+
+    private static string? ReadApplicationIdentity(char[] buffer, uint length, int result)
+    {
+        // Both APIs return a status directly and count the terminating NUL.
+        if (result != 0 || length < 2 || length > buffer.Length || buffer[length - 1] != '\0') return null;
+        ReadOnlySpan<char> value = buffer.AsSpan(0, checked((int)length - 1));
+        foreach (char character in value)
+            if (!(character is >= 'A' and <= 'Z' or >= 'a' and <= 'z' or >= '0' and <= '9' or '.' or '_' or '-' or '!'))
+                return null;
+        return new string(value);
     }
 
     private static string? SafeShortName(ReadOnlySpan<char> name, int maximumLength, bool windowClass)
@@ -191,6 +226,8 @@ internal static class WindowCoverageDiagnostics
     }
 
     private readonly record struct NativeStyle(bool Succeeded, uint? Value, bool? TopMost, int Error);
+    private sealed record ProcessObservation(string Category, bool? Succeeded, int Error,
+        string? OtherName, HostApplicationIdentity? HostIdentity);
     [StructLayout(LayoutKind.Sequential)]
     private struct NativeRectangle { internal int Left, Top, Right, Bottom; }
     [DllImport("kernel32.dll", ExactSpelling = true)]
@@ -221,7 +258,14 @@ internal static class WindowCoverageDiagnostics
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool QueryFullProcessImageNameW(SafeProcessHandle process, uint flags,
         [Out] char[] imageName, ref uint length);
+    [DllImport("kernel32.dll", ExactSpelling = true, CharSet = CharSet.Unicode)]
+    private static extern int GetPackageFamilyName(SafeProcessHandle process, ref uint length, [Out] char[] familyName);
+    [DllImport("kernel32.dll", ExactSpelling = true, CharSet = CharSet.Unicode)]
+    private static extern int GetApplicationUserModelId(SafeProcessHandle process, ref uint length, [Out] char[] applicationId);
 }
+
+internal sealed record HostApplicationIdentity(int PackageFamilyQueryResult, string? PackageFamilyName,
+    int ApplicationIdQueryResult, string? ApplicationUserModelId);
 
 internal sealed record WindowCoverageDiagnosticSnapshot(OwnNativeWindowState? OwnWindow,
     bool CurrentProcessSessionQuerySucceeded, int CurrentProcessSessionQueryWin32Error,
@@ -247,6 +291,7 @@ internal sealed record WindowRootOwnership
     public bool? ProcessImageQuerySucceeded { get; init; }
     public int ProcessImageQueryWin32Error { get; init; }
     public string? OtherProcessBaseName { get; init; }
+    public HostApplicationIdentity? HostApplicationIdentity { get; init; }
     public string ClassCategory { get; init; } = "unavailable";
     public bool ClassQuerySucceeded { get; init; }
     public int ClassQueryWin32Error { get; init; }

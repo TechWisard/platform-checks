@@ -243,6 +243,16 @@ query is used. Its temporary full-path buffer is cleared after taking the
 basename; full paths are neither saved nor emitted. No process inventory,
 command line, window title, account data or extra process rights are requested.
 Class buffers are also cleared. No foreign window is activated or changed.
+
+For a same-session `WWAHost.exe` covering window, the same limited-information
+process handle also queries `GetPackageFamilyName` and
+`GetApplicationUserModelId`. This distinguishes the generic host from the
+application it hosts. Each query uses a fixed 257-character buffer; only a
+successful, NUL-terminated identity of at most 256 ASCII letters, digits,
+periods, underscores, hyphens or exclamation marks can be reported. Buffers are
+cleared and identities are emitted only after the window-owner recheck.
+Neither process command lines nor application URLs or window text are read.
+These labels are diagnostics, not authentication or proof of a particular UI.
 Owner checks remain sequential observations rather than an atomic lifetime
 guarantee, and these diagnostic names cannot make the frame challenge pass.
 
@@ -290,6 +300,8 @@ identifiers and contracts are from these Microsoft references:
 - [GetTokenInformation](https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-gettokeninformation)
 - [GetClassNameW](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getclassnamew)
 - [QueryFullProcessImageNameW](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-queryfullprocessimagenamew)
+- [GetPackageFamilyName](https://learn.microsoft.com/en-us/windows/win32/api/appmodel/nf-appmodel-getpackagefamilyname)
+- [GetApplicationUserModelId](https://learn.microsoft.com/en-us/windows/win32/api/appmodel/nf-appmodel-getapplicationusermodelid)
 
 The `IMsRdpExtendedSettings` method offsets, calling convention, HRESULT return,
 BSTR/VARIANT-pointer parameters and direction flags are validated against the
