@@ -1,0 +1,5 @@
+{
+  "schema": "windows-guest-run-request/v1",
+  "request_id": "w11-ltsc-x64-20261028-first",
+  "source_commit": "a09b61ab17c74dbd60da46230ec6c6affc20cbb2"
+}
