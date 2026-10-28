@@ -21,8 +21,10 @@ constexpr wchar_t TargetApplication[] = L"Microsoft.Windows.CloudExperienceHost_
 constexpr wchar_t TargetClass[] = L"Windows.UI.Core.CoreWindow";
 constexpr wchar_t PrivacyHeading[] = L"Choose privacy settings for your device";
 constexpr wchar_t AcceptId[] = L"OobeSettingsAcceptButton";
+constexpr char ObservedAcceptLabel[] = "Accept these privacy settings";
 constexpr ULONGLONG TotalBudgetMs = 32000;
 constexpr ULONGLONG PostReadBudgetMs = 3000;
+constexpr ULONGLONG AcceptTransitionBudgetMs = 6000;
 // These exact fixed OS headings are also used by the read-only presentation probe.
 constexpr const wchar_t* KnownHeadings[]{PrivacyHeading, L"Privacy settings", L"Hi", L"Just a moment...",
     L"Just a moment", L"Getting things ready", L"We're getting things ready for you",
@@ -43,6 +45,15 @@ struct PostPage {
     std::array<int, sizeof(KnownHeadings) / sizeof(KnownHeadings[0])> headings{};
     ButtonLabel label;
     PostPage() { headings.fill(-1); }
+};
+struct SecondAction {
+    const char* stage{"not_attempted"};
+    HRESULT invoke_error{S_OK};
+    ULONGLONG delay_ms{};
+    unsigned initial_heading_count{}, recheck_heading_count{}, initial_button_count{}, recheck_button_count{};
+    bool checked{}, first_page_verified{}, recheck_page_verified{}, owner_verified{}, owner_reverified{}, same_button_reverified{};
+    bool invoke_attempted{}, invoke_succeeded{};
+    ButtonLabel first_label, recheck_label;
 };
 struct Failure { const char* stage; HRESULT result; };
 void need(bool value, const char* stage, HRESULT error = E_UNEXPECTED) {
@@ -85,8 +96,10 @@ struct Result {
     bool foreground_is_observed_target{}, observed_target_sampled{}, observed_target_exists{}, observed_target_visible{};
     bool observed_target_cloak_query_attempted{};
     bool final_active_input_desktop_verified{};
+    bool first_label_is_known_accept{};
     ButtonLabel button_before;
     PostPage post;
+    SecondAction second;
 };
 struct Handle final {
     HANDLE value{};
@@ -167,6 +180,9 @@ void read_button_label(IUIAutomationElement* button, ButtonLabel& out, ULONGLONG
     Text name; budget(end); out.error = button->get_CurrentName(&name.value);
     if (FAILED(out.error)) { out.status = "name_unavailable"; return; }
     normalize_button_label(name.value, out);
+}
+bool exact_observed_accept(const ButtonLabel& label) noexcept {
+    return SUCCEEDED(label.error) && std::strcmp(label.ascii.data(), ObservedAcceptLabel) == 0;
 }
 void verify_desktop(Result& out) {
     DWORD session{};
@@ -372,6 +388,44 @@ Page read_page(IUIAutomation2* automation, HWND window, DWORD owner, ULONGLONG e
         reinterpret_cast<void**>(page.invoke.put())), "button_invoke_pattern");
     need(page.invoke.get() != nullptr, "invoke_pattern_unavailable"); return page;
 }
+void consider_observed_accept(IUIAutomation2* automation, HWND window, DWORD owner, DWORD thread, HANDLE process,
+    ULONGLONG first_completed, ULONGLONG wait_end, Result& out) {
+    auto& second = out.second; second.checked = true;
+    need(out.invoke_count == 1 && out.invoke_succeeded && !second.invoke_attempted, "accept_transition_order");
+    if (out.first_label_is_known_accept) { second.stage = "first_action_already_accept"; return; }
+    const ULONGLONG early_end = first_completed + AcceptTransitionBudgetMs < wait_end ?
+        first_completed + AcceptTransitionBudgetMs : wait_end;
+    if (early_end <= first_completed + 1000) { second.stage = "early_window_unavailable"; return; }
+    // This is one separate observed transition, never a retry of the first Invoke.
+    // Waiting is bounded and never changes focus or sends keys to the OS page.
+    Sleep(1000);
+    while (GetTickCount64() - first_completed < 1000) Sleep(1);
+    if (!IsWindow(window) || !IsWindowVisible(window) || GetAncestor(GetForegroundWindow(), GA_ROOT) != window) {
+        second.stage = "target_no_longer_foreground"; return;
+    }
+    budget(early_end); verify_target(window, owner, thread, process, out); second.owner_verified = true;
+    Page first = read_page(automation, window, owner, early_end, out);
+    second.first_page_verified = true;
+    second.initial_heading_count = first.headings; second.initial_button_count = first.buttons;
+    read_button_label(first.button.get(), second.first_label, early_end);
+    if (!exact_observed_accept(second.first_label)) { second.stage = "label_not_observed_accept"; return; }
+    budget(early_end); verify_target(window, owner, thread, process, out);
+    Page fresh = read_page(automation, window, owner, early_end, out);
+    second.recheck_page_verified = true;
+    second.recheck_heading_count = fresh.headings; second.recheck_button_count = fresh.buttons;
+    read_button_label(fresh.button.get(), second.recheck_label, early_end);
+    if (!exact_observed_accept(second.recheck_label)) { second.stage = "accept_label_changed"; return; }
+    BOOL same{};
+    budget(early_end); hr(automation->CompareElements(first.button.get(), fresh.button.get(), &same), "second_same_accept_button");
+    need(same != FALSE, "second_accept_button_replaced"); second.same_button_reverified = true;
+    budget(early_end); verify_target(window, owner, thread, process, out); second.owner_reverified = true;
+    budget(early_end); second.delay_ms = GetTickCount64() - first_completed;
+    need(second.delay_ms >= 1000 && second.delay_ms < AcceptTransitionBudgetMs, "accept_transition_timing");
+    out.stage = "invoke_observed_privacy_accept"; second.stage = "invoke_observed_accept";
+    second.invoke_attempted = true; ++out.invoke_count;
+    second.invoke_error = fresh.invoke->Invoke(); hr(second.invoke_error, "observed_accept_invoke");
+    second.invoke_succeeded = true; second.stage = "invoked";
+}
 void observe_after_invoke(HWND window, DWORD owner, DWORD thread, HANDLE process, ULONGLONG end, Result& out) {
     PostPage observation; observation.attempted = true;
     try {
@@ -477,11 +531,13 @@ void prepare(Result& out, ULONGLONG end) {
         BOOL same{}; budget(wait_end); hr(automation->CompareElements(first.button.get(), fresh.button.get(), &same), "same_accept_button");
         need(same != FALSE, "accept_button_replaced"); out.same_button_reverified = true;
         read_button_label(fresh.button.get(), out.button_before, wait_end);
-        // Last checks immediately precede the one and only action. No generic
-        // retry, other button, focus request, key injection or process stop.
+        out.first_label_is_known_accept = out.button_before.category == 3 || exact_observed_accept(out.button_before);
+        // Last checks immediately precede the first action. A separately
+        // observed exact Accept transition is the only possible second action.
         budget(wait_end); verify_target(foreground, owner, thread, process.value, out); out.target_owner_reverified = true;
         out.stage = "invoke_exact_privacy_button"; out.invoke_attempted = true; ++out.invoke_count;
         out.invoke_error = fresh.invoke->Invoke(); hr(out.invoke_error, "privacy_button_invoke"); out.invoke_succeeded = true;
+        consider_observed_accept(automation.get(), foreground, owner, thread, process.value, GetTickCount64(), wait_end, out);
     }
     out.stage = "wait_ordinary_desktop";
     unsigned stable{};
@@ -525,8 +581,18 @@ void write(const Result& out, ULONGLONG elapsed) {
     FIELD(observed_target_cloak_flags);
     FIELD(wait_observations); FIELD(stable_observations); FIELD(ordinary_desktop_verified); FIELD(com_uninitialized); FIELD(cleanup_verified);
     FIELD(final_active_input_desktop_verified);
+    FIELD(first_label_is_known_accept);
 #undef FIELD
     std::cout << ",\"button_label_before\":"; write_label(out.button_before);
+    std::cout << ",\"second_action\":{\"checked\":" << out.second.checked << ",\"stage\":\"" << out.second.stage
+        << "\",\"delay_ms\":" << out.second.delay_ms << ",\"first_page_verified\":" << out.second.first_page_verified
+        << ",\"recheck_page_verified\":" << out.second.recheck_page_verified << ",\"owner_verified\":" << out.second.owner_verified
+        << ",\"owner_reverified\":" << out.second.owner_reverified << ",\"same_button_reverified\":" << out.second.same_button_reverified
+        << ",\"initial_heading_count\":" << out.second.initial_heading_count << ",\"recheck_heading_count\":" << out.second.recheck_heading_count
+        << ",\"initial_button_count\":" << out.second.initial_button_count << ",\"recheck_button_count\":" << out.second.recheck_button_count
+        << ",\"invoke_attempted\":" << out.second.invoke_attempted << ",\"invoke_succeeded\":" << out.second.invoke_succeeded
+        << ",\"invoke_hresult\":" << static_cast<std::uint32_t>(out.second.invoke_error) << ",\"first_label\":";
+    write_label(out.second.first_label); std::cout << ",\"recheck_label\":"; write_label(out.second.recheck_label); std::cout << '}';
     std::cout << ",\"post_invoke\":{\"attempted\":" << out.post.attempted << ",\"stage\":\"" << out.post.stage
         << "\",\"hresult\":" << static_cast<std::uint32_t>(out.post.error) << ",\"owner_verified\":" << out.post.owner_verified
         << ",\"owner_stable\":" << out.post.owner_stable << ",\"root_verified\":" << out.post.root_verified
@@ -558,7 +624,10 @@ int main(int argc, char** argv) {
     if (!out.cleanup_verified) { out.status = "failed"; out.stage = "own_cleanup_failed"; }
     const bool success = out.ordinary_desktop_verified && out.final_active_input_desktop_verified && out.cleanup_verified && SUCCEEDED(out.error) &&
         ((out.invoke_count == 0 && !out.target_initially_foreground) ||
-         (out.invoke_count == 1 && out.invoke_succeeded && out.target_owner_reverified && out.same_button_reverified &&
+         (((out.invoke_count == 1 && !out.second.invoke_attempted) ||
+           (out.invoke_count == 2 && !out.first_label_is_known_accept && out.second.invoke_succeeded &&
+            out.second.owner_reverified && out.second.same_button_reverified)) &&
+          out.invoke_succeeded && out.target_owner_reverified && out.same_button_reverified &&
           out.observed_page_hidden_or_destroyed && out.com_uninitialized));
     write(out, GetTickCount64() - start); return success ? 0 : 1;
 }

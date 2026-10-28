@@ -149,16 +149,35 @@ function Test-PreparationEligibility {
         $Report.session_functionality_verified -ne $false -or $Report.other_ui_invoked -ne $false -or
         $Report.force_closed_window -ne $false -or $Report.credential_fields_read -ne $false -or
         $Report.privacy_toggle_values_changed_by_helper -ne $false) { return $false }
+    $second = $Report.second_action
+    $firstKnownAccept = $Report.button_label_before.category -eq 3 -or
+        $Report.button_label_before.safe_ascii -ceq 'Accept these privacy settings'
+    if ($Report.first_label_is_known_accept -ne $firstKnownAccept) { return $false }
     $noAction = $Report.target_initially_foreground -eq $false -and $Report.invoke_count -eq 0 -and
-        $Report.invoke_attempted -eq $false -and $Report.invoke_succeeded -eq $false
-    $ownedAction = $Report.target_initially_foreground -eq $true -and $Report.invoke_count -eq 1 -and
+        $Report.invoke_attempted -eq $false -and $Report.invoke_succeeded -eq $false -and
+        $second.checked -eq $false -and $second.invoke_attempted -eq $false -and $second.invoke_succeeded -eq $false
+    $firstOwnedAction = $Report.target_initially_foreground -eq $true -and
         $Report.invoke_attempted -eq $true -and $Report.invoke_succeeded -eq $true -and $Report.invoke_hresult -eq 0 -and
         $Report.target_owner_verified -eq $true -and $Report.target_owner_reverified -eq $true -and
         $Report.root_handle_verified -eq $true -and $Report.same_button_reverified -eq $true -and
         $Report.initial_heading_count -ge 1 -and $Report.initial_heading_count -le 8 -and
         $Report.recheck_heading_count -ge 1 -and $Report.recheck_heading_count -le 8 -and
         $Report.initial_button_count -eq 1 -and $Report.recheck_button_count -eq 1 -and $Report.com_uninitialized -eq $true
-    if (-not ($noAction -or $ownedAction)) { return $false }
+    $oneAction = $firstOwnedAction -and $Report.invoke_count -eq 1 -and
+        $second.invoke_attempted -eq $false -and $second.invoke_succeeded -eq $false
+    $twoActions = $firstOwnedAction -and $Report.invoke_count -eq 2 -and -not $firstKnownAccept -and
+        $second.checked -eq $true -and $second.stage -eq 'invoked' -and
+        $second.invoke_attempted -eq $true -and $second.invoke_succeeded -eq $true -and $second.invoke_hresult -eq 0 -and
+        $second.delay_ms -ge 1000 -and $second.delay_ms -lt 6000 -and
+        $second.first_page_verified -eq $true -and $second.recheck_page_verified -eq $true -and
+        $second.owner_verified -eq $true -and $second.owner_reverified -eq $true -and $second.same_button_reverified -eq $true -and
+        $second.initial_heading_count -ge 1 -and $second.initial_heading_count -le 8 -and
+        $second.recheck_heading_count -ge 1 -and $second.recheck_heading_count -le 8 -and
+        $second.initial_button_count -eq 1 -and $second.recheck_button_count -eq 1 -and
+        $second.first_label.hresult -eq 0 -and $second.recheck_label.hresult -eq 0 -and
+        $second.first_label.safe_ascii -ceq 'Accept these privacy settings' -and
+        $second.recheck_label.safe_ascii -ceq 'Accept these privacy settings'
+    if (-not ($noAction -or $oneAction -or $twoActions)) { return $false }
     $ordinary = $ExitCode -eq 0 -and $Report.status -in @('completed', 'not_needed') -and
         $Report.hresult -eq 0 -and $Report.ordinary_desktop_verified -eq $true
     # Only the observed foreground-category timeout is eligible. API, ownership,
