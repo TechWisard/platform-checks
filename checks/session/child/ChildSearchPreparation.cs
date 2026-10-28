@@ -37,7 +37,7 @@ internal static class ChildSearchPreparation
 
     private sealed class WitnessReport
     {
-        public string Schema { get; } = "witness-preparation/v1";
+        public string Schema { get; } = "witness-preparation/v2";
         public required string Nonce { get; init; }
         public required string IdentityDigest { get; init; }
         public uint SessionId { get; init; }
@@ -50,13 +50,16 @@ internal static class ChildSearchPreparation
         public int? ExitCode { get; set; }
         public bool NativeBindingVerified { get; set; }
         public bool NativeAccepted { get; set; }
+        public bool NativeForegroundUnresolved { get; set; }
+        public bool RenderProbeEligible { get; set; }
         public JsonElement? Helper { get; set; }
         public string? ErrorCategory { get; set; }
         public int? ErrorHresult { get; set; }
         public long ElapsedMs { get; set; }
     }
 
-    internal sealed record Observation(bool Verified, bool CleanupVerified, Dictionary<string, object?> Public);
+    internal sealed record Observation(bool Verified, bool CleanupVerified, bool RenderProbeEligible,
+        bool ForegroundUnresolved, Dictionary<string, object?> Public);
 
     private static void Need(bool condition, string code)
     { if (!condition) throw new ExperimentFailure(code); }
@@ -205,10 +208,18 @@ internal static class ChildSearchPreparation
             using JsonDocument parsed = ParseJson(await stdout.ConfigureAwait(false), 16384);
             (bool binding, bool accepted) = ValidateNative(parsed.RootElement, report.PreparationNonce);
             report.Helper = parsed.RootElement.Clone(); report.NativeBindingVerified = binding; report.NativeAccepted = accepted;
+            report.NativeForegroundUnresolved = IsCleanForegroundObservation(parsed.RootElement, report.PreparationNonce);
             if (report.ExitCode == 0 && binding && accepted) report.Status = "verified";
+            // A fully observed but unresolved Search window permits creating
+            // our own witness. It remains a preparation failure, not a claim
+            // that Escape was delivered or the target left the foreground.
+            report.RenderProbeEligible = report.Status == "verified" ||
+                (report.ExitCode == 1 && binding && report.NativeForegroundUnresolved);
         }
         catch (Exception error)
         {
+            report.Status = "failed";
+            report.RenderProbeEligible = false;
             report.ErrorCategory = ErrorCategory(error); report.ErrorHresult = error.HResult;
             if (process is not null)
             {
@@ -245,7 +256,7 @@ internal static class ChildSearchPreparation
             }
             finally { if (File.Exists(temporary)) File.Delete(temporary); }
         }
-        Need(report.Status == "verified", "child_search_preparation_failed");
+        Need(report.RenderProbeEligible, "child_search_render_probe_not_eligible");
     }
 
     private static async Task<string> ReadBounded(Stream stream, int cap, CancellationToken cancellation)
@@ -318,6 +329,33 @@ internal static class ChildSearchPreparation
         return (bound, prepared || unnecessary);
     }
 
+    // This is observation eligibility only. The unchanged native helper must
+    // have completed its exact single pair and final owner/desktop observation.
+    // Every API/receipt/identity/cleanup failure remains ineligible.
+    internal static bool IsCleanForegroundObservation(JsonElement value, string expectedNonce)
+    {
+        (bool binding, bool accepted) = ValidateNative(value, expectedNonce);
+        if (!binding || accepted) return false;
+        bool Flag(string key) => value.GetProperty(key).GetBoolean();
+        uint Number(string key) => value.GetProperty(key).GetUInt32();
+        return value.GetProperty("status").GetString() == "failed" &&
+            value.GetProperty("stage").GetString() == "search_target_still_foreground" &&
+            Number("hresult") == 2147549183U /* E_UNEXPECTED at this exact terminal guard */ &&
+            Number("elapsed_ms") is >= 3000 and < 10000 &&
+            Preconditions.All(Flag) && Number("receipt_error") == 0 &&
+            new[] { "target_found", "owner_verified", "owner_reverified", "first_page_verified", "recheck_page_verified",
+                "same_root_reverified", "keyboard_state_query_succeeded", "send_attempted", "pair_inserted",
+                "release_event_inserted", "escape_up_observed", "key_cleanup_verified", "target_observation_valid",
+                "target_exists", "target_visible", "target_foreground", "com_uninitialized", "cleanup_verified" }.All(Flag) &&
+            !Flag("target_hidden_or_destroyed") && !Flag("release_cleanup_attempted") &&
+            Number("initial_search_count") == 1 && Number("recheck_search_count") == 1 &&
+            Number("queue_down_mask") == 0 && Number("async_down_mask") == 0 &&
+            Number("send_call_count") == 1 && Number("requested_input_count") == 2 && Number("inserted_input_count") == 2 &&
+            Number("send_last_error") == 0 && Number("cleanup_call_count") == 0 && Number("cleanup_inserted_count") == 0 &&
+            Number("cleanup_last_error") == 0 && Number("release_observations") > 0 &&
+            Number("target_observations") >= 2 && Number("cleanup_hresult") == 0;
+    }
+
     internal static Observation ReadReport(string path, string nonce, uint session, string identityDigest, string expectedPreparationNonce)
     {
         using FileStream file = new(path, FileMode.Open, FileAccess.Read, FileShare.Read);
@@ -326,15 +364,15 @@ internal static class ChildSearchPreparation
         using JsonDocument document = JsonDocument.Parse(file, new JsonDocumentOptions { MaxDepth = 6 });
         JsonElement root = document.RootElement;
         string[] keys = { "schema", "nonce", "identity_digest", "session_id", "preparation_nonce", "status", "process_started", "process_exited",
-            "process_cleanup_verified", "output_completed", "exit_code", "native_binding_verified", "native_accepted", "helper", "error_category", "error_hresult", "elapsed_ms" };
+            "process_cleanup_verified", "output_completed", "exit_code", "native_binding_verified", "native_accepted", "native_foreground_unresolved", "render_probe_eligible", "helper", "error_category", "error_hresult", "elapsed_ms" };
         Keys(root, keys);
-        Need(root.GetProperty("schema").GetString() == "witness-preparation/v1" && root.GetProperty("nonce").GetString() == nonce &&
+        Need(root.GetProperty("schema").GetString() == "witness-preparation/v2" && root.GetProperty("nonce").GetString() == nonce &&
             root.GetProperty("identity_digest").GetString() == identityDigest && root.GetProperty("session_id").GetUInt32() == session &&
             root.GetProperty("preparation_nonce").GetString() == expectedPreparationNonce, "child_preparation_report_binding_invalid");
         string? status = root.GetProperty("status").GetString(), category = root.GetProperty("error_category").GetString();
         Need(status is "verified" or "failed" && category is null or "timeout" or "access_denied" or "io" or "invalid_report" or "process" or
             "precondition" or "other" or "owned_process_cleanup", "child_preparation_report_category_invalid");
-        string[] flags = { "process_started", "process_exited", "process_cleanup_verified", "output_completed", "native_binding_verified", "native_accepted" };
+        string[] flags = { "process_started", "process_exited", "process_cleanup_verified", "output_completed", "native_binding_verified", "native_accepted", "native_foreground_unresolved", "render_probe_eligible" };
         foreach (string key in flags) Need(root.GetProperty(key).ValueKind is JsonValueKind.True or JsonValueKind.False,
             "child_preparation_report_flag_invalid");
         int? exit = root.GetProperty("exit_code").ValueKind == JsonValueKind.Null ? null : root.GetProperty("exit_code").GetInt32();
@@ -347,27 +385,33 @@ internal static class ChildSearchPreparation
             (!Flag("output_completed") || Flag("process_exited")) &&
             (!Flag("process_started") || !Flag("process_cleanup_verified") || Flag("process_exited")),
             "child_preparation_report_process_inconsistent");
-        JsonElement helper = root.GetProperty("helper"); bool binding = false, accepted = false, nativeCleanup = false;
+        JsonElement helper = root.GetProperty("helper"); bool binding = false, accepted = false, nativeCleanup = false, foregroundUnresolved = false;
         Dictionary<string, JsonElement>? publicHelper = null;
         if (helper.ValueKind != JsonValueKind.Null)
         {
             (binding, accepted) = ValidateNative(helper, expectedPreparationNonce);
+            foregroundUnresolved = IsCleanForegroundObservation(helper, expectedPreparationNonce);
             nativeCleanup = binding && helper.GetProperty("cleanup_verified").GetBoolean() && helper.GetProperty("key_cleanup_verified").GetBoolean();
             publicHelper = helper.EnumerateObject().Where(item => item.Name != "binding_nonce")
                 .ToDictionary(item => item.Name, item => item.Value.Clone(), StringComparer.Ordinal);
         }
         Need(binding == Flag("native_binding_verified") && accepted == Flag("native_accepted") &&
+            foregroundUnresolved == Flag("native_foreground_unresolved") &&
             (helper.ValueKind == JsonValueKind.Null || Flag("output_completed")), "child_preparation_report_native_inconsistent");
         bool cleanup = Flag("process_cleanup_verified") && (!Flag("process_started") || nativeCleanup);
         bool verified = status == "verified" && Flag("process_started") && Flag("process_exited") && Flag("output_completed") &&
             exit == 0 && binding && accepted && cleanup && category is null && error is null;
+        bool renderProbeEligible = verified || (status == "failed" && Flag("process_started") && Flag("process_exited") &&
+            Flag("output_completed") && exit == 1 && binding && foregroundUnresolved && cleanup && category is null && error is null);
+        Need(renderProbeEligible == Flag("render_probe_eligible"), "child_preparation_report_eligibility_inconsistent");
         Dictionary<string, object?> output = new(StringComparer.Ordinal)
         {
-            ["schema"] = "witness-preparation/v1", ["status"] = status, ["session_id"] = session, ["verified"] = verified,
-            ["cleanup_verified"] = cleanup, ["exit_code"] = exit, ["error_category"] = category, ["error_hresult"] = error,
+            ["schema"] = "witness-preparation/v2", ["status"] = status, ["session_id"] = session, ["verified"] = verified,
+            ["cleanup_verified"] = cleanup, ["render_probe_eligible"] = renderProbeEligible,
+            ["foreground_unresolved"] = foregroundUnresolved, ["exit_code"] = exit, ["error_category"] = category, ["error_hresult"] = error,
             ["elapsed_ms"] = elapsed, ["helper"] = publicHelper
         };
         foreach (string key in flags) output[key] = Flag(key);
-        return new(verified, cleanup, output);
+        return new(verified, cleanup, renderProbeEligible, foregroundUnresolved, output);
     }
 }

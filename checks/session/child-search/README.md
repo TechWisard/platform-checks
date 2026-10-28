@@ -108,13 +108,51 @@ revalidates child ownership and this report before permitting its frame check.
 Public event output omits the binding nonces and identity digest. Status,
 fixed stage names, HRESULTs, counts and observed flags remain available.
 
-When preparation is requested, `run.ps1` separately requires
-`child_search_preparation_requested`, `child_search_preparation_verified` and
-`child_search_preparation_cleanup_verified` to be true. A preparation success
-does not override a nonzero harness result, cleanup failure or any existing
-frame/input gate. `not_needed` means only that the exact eligible Search
-target was not observed; independent frame validation still decides whether
-the witness is visible.
+When preparation is requested, `run.ps1` requires verified cleanup and
+`child_search_render_probe_eligible` before accepting the later functional
+result. `child_search_preparation_verified` retains its strict meaning: only
+the native `prepared` or `not_needed` outcome with exit zero can set it true.
+`not_needed` means only that the exact eligible Search target was not observed;
+independent frame validation still decides whether the witness is visible.
+
+### Rendering after an unresolved foreground observation
+
+The managed fixture also permits creating its own witness after one narrowly
+defined observation: the native helper exits with `failed`, stage
+`search_target_still_foreground`, and HRESULT `E_UNEXPECTED` (2147549183), after
+three seconds of target observation, while all ownership and input-cleanup
+requirements still hold. This does not change the native helper or its exit
+code. It does not send another key, invoke another UI element, hide the target,
+or claim that the Escape pair was delivered.
+
+The new path requires the same valid receipt and nonce, protected owners and
+ACLs, exact nonadministrator child identity, active child and Default input
+desktop, unchanged console parent, two matching UI Automation observations,
+and freshly rechecked target owner. Both key-state masks must be zero. Exactly
+one two-event Escape batch must have been inserted, with its release observed,
+no compensation call or Win32 error, and successful native cleanup. The final
+pinned target must still be valid, exist, be visible, and be foreground. The
+report must contain at least two target observations, an elapsed time from
+3000 through 9999 ms, and successful COM cleanup. Every other failure remains
+ineligible.
+
+The managed wrapper separately requires native exit code exactly one, completed
+bounded output, a reaped owned process, successful process cleanup, and no
+managed error. A version-two `witness-preparation` envelope records the native
+failure alongside `native_foreground_unresolved` and `render_probe_eligible`.
+The parent revalidates the exact native and process evidence and checks its
+existing child/witness ownership before allowing a frame capture.
+
+For this path, `child_search_preparation_verified` stays false and
+`child_search_foreground_unresolved` records the pre-witness observation.
+Only `child_search_render_probe_eligible` becomes true. The existing witness
+then makes its single own-window presentation request and reports what
+actually happened. No foreground or presentation retry is added.
+
+The captured nonce-dependent frame, child identity/token, and normal-window
+input checks remain unchanged. The runner still requires their actual results
+and all session/account/input cleanup results. Eligibility alone cannot
+produce a frame/input success or turn a nonzero harness exit into success.
 
 ## Build and contract checks
 

@@ -22,6 +22,23 @@ function Test-ExactBoolean {
     return $null -ne $property -and $property.Value -is [bool] -and $property.Value -eq $Expected
 }
 
+function Test-ChildRenderEligibility {
+    param([object] $Report, [bool] $Requested)
+    if ($null -eq $Report -or $Report -isnot [pscustomobject] -or
+        -not (Test-ExactBoolean $Report 'child_search_preparation_requested' $Requested)) { return $false }
+    if (-not $Requested) { return $true }
+    foreach ($name in @('child_search_render_probe_eligible', 'child_search_preparation_cleanup_verified')) {
+        if (-not (Test-ExactBoolean $Report $name $true)) { return $false }
+    }
+    # Exactly one preparation outcome is eligible: actual preparation success,
+    # or the narrowly revalidated, input-clean unresolved foreground observation.
+    $prepared = (Test-ExactBoolean $Report 'child_search_preparation_verified' $true) -and
+        (Test-ExactBoolean $Report 'child_search_foreground_unresolved' $false)
+    $observed = (Test-ExactBoolean $Report 'child_search_preparation_verified' $false) -and
+        (Test-ExactBoolean $Report 'child_search_foreground_unresolved' $true)
+    return $prepared -or $observed
+}
+
 function Test-WindowInputReport {
     param([string] $Json, [bool] $ChildPreparationRequested)
     try { $report = ConvertFrom-Json -InputObject $Json -NoEnumerate }
@@ -46,12 +63,7 @@ function Test-WindowInputReport {
         'physical_input_isolation_verified', 'native_multiseat_verified', 'same_user_sid')) {
         if (-not (Test-ExactBoolean $report $name $false)) { return $false }
     }
-    if (-not (Test-ExactBoolean $report 'child_search_preparation_requested' $ChildPreparationRequested)) { return $false }
-    if ($ChildPreparationRequested) {
-        foreach ($name in @('child_search_preparation_verified', 'child_search_preparation_cleanup_verified')) {
-            if (-not (Test-ExactBoolean $report $name $true)) { return $false }
-        }
-    }
+    if (-not (Test-ChildRenderEligibility $report $ChildPreparationRequested)) { return $false }
     return $true
 }
 
@@ -117,20 +129,14 @@ if (Test-Path -LiteralPath $evidencePath) {
     Write-Output $evidenceText
     if ($ChildSearchHelper) {
         try {
-            $reported = $evidenceText | ConvertFrom-Json -AsHashtable
-            $preparationVerified = $true
-            foreach ($field in @('child_search_preparation_requested', 'child_search_preparation_verified', 'child_search_preparation_cleanup_verified')) {
-                if (-not $reported.ContainsKey($field) -or $reported[$field] -isnot [bool] -or $reported[$field] -ne $true) {
-                    $preparationVerified = $false
-                }
-            }
-            if (-not $preparationVerified) {
+            $reported = ConvertFrom-Json -InputObject $evidenceText -NoEnumerate
+            if (-not (Test-ChildRenderEligibility $reported $true)) {
                 $result = 1
-                'runner_child_preparation_gate=not_verified'
+                'runner_child_render_eligibility_gate=not_verified'
             }
         } catch {
             $result = 1
-            'runner_child_preparation_gate=invalid_evidence'
+            'runner_child_render_eligibility_gate=invalid_evidence'
         }
     }
     if ($TestWindowInput) {
@@ -151,7 +157,7 @@ if (Test-Path -LiteralPath $evidencePath) {
     Get-Content -LiteralPath $evidencePath -Raw
 } elseif ($ChildSearchHelper) {
     $result = 1
-    'runner_child_preparation_gate=missing_evidence'
+    'runner_child_render_eligibility_gate=missing_evidence'
 } elseif ($TestWindowInput -and $result -eq 0) {
     $result = 1
     'window_input_runner_contract_verified=false; evidence_missing=true'

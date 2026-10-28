@@ -308,6 +308,8 @@ internal sealed class Evidence
     public bool WitnessIdentityMatches { get; set; }
     public bool ChildSearchPreparationRequested { get; set; }
     public bool ChildSearchPreparationVerified { get; set; }
+    public bool ChildSearchRenderProbeEligible { get; set; }
+    public bool ChildSearchForegroundUnresolved { get; set; }
     public bool ChildSearchPreparationCleanupVerified { get; set; } = true;
     public bool FrameChallengeVerified { get; set; }
     public bool WindowInputRequested { get; set; }
@@ -592,7 +594,7 @@ internal sealed class ExperimentForm : Form
                 if (witnessVerified) ReadWitnessRendering();
                 if (witnessVerified && childSearchHelper is not null && !witnessPreparationObserved)
                     ReadWitnessPreparation();
-                if (witnessVerified && (childSearchHelper is null || evidence.ChildSearchPreparationVerified) && CheckFrame())
+                if (witnessVerified && (childSearchHelper is null || evidence.ChildSearchRenderProbeEligible) && CheckFrame())
                 {
                     evidence.FrameChallengeVerified = true;
                     evidence.DifferentAccountVerified = alternateTestAccount && evidence.SameUserSid == false &&
@@ -652,9 +654,11 @@ internal sealed class ExperimentForm : Form
             nonce, evidence.ChildSessionId.Value, Program.IdentityDigest(nonce, expectedWitnessSid), preparationNonce);
         witnessPreparationObserved = true;
         evidence.ChildSearchPreparationCleanupVerified = observation.CleanupVerified;
+        evidence.ChildSearchPreparationVerified = observation.Verified;
+        evidence.ChildSearchRenderProbeEligible = observation.RenderProbeEligible;
+        evidence.ChildSearchForegroundUnresolved = observation.ForegroundUnresolved;
         evidence.Event("child_search_preparation_observed", observation.Public);
-        if (!observation.Verified) throw new ExperimentFailure("child_search_preparation_not_verified");
-        evidence.ChildSearchPreparationVerified = true;
+        if (!observation.RenderProbeEligible) throw new ExperimentFailure("child_search_render_probe_not_eligible");
     }
 
     private void ReadWitnessRendering()
@@ -1092,6 +1096,9 @@ internal static class Program
                 if (administratorGroupPresent) throw new ExperimentFailure("child_preparation_requires_nonadministrator_witness");
                 ChildSearchPreparation.RunAndWrite(output, args[2], actual, digest, sid).GetAwaiter().GetResult();
             }
+            // Native preparation and its input cleanup finish first. A narrowly
+            // verified unresolved Search observation may allow this own-window
+            // experiment; actual parent pixels and child input still decide.
             // The native preparation finishes before computing the palette,
             // creating a Form, or registering the witness input baseline.
             render = new WitnessRenderEvidence(output, args[2], actual, digest);
