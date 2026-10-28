@@ -2,8 +2,8 @@
 
 This standalone Windows test observes real callbacks from the installed Remote
 Desktop ActiveX control. It is not a remote-desktop application, an RDP server,
-an account/session launcher or a device-assignment tool. The source has not yet
-been executed on Windows; local cross-compilation is compile/link evidence only.
+an account/session launcher or a device-assignment tool. This revision is submitted for its first
+Windows execution; local cross-compilation is compile/link evidence only.
 
 ## Exact experiment
 
