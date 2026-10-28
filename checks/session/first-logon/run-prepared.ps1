@@ -155,6 +155,9 @@ $preparationExit = $null
 $calibrationExit = $null
 $experimentExit = $null
 $preparationVerified = $false
+$calibrationDiagnosticOnly = $false
+$calibrationErrorHresult = $null
+$calibrationErrorType = $null
 $policiesApplied = $false
 try {
     if (-not $AllowDisposablePrivacyPreparation -or -not [System.OperatingSystem]::IsWindows() -or
@@ -182,17 +185,30 @@ try {
     $report = $prepared.Output.Trim() | ConvertFrom-Json -Depth 8
     if ($report.schema -ne 'first-logon-prepare/v1') { throw 'Unexpected preparation schema.' }
     Write-Output $prepared.Output.Trim()
-    if ($preparationExit -ne 0 -or $report.status -notin @('completed', 'not_needed') -or
-        $report.ordinary_desktop_verified -ne $true -or $report.cleanup_verified -ne $true -or
-        $report.session_functionality_verified -ne $false) { throw 'Parent desktop preparation not verified.' }
-    $preparationVerified = $true
+    $preparationVerified = $preparationExit -eq 0 -and $report.status -in @('completed', 'not_needed') -and
+        $report.ordinary_desktop_verified -eq $true -and $report.cleanup_verified -eq $true -and
+        $report.session_functionality_verified -eq $false
+    $calibrationDiagnosticOnly = -not $preparationVerified
     $phase = 'native_window_calibration'
-    $calibration = Invoke-OwnedProcess -Executable $powershell -WaitMilliseconds 65000 -MaximumOutput 1048576 `
-        -Arguments @('-NoLogo', '-NoProfile', '-NonInteractive',
-        '-File', $calibrationRunner, '-Program', [System.IO.Path]::GetFullPath($CalibrationProgram))
-    $calibrationExit = $calibration.ExitCode
-    Write-Output $calibration.Output
-    if ($calibration.ErrorOutput.Length) { throw 'Unexpected calibration stderr.' }
+    # A completed helper result always receives an independent pixel/ownership
+    # calibration. A preparation failure stays a failure even if calibration
+    # passes. No child account/session starts unless both original gates pass.
+    try {
+        $calibration = Invoke-OwnedProcess -Executable $powershell -WaitMilliseconds 65000 -MaximumOutput 1048576 `
+            -Arguments @('-NoLogo', '-NoProfile', '-NonInteractive',
+            '-File', $calibrationRunner, '-Program', [System.IO.Path]::GetFullPath($CalibrationProgram))
+        $calibrationExit = $calibration.ExitCode
+        Write-Output $calibration.Output
+        if ($calibration.ErrorOutput.Length) { throw 'Unexpected calibration stderr.' }
+    } catch {
+        $calibrationErrorHresult = ([long]$_.Exception.HResult -band 4294967295L)
+        $calibrationErrorType = $_.Exception.GetType().Name
+    }
+    if (-not $preparationVerified) {
+        $phase = 'prepare_parent_first_logon'
+        throw 'Parent desktop preparation not verified; calibration is diagnostic only.'
+    }
+    if ($null -ne $calibrationErrorHresult) { throw 'Independent native calibration did not complete.' }
     if ($calibrationExit -ne 0) { throw 'Independent native window calibration failed.' }
     $phase = 'verify_policies_before_new_account'
     foreach ($snapshot in $snapshots) {
@@ -239,6 +255,9 @@ if (-not $restored) { $outcome = 1 }
     parent_preparation_verified = $preparationVerified
     preparation_exit = $preparationExit
     native_calibration_exit = $calibrationExit
+    calibration_diagnostic_only = $calibrationDiagnosticOnly
+    calibration_error_hresult = $calibrationErrorHresult
+    calibration_error_type = $calibrationErrorType
     child_experiment_exit = $experimentExit
     policy_values_restored = $restored
     policy_values = @($snapshots | ForEach-Object {

@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <ole2.h>
 #include <appmodel.h>
+#include <dwmapi.h>
 #include <wtsapi32.h>
 #include <uiautomation.h>
 #include <array>
@@ -46,13 +47,21 @@ struct Result {
     const char* status{"failed"};
     const char* stage{"start"};
     HRESULT error{S_OK}, invoke_error{S_OK}, cleanup_error{S_OK};
+    HRESULT foreground_class_hresult{S_OK}, observed_target_cloak_hresult{S_OK};
     DWORD session{};
     unsigned initial_heading_count{}, recheck_heading_count{}, initial_button_count{}, recheck_button_count{};
     unsigned invoke_count{}, wait_observations{}, stable_observations{}, foreground_kind{};
+    unsigned wait_guard{}, foreground_class_category{};
+    DWORD observed_target_cloak_flags{};
     bool opted_in{}, disposable_environment_verified{}, input_default_desktop_verified{}, target_initially_foreground{};
     bool target_owner_verified{}, target_owner_reverified{}, root_handle_verified{}, same_button_reverified{};
     bool invoke_attempted{}, invoke_succeeded{}, observed_page_hidden_or_destroyed{};
     bool explorer_shell_verified{}, ordinary_desktop_verified{}, com_uninitialized{}, cleanup_verified{true};
+    bool shell_handle_present{}, shell_window_exists{}, shell_identity_checked{};
+    bool foreground_present{}, foreground_class_read{}, associated_console_present{};
+    bool foreground_is_shell{}, foreground_matches_associated_console{}, foreground_shares_shell_process{};
+    bool foreground_is_observed_target{}, observed_target_sampled{}, observed_target_exists{}, observed_target_visible{};
+    bool observed_target_cloak_query_attempted{};
 };
 struct Handle final {
     HANDLE value{};
@@ -152,30 +161,72 @@ bool explorer_image(HANDLE process) {
     const wchar_t* basename = last ? last + 1 : path.value.data();
     return CompareStringOrdinal(basename, -1, L"explorer.exe", -1, TRUE) == CSTR_EQUAL;
 }
+unsigned foreground_class(HWND window, Result& out) {
+    std::array<wchar_t, 128> value{};
+    const int size = GetClassNameW(window, value.data(), static_cast<int>(value.size()));
+    if (size <= 0 || size >= static_cast<int>(value.size() - 1)) {
+        out.foreground_class_hresult = size <= 0 ? last_error() : HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    out.foreground_class_read = true;
+    constexpr const wchar_t* classes[]{L"Progman", L"WorkerW", L"CabinetWClass", L"ConsoleWindowClass",
+        L"CASCADIA_HOSTING_WINDOW_CLASS", L"Windows.UI.Core.CoreWindow", L"ApplicationFrameWindow"};
+    for (unsigned index = 0; index < sizeof(classes) / sizeof(classes[0]); ++index)
+        if (std::wcscmp(value.data(), classes[index]) == 0) return index + 1;
+    return 255; // Unknown class text is never emitted or used to widen the gate.
+}
 bool ordinary_desktop(HWND original_target, Result& out) {
     verify_desktop(out);
+    out.wait_guard = 0; out.foreground_kind = 0; out.explorer_shell_verified = false; out.shell_identity_checked = false;
+    out.foreground_class_category = 0; out.foreground_class_read = false; out.foreground_class_hresult = S_OK;
+    out.foreground_shares_shell_process = false;
+    // Every directly readable observation is refreshed before an early return.
+    // DWM cloak state is diagnostic only; all existing readiness gates stay.
+    out.observed_target_sampled = original_target != nullptr;
+    out.observed_target_exists = original_target && IsWindow(original_target);
+    out.observed_target_visible = out.observed_target_exists && IsWindowVisible(original_target);
+    out.observed_page_hidden_or_destroyed = original_target && (!out.observed_target_exists || !out.observed_target_visible);
+    out.observed_target_cloak_query_attempted = out.observed_target_exists;
+    out.observed_target_cloak_flags = 0; out.observed_target_cloak_hresult = S_OK;
+    if (out.observed_target_exists) {
+        out.observed_target_cloak_hresult = DwmGetWindowAttribute(original_target, DWMWA_CLOAKED,
+            &out.observed_target_cloak_flags, sizeof(out.observed_target_cloak_flags));
+    }
     const HWND shell = GetShellWindow();
-    if (!shell || !IsWindow(shell)) return false;
+    out.shell_handle_present = shell != nullptr; out.shell_window_exists = shell && IsWindow(shell);
+    const HWND foreground = GetAncestor(GetForegroundWindow(), GA_ROOT);
+    const HWND console = GetConsoleWindow();
+    out.foreground_present = foreground != nullptr; out.associated_console_present = console != nullptr;
+    out.foreground_is_shell = foreground && foreground == shell;
+    out.foreground_matches_associated_console = foreground && console && foreground == GetAncestor(console, GA_ROOT);
+    out.foreground_is_observed_target = foreground && original_target && foreground == original_target;
+    if (foreground) out.foreground_class_category = foreground_class(foreground, out);
+    if (!shell || !IsWindow(shell)) { out.wait_guard = 1; return false; }
     const DWORD shell_owner = window_owner(shell, out.session);
     Handle process{OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, shell_owner), out};
     need(process.value != nullptr, "shell_process_open", last_error());
-    need(explorer_image(process.value), "shell_process_not_explorer");
-    const HWND foreground = GetAncestor(GetForegroundWindow(), GA_ROOT);
-    if (!foreground) return false;
+    out.explorer_shell_verified = explorer_image(process.value); out.shell_identity_checked = true;
+    need(out.explorer_shell_verified, "shell_process_not_explorer");
+    if (!foreground) { out.wait_guard = 2; return false; }
     const DWORD foreground_owner = window_owner(foreground, out.session);
+    out.foreground_shares_shell_process = foreground_owner == shell_owner;
     unsigned kind{};
     if (foreground == shell) kind = 1;
     else if (foreground == GetAncestor(GetConsoleWindow(), GA_ROOT)) kind = 2;
     else if (foreground_owner == shell_owner &&
         (class_equals(foreground, L"Progman") || class_equals(foreground, L"WorkerW") || class_equals(foreground, L"CabinetWClass"))) kind = 3;
-    if (!kind) return false;
+    out.foreground_kind = kind;
+    if (!kind) { out.wait_guard = 3; return false; }
     const bool absent = !original_target || !IsWindow(original_target) || !IsWindowVisible(original_target);
-    if (!absent) return false;
+    if (!absent) { out.wait_guard = 4; return false; }
     // Recheck the exact observed shell/foreground before reporting a stable poll.
     if (GetShellWindow() != shell || GetAncestor(GetForegroundWindow(), GA_ROOT) != foreground ||
-        window_owner(shell, out.session) != shell_owner || window_owner(foreground, out.session) != foreground_owner) return false;
+        window_owner(shell, out.session) != shell_owner || window_owner(foreground, out.session) != foreground_owner) {
+        out.wait_guard = 5; return false;
+    }
     out.explorer_shell_verified = true; out.foreground_kind = kind;
     if (original_target) out.observed_page_hidden_or_destroyed = true;
+    out.wait_guard = 6;
     return true;
 }
 Com<IUIAutomationCondition> property(IUIAutomation2* automation, PROPERTYID id, VARIANT value, ULONGLONG end) {
@@ -307,9 +358,17 @@ void write(const Result& out, ULONGLONG elapsed) {
     FIELD(initial_heading_count); FIELD(recheck_heading_count); FIELD(initial_button_count); FIELD(recheck_button_count);
     FIELD(same_button_reverified); FIELD(invoke_attempted); FIELD(invoke_count); FIELD(invoke_succeeded);
     FIELD(observed_page_hidden_or_destroyed); FIELD(explorer_shell_verified); FIELD(foreground_kind);
+    FIELD(wait_guard); FIELD(shell_handle_present); FIELD(shell_window_exists); FIELD(shell_identity_checked);
+    FIELD(foreground_present); FIELD(foreground_class_read); FIELD(foreground_class_category);
+    FIELD(associated_console_present); FIELD(foreground_is_shell); FIELD(foreground_matches_associated_console);
+    FIELD(foreground_shares_shell_process); FIELD(foreground_is_observed_target); FIELD(observed_target_sampled);
+    FIELD(observed_target_exists); FIELD(observed_target_visible); FIELD(observed_target_cloak_query_attempted);
+    FIELD(observed_target_cloak_flags);
     FIELD(wait_observations); FIELD(stable_observations); FIELD(ordinary_desktop_verified); FIELD(com_uninitialized); FIELD(cleanup_verified);
 #undef FIELD
-    std::cout << ",\"privacy_toggle_values_changed_by_helper\":false,\"credential_fields_read\":false,"
+    std::cout << ",\"foreground_class_hresult\":" << static_cast<std::uint32_t>(out.foreground_class_hresult)
+        << ",\"observed_target_cloak_hresult\":" << static_cast<std::uint32_t>(out.observed_target_cloak_hresult)
+        << ",\"privacy_toggle_values_changed_by_helper\":false,\"credential_fields_read\":false,"
         "\"other_ui_invoked\":false,\"force_closed_window\":false,\"session_functionality_verified\":false,"
         "\"remote_frame_verified\":false,\"input_channel_verified\":false,\"physical_isolation_verified\":false}\n";
 }

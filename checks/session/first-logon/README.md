@@ -81,11 +81,13 @@ and unexpanded data; then sets only:
 | `SOFTWARE\Policies\Microsoft\Windows\OOBE` | `DisablePrivacyExperience` | 1 |
 | `SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System` | `EnableFirstLogonAnimation` | 0 |
 
-Both snapshots are completed before either write. The wrapper verifies writes,
-requires native preparation, then requires the unchanged independent native
-window calibration. It rechecks the two policy values before starting the
-existing child runner with `-AlternateTestAccount -TestDirectInput`.
-Calibration failure prevents the child experiment; neither gate is weakened.
+Both snapshots are completed before either write. The wrapper verifies writes
+and runs the unchanged independent native window calibration after every
+completed, parsed helper result, including a preparation timeout. After failed
+preparation, calibration is diagnostic only: the original preparation failure
+and final failure remain. The child runner starts only if both the original
+preparation gate and calibration pass. The two policy values are rechecked
+before starting it with `-AlternateTestAccount -TestDirectInput`.
 
 The calibration and child runner execute as owned PowerShell subprocesses, so
 their `exit` statements cannot leave the policy wrapper's `finally` scope.
@@ -123,3 +125,24 @@ not yet completed its first Windows runtime execution.
 The button ID and heading are runtime observations from that page, not a claim
 that every Windows build or language exposes this UI contract. A mismatch fails
 without an alternative UI action.
+
+## Independent wait observations
+
+After the first actual preparation attempt timed out, each ordinary-desktop
+guard now records its own observation before later guards can return early.
+Shell presence and Explorer identity, foreground category, associated-console
+presence, and the original target HWND's existence/visibility are separate
+fields. `DWMWA_CLOAKED` is read only for that original observed target; its
+numeric HRESULT and flags are diagnostics and do not alter the readiness gate.
+No unknown window class text or UI name is emitted.
+
+`wait_guard`: 0 = observation not yet completed; 1 = shell absent; 2 = foreground
+absent; 3 = foreground outside the existing ordinary categories; 4 = original
+target still visible; 5 = owner/foreground changed on final recheck; 6 = ready
+poll. Other API errors retain their explicit failure stage.
+
+`foreground_class_category`: 0 = absent/unreadable; 1 = Progman; 2 = WorkerW;
+3 = CabinetWClass; 4 = ConsoleWindowClass; 5 = CASCADIA_HOSTING_WINDOW_CLASS;
+6 = Windows.UI.Core.CoreWindow; 7 = ApplicationFrameWindow; 255 = unclassified.
+These classifications authorize no additional action. The single-Invoke limit,
+32-second native budget, foreground/absence checks and child gates are unchanged.
