@@ -57,6 +57,7 @@ internal static class OwnWindowPresentation
         bool? foregroundIsOwn = root == IntPtr.Zero || foregroundRoot == IntPtr.Zero ? null : root == foregroundRoot;
 
         int points = 0, ownMask = 0, noWindowMask = 0, unresolvedMask = 0;
+        IntPtr[] hitRoots = new IntPtr[9];
         if (region.Width is > 0 and <= 4096 && region.Height is > 0 and <= 4096)
         {
             // Same row-major 3x3 grid used by the independent parent probe.
@@ -70,6 +71,7 @@ internal static class OwnWindowPresentation
                 IntPtr hit = WindowFromPoint(point);
                 if (hit == IntPtr.Zero) { noWindowMask |= bit; continue; }
                 IntPtr hitRoot = GetAncestor(hit, 2);
+                hitRoots[points - 1] = hitRoot;
                 if (hitRoot == IntPtr.Zero) { unresolvedMask |= bit; continue; }
                 if (root != IntPtr.Zero && hitRoot == root) ownMask |= bit;
             }
@@ -86,7 +88,8 @@ internal static class OwnWindowPresentation
             form.TopMost, IsWindowVisible(window), IsWindowEnabled(window), IsIconic(window),
             root != IntPtr.Zero, foregroundRoot != IntPtr.Zero, foregroundIsOwn,
             points, root != IntPtr.Zero ? ownMask : null, noWindowMask, unresolvedMask,
-            cloakHresult >= 0 ? cloaked : null, cloakHresult);
+            cloakHresult >= 0 ? cloaked : null, cloakHresult,
+            WindowCoverageDiagnostics.Capture(form, root, foregroundRoot, hitRoots));
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -123,4 +126,4 @@ internal sealed record OwnWindowCoverage(FrameRectangle ClientScreenBounds, Fram
     bool TopMostRequested, bool WindowVisible, bool WindowEnabled, bool WindowIconic,
     bool OwnRootResolved, bool ForegroundRootResolved, bool? ForegroundRootIsOwn,
     int HitTestPointCount, int? OwnRootHitMask, int NoWindowHitMask, int UnresolvedRootHitMask,
-    uint? CloakedFlags, int CloakHresult);
+    uint? CloakedFlags, int CloakHresult, WindowCoverageDiagnosticSnapshot Diagnostics);

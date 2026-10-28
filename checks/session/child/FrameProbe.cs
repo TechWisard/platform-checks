@@ -15,6 +15,7 @@ internal sealed class FrameProbe
     private const int SampleStep = 4;
     private readonly Stopwatch clock = Stopwatch.StartNew();
     private FrameProbeSnapshot? last;
+    private FrameCoverageObservation? lastCoverage;
     private long sequence;
     private long lastReportMilliseconds;
     private bool reported;
@@ -29,7 +30,7 @@ internal sealed class FrameProbe
         long elapsed = clock.ElapsedMilliseconds;
         if (region.Width <= 0 || region.Height <= 0 || region.Width > MaximumDimension || region.Height > MaximumDimension)
         {
-            Observe(new(currentSequence, elapsed, "region_rejected", geometry, null, 0, null), record);
+            Observe(new(currentSequence, elapsed, "region_rejected", geometry, null, 0, null), parent, record);
             return null;
         }
 
@@ -40,13 +41,13 @@ internal sealed class FrameProbe
             using (Graphics graphics = Graphics.FromImage(bitmap))
                 graphics.CopyFromScreen(region.Location, Point.Empty, region.Size, CopyPixelOperation.SourceCopy);
             FrameSamples samples = Analyze(bitmap, palette);
-            Observe(new(currentSequence, elapsed, "captured", geometry, samples, capture.ElapsedMilliseconds, null), record);
+            Observe(new(currentSequence, elapsed, "captured", geometry, samples, capture.ElapsedMilliseconds, null), parent, record);
             return samples;
         }
         catch (Exception ex)
         {
             int code = ex is Win32Exception win32 ? win32.NativeErrorCode : ex.HResult;
-            Observe(new(currentSequence, elapsed, "capture_failed", geometry, null, capture.ElapsedMilliseconds, code), record);
+            Observe(new(currentSequence, elapsed, "capture_failed", geometry, null, capture.ElapsedMilliseconds, code), parent, record);
             throw; // Preserve the existing failure behavior of CopyFromScreen.
         }
     }
@@ -98,7 +99,7 @@ internal sealed class FrameProbe
         }
     }
 
-    private void Observe(FrameProbeSnapshot snapshot, Action<string, object?> record)
+    private void Observe(FrameProbeSnapshot snapshot, Control parent, Action<string, object?> record)
     {
         last = snapshot;
         long now = clock.ElapsedMilliseconds;
@@ -107,6 +108,18 @@ internal sealed class FrameProbe
         reported = true;
         lastReportMilliseconds = now;
         record("parent_frame_probe", new { phase, snapshot });
+        // Resolve image/class categories only on bounded diagnostic reports,
+        // not on every 500ms frame capture. These queries never affect a match.
+        try
+        {
+            OwnWindowCoverage coverage = OwnWindowPresentation.Observe((Form)parent);
+            lastCoverage = new(snapshot.Sequence, snapshot.ElapsedMilliseconds, coverage, null);
+        }
+        catch (Exception exception)
+        {
+            lastCoverage = new(snapshot.Sequence, snapshot.ElapsedMilliseconds, null, exception.HResult);
+        }
+        record("parent_window_coverage", new { phase, snapshot = lastCoverage });
     }
 
     // Re-emits the most recent sampled pass, before cleanup changes visibility.
@@ -116,6 +129,8 @@ internal sealed class FrameProbe
         if (last is null || finalReported) return;
         finalReported = true;
         record("parent_frame_probe", new { phase = "final", snapshot = last });
+        if (lastCoverage is not null)
+            record("parent_window_coverage", new { phase = "final", snapshot = lastCoverage });
     }
 
     private static ParentFrameGeometry ReadGeometry(Control host, Control parent, Rectangle region)
@@ -230,6 +245,9 @@ internal sealed record FrameSamples(int SampleCount, int BlackSamples, int White
 
 internal sealed record FrameProbeSnapshot(long Sequence, long ElapsedMilliseconds, string CaptureStatus,
     ParentFrameGeometry Geometry, FrameSamples? Pixels, long CaptureMilliseconds, int? CaptureError);
+
+internal sealed record FrameCoverageObservation(long FrameSequence, long FrameElapsedMilliseconds,
+    OwnWindowCoverage? Coverage, int? DiagnosticHresult);
 
 internal sealed record ParentFrameGeometry(FrameRectangle ClientRegion, FrameRectangle HostClientRectangle,
     FrameRectangle VirtualScreen, FrameRectangle VirtualScreenIntersection, bool EntireRegionInsideVirtualScreen,

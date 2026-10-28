@@ -82,6 +82,27 @@ passes are attempted, with numeric inventory diagnostics and no account names.
 .\run.ps1 -ResultsDirectory "$env:RUNNER_TEMP\account-contract-new" -AllowEnableChildSessions -AlternateTestAccount
 ```
 
+## Optional direct-input delivery experiment
+
+`-TestDirectInput` additionally requires `-AlternateTestAccount`. No input is
+sent until the unchanged parent frame challenge and the distinct account B
+identity have actually passed. The witness first reports an empty input
+baseline, its own foreground/focus, input desktop and measured geometry.
+
+The test sends one mouse move through the documented RDP input sink. A new
+actual `WM_MOUSEMOVE` in the witness must confirm the exact physical point and
+own root before the single left down/up is allowed. Then eight independent
+random hex characters, known only to the parent, must arrive as real witness
+character messages. Extra/repeated/invalid input fails. A quiet interval and a
+newer heartbeat after its end are required; a stale report is not success.
+
+The parent observes its own UI-thread keyboard/button messages without
+suppressing them and repeatedly checks its cursor. Any observed parent effect
+fails. This is bounded evidence about the selected RDP connection, not physical
+device isolation or observation of every parent process. Both physical/native
+multiseat fields stay false. COM method/enum signatures are checked against the
+installed Microsoft type library; successful HRESULTs alone do not pass.
+
 ## Run only in an isolated disposable test machine
 
 Requirements: Windows with the desktop RDP ActiveX control, .NET 8 SDK and the

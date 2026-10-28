@@ -3,6 +3,7 @@ param(
     [string] $ResultsDirectory,
     [switch] $AllowEnableChildSessions,
     [switch] $AlternateTestAccount,
+    [switch] $TestDirectInput,
     [ValidateRange(15, 300)]
     [int] $TimeoutSeconds = 120
 )
@@ -27,6 +28,7 @@ $program = Join-Path $buildDirectory 'SessionContractExperiment.exe'
 $programArgs = @('--output', $evidencePath, '--timeout-seconds', $TimeoutSeconds.ToString())
 if ($AllowEnableChildSessions) { $programArgs += '--allow-enable-child-sessions' }
 if ($AlternateTestAccount) { $programArgs += '--alternate-test-account' }
+if ($TestDirectInput) { $programArgs += '--test-direct-input' }
 . (Join-Path $PSScriptRoot 'environment-snapshot.ps1')
 'environment_snapshot_phase=before'
 Write-SessionEnvironmentSnapshot

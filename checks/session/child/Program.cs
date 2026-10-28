@@ -307,6 +307,12 @@ internal sealed class Evidence
     public bool WitnessInExpectedSession { get; set; }
     public bool WitnessIdentityMatches { get; set; }
     public bool FrameChallengeVerified { get; set; }
+    public bool DirectInputRequested { get; set; }
+    public bool DirectInputChannelVerified { get; set; }
+    public bool ChildReceivedExpectedText { get; set; }
+    public bool ChildReceivedExpectedButtonSequence { get; set; }
+    public int? ParentProbeInputEventCount { get; set; }
+    public bool? ParentCursorUnchanged { get; set; }
     public bool PhysicalInputIsolationVerified { get; set; }
     public bool NativeMultiseatVerified { get; set; }
     public bool ChildRemoved { get; set; }
@@ -334,6 +340,7 @@ internal sealed class ExperimentForm : Form
     private readonly Evidence evidence;
     private readonly bool allowEnable;
     private readonly bool alternateTestAccount;
+    private readonly bool testDirectInput;
     private readonly TimeSpan timeout;
     private readonly RdpHost host = new() { Dock = DockStyle.Fill };
     private readonly FrameProbe frameProbe = new();
@@ -359,10 +366,11 @@ internal sealed class ExperimentForm : Form
     private bool preconditions;
     internal int ExitCode { get; private set; } = 1;
 
-    internal ExperimentForm(Evidence evidence, bool allowEnable, TimeSpan timeout, bool alternateTestAccount)
+    internal ExperimentForm(Evidence evidence, bool allowEnable, TimeSpan timeout, bool alternateTestAccount, bool testDirectInput)
     {
         this.evidence = evidence; this.allowEnable = allowEnable; this.timeout = timeout;
         this.alternateTestAccount = alternateTestAccount;
+        this.testDirectInput = testDirectInput;
         Text = "Session contract experiment — local child session";
         OwnWindowPresentation.Configure(this);
         MaximizeBox = false;
@@ -572,6 +580,14 @@ internal sealed class ExperimentForm : Form
                 await Task.Delay(500);
             }
             if (!evidence.FrameChallengeVerified) throw new ExperimentFailure("frame_challenge_timeout");
+            if (testDirectInput)
+            {
+                await DirectInputExperiment.Run(this, control, evidence, witnessFile, nonce,
+                    evidence.ChildSessionId!.Value, Program.IdentityDigest(nonce, expectedWitnessSid),
+                    () => { connectionEvents.ThrowIfConnectionFailed(); VerifyWitnessOwnership(evidence.ChildSessionId!.Value); },
+                    timeout - deadline.Elapsed);
+                evidence.Status = "different_account_child_frame_and_input_verified";
+            }
         }
         catch (Exception ex)
         {
@@ -660,6 +676,7 @@ internal sealed class ExperimentForm : Form
                 arguments.Add(Assembly.GetExecutingAssembly().Location);
         }
         arguments.AddRange(new[] { "--witness", session.ToString(CultureInfo.InvariantCulture), nonce, result });
+        if (testDirectInput) arguments.Add("--prepare-input");
         action.Path = executable;
         action.Arguments = string.Join(" ", arguments.Select(Program.QuoteArgument));
         action.WorkingDirectory = witnessSandbox?.BinaryDirectory ?? AppContext.BaseDirectory;
@@ -845,6 +862,7 @@ internal sealed class WitnessForm : Form
 {
     private readonly Color[] colors;
     private readonly WitnessRenderEvidence render;
+    private WitnessInputEvidence? input;
     private readonly System.Windows.Forms.Timer lifetime = new() { Interval = 150000 };
     private readonly System.Windows.Forms.Timer diagnostics = new() { Interval = 1000 };
     private readonly Stopwatch shownFor = new();
@@ -883,6 +901,17 @@ internal sealed class WitnessForm : Form
         };
         FormClosed += (_, _) => { lifetime.Dispose(); diagnostics.Dispose(); shownFor.Stop(); };
     }
+    internal WitnessInputEvidence AttachInputProbe(string identityOutput, string nonce, uint session, string digest)
+    {
+        if (input is not null || IsHandleCreated) throw new ExperimentFailure("input_probe_attachment_must_precede_window_creation");
+        input = new WitnessInputEvidence(this, identityOutput, nonce, session, digest);
+        return input;
+    }
+    protected override void WndProc(ref Message message)
+    {
+        if (input?.Observe(ref message) == true) return;
+        base.WndProc(ref message);
+    }
     protected override void OnPaint(PaintEventArgs e)
     {
         try
@@ -899,6 +928,7 @@ internal sealed class WitnessForm : Form
     }
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
+        input?.Dispose();
         render.Capture(this, "form_closing", captureFrame: false, final: true, closeReason: (int)e.CloseReason);
         base.OnFormClosing(e);
     }
@@ -909,21 +939,24 @@ internal static class Program
     [STAThread]
     private static int Main(string[] args)
     {
-        if (args.Length == 4 && args[0] == "--witness") return RunWitness(args);
+        if ((args.Length == 4 || (args.Length == 5 && args[4] == "--prepare-input")) && args[0] == "--witness") return RunWitness(args);
         string? output = null;
         bool allowEnable = false;
         bool alternateTestAccount = false;
+        bool testDirectInput = false;
         int timeout = 120;
         for (int i = 0; i < args.Length; i++)
         {
             if (args[i] == "--output" && i + 1 < args.Length) output = Path.GetFullPath(args[++i]);
             else if (args[i] == "--allow-enable-child-sessions") allowEnable = true;
             else if (args[i] == "--alternate-test-account") alternateTestAccount = true;
+            else if (args[i] == "--test-direct-input") testDirectInput = true;
             else if (args[i] == "--timeout-seconds" && i + 1 < args.Length && int.TryParse(args[++i], out int value) && value is >= 15 and <= 300) timeout = value;
-            else { Console.Error.WriteLine("Usage: SessionContractExperiment --output FILE [--allow-enable-child-sessions] [--timeout-seconds 15..300] [--alternate-test-account]"); return 64; }
+            else { Console.Error.WriteLine("Usage: SessionContractExperiment --output FILE [--allow-enable-child-sessions] [--timeout-seconds 15..300] [--alternate-test-account] [--test-direct-input]"); return 64; }
         }
+        if (testDirectInput && !alternateTestAccount) { Console.Error.WriteLine("--test-direct-input requires --alternate-test-account."); return 64; }
         if (output is null || File.Exists(output)) { Console.Error.WriteLine("A new --output file is required."); return 64; }
-        Evidence evidence = new() { AlternateTestAccountRequested = alternateTestAccount };
+        Evidence evidence = new() { AlternateTestAccountRequested = alternateTestAccount, DirectInputRequested = testDirectInput };
         int result = 1;
         using Mutex mutex = new(false, "Local\\SessionContractExperiment");
         bool acquired = false;
@@ -946,7 +979,7 @@ internal static class Program
                 Application.SetUnhandledExceptionMode(UnhandledExceptionMode.ThrowException);
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
-                using ExperimentForm form = new(evidence, allowEnable, TimeSpan.FromSeconds(timeout), alternateTestAccount);
+                using ExperimentForm form = new(evidence, allowEnable, TimeSpan.FromSeconds(timeout), alternateTestAccount, testDirectInput);
                 Application.Run(form);
                 result = form.ExitCode;
             }
@@ -979,6 +1012,7 @@ internal static class Program
         string? sid = identity.User?.Value;
         if (sid is null) return 2;
         WitnessRenderEvidence? render = null;
+        WitnessInputEvidence? input = null;
         ThreadExceptionEventHandler? uiException = null;
         int result = 2;
         try
@@ -999,12 +1033,14 @@ internal static class Program
             {
                 result = 2;
                 render.RecordException("ui_thread", error.Exception);
+                input?.RecordException(error.Exception);
                 Application.ExitThread();
             };
             Application.ThreadException += uiException;
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             using WitnessForm form = new(args[2], render);
+            if (args.Length == 5) input = form.AttachInputProbe(output, args[2], actual, digest);
             result = 0;
             Application.Run(form);
             if (render.UiFailed) result = 2;
@@ -1013,11 +1049,13 @@ internal static class Program
         {
             result = 2;
             render?.RecordException("startup_or_message_loop", ex);
+            input?.RecordException(ex);
             Console.Error.WriteLine("witness_ui_failed;hresult=" + ex.HResult.ToString(CultureInfo.InvariantCulture));
         }
         finally
         {
             if (uiException is not null) Application.ThreadException -= uiException;
+            input?.Dispose();
             render?.Returning(result);
         }
         return result;
