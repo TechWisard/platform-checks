@@ -363,6 +363,11 @@ internal sealed class ExperimentForm : Form
             Dispatch.Set(control, "DesktopHeight", 768);
             Dispatch.Set(control, "ColorDepth", 32);
             object advanced = Dispatch.Get(control, "AdvancedSettings9") ?? throw new ExperimentFailure("advanced_settings_missing");
+            bool credSspBefore = Convert.ToBoolean(Dispatch.Get(advanced, "EnableCredSspSupport"), CultureInfo.InvariantCulture);
+            Dispatch.Set(advanced, "EnableCredSspSupport", true);
+            bool credSspAfter = Convert.ToBoolean(Dispatch.Get(advanced, "EnableCredSspSupport"), CultureInfo.InvariantCulture);
+            evidence.Event("connection_credssp", new { before = credSspBefore, after = credSspAfter });
+            if (!credSspAfter) throw new ExperimentFailure("connection_credssp_not_enabled");
             foreach (string property in new[] { "RedirectClipboard", "RedirectDrives", "RedirectPrinters", "RedirectPorts", "RedirectSmartCards" })
                 Dispatch.Set(advanced, property, false);
             extended.Set("ConnectToChildSession", true);

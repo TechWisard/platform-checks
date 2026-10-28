@@ -2,6 +2,9 @@ name: Independent platform checks
 
 on:
   push:
+    paths-ignore:
+      - 'checks/session/**'
+      - '.github/workflows/session-contracts.yml'
   pull_request:
   workflow_dispatch:
 
