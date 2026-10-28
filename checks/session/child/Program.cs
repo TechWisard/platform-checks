@@ -306,7 +306,15 @@ internal sealed class Evidence
     public bool WitnessSandboxRemoved { get; set; } = true;
     public bool WitnessInExpectedSession { get; set; }
     public bool WitnessIdentityMatches { get; set; }
+    public bool ChildSearchPreparationRequested { get; set; }
+    public bool ChildSearchPreparationVerified { get; set; }
+    public bool ChildSearchPreparationCleanupVerified { get; set; } = true;
     public bool FrameChallengeVerified { get; set; }
+    public bool WindowInputRequested { get; set; }
+    public bool WindowInputVerified { get; set; }
+    public bool? WindowInputCleanupVerified { get; set; }
+    public bool WindowChildReceivedExpectedText { get; set; }
+    public bool WindowChildReceivedExpectedButtonSequence { get; set; }
     public bool DirectInputRequested { get; set; }
     public bool DirectInputChannelVerified { get; set; }
     public bool ChildReceivedExpectedText { get; set; }
@@ -341,6 +349,8 @@ internal sealed class ExperimentForm : Form
     private readonly bool allowEnable;
     private readonly bool alternateTestAccount;
     private readonly bool testDirectInput;
+    private readonly bool testWindowInput;
+    private readonly string? childSearchHelper;
     private readonly TimeSpan timeout;
     private readonly RdpHost host = new() { Dock = DockStyle.Fill };
     private readonly FrameProbe frameProbe = new();
@@ -357,6 +367,8 @@ internal sealed class ExperimentForm : Form
     private RdpPasswordControl? passwordControl;
     private WitnessSandbox? witnessSandbox;
     private string? witnessRenderPath;
+    private string? witnessPreparationPath;
+    private bool witnessPreparationObserved;
     private long witnessRenderSequence = -1;
     private bool witnessRenderReadErrorReported;
     private dynamic? taskFolder;
@@ -366,11 +378,13 @@ internal sealed class ExperimentForm : Form
     private bool preconditions;
     internal int ExitCode { get; private set; } = 1;
 
-    internal ExperimentForm(Evidence evidence, bool allowEnable, TimeSpan timeout, bool alternateTestAccount, bool testDirectInput)
+    internal ExperimentForm(Evidence evidence, bool allowEnable, TimeSpan timeout, bool alternateTestAccount, bool testDirectInput, bool testWindowInput, string? childSearchHelper)
     {
         this.evidence = evidence; this.allowEnable = allowEnable; this.timeout = timeout;
         this.alternateTestAccount = alternateTestAccount;
         this.testDirectInput = testDirectInput;
+        this.testWindowInput = testWindowInput;
+        this.childSearchHelper = childSearchHelper;
         Text = "Session contract experiment — local child session";
         OwnWindowPresentation.Configure(this);
         MaximizeBox = false;
@@ -530,6 +544,14 @@ internal sealed class ExperimentForm : Form
                 finally { evidence.WitnessSandboxRemoved = !witnessSandbox.Created; }
                 witnessFile = witnessSandbox.ResultPath;
                 evidence.Event("owned_witness_payload_prepared");
+                if (childSearchHelper is not null)
+                {
+                    VerifyWitnessOwnership(evidence.ChildSessionId!.Value);
+                    witnessSandbox.PrepareChildSearch(childSearchHelper, parentSid, expectedWitnessSid,
+                        evidence.ParentSessionId, evidence.ChildSessionId.Value, evidence.ConsoleSessionBefore);
+                    witnessPreparationPath = Path.Combine(Path.GetDirectoryName(witnessFile)!, ChildSearchPreparation.ReportName);
+                    evidence.Event("owned_child_search_payload_prepared");
+                }
             }
             else
             {
@@ -568,7 +590,9 @@ internal sealed class ExperimentForm : Form
                     evidence.Event("witness_process_verified");
                 }
                 if (witnessVerified) ReadWitnessRendering();
-                if (witnessVerified && CheckFrame())
+                if (witnessVerified && childSearchHelper is not null && !witnessPreparationObserved)
+                    ReadWitnessPreparation();
+                if (witnessVerified && (childSearchHelper is null || evidence.ChildSearchPreparationVerified) && CheckFrame())
                 {
                     evidence.FrameChallengeVerified = true;
                     evidence.DifferentAccountVerified = alternateTestAccount && evidence.SameUserSid == false &&
@@ -580,6 +604,14 @@ internal sealed class ExperimentForm : Form
                 await Task.Delay(500);
             }
             if (!evidence.FrameChallengeVerified) throw new ExperimentFailure("frame_challenge_timeout");
+            if (testWindowInput)
+            {
+                await WindowInputExperiment.Run(this, host, control, evidence, witnessFile, nonce,
+                    evidence.ChildSessionId!.Value, Program.IdentityDigest(nonce, expectedWitnessSid),
+                    () => { connectionEvents.ThrowIfConnectionFailed(); VerifyWitnessOwnership(evidence.ChildSessionId!.Value); },
+                    timeout - deadline.Elapsed);
+                evidence.Status = "different_account_child_frame_and_window_input_verified";
+            }
             if (testDirectInput)
             {
                 await DirectInputExperiment.Run(this, control, evidence, witnessFile, nonce,
@@ -608,6 +640,21 @@ internal sealed class ExperimentForm : Form
         evidence.Status = "unsupported_environment";
         evidence.Event(reason);
         ExitCode = 77;
+    }
+
+    private void ReadWitnessPreparation()
+    {
+        if (witnessPreparationPath is null || !File.Exists(witnessPreparationPath)) return;
+        if (witnessSandbox?.PreparationNonce is not string preparationNonce)
+            throw new ExperimentFailure("child_preparation_parent_receipt_missing");
+        VerifyWitnessOwnership(evidence.ChildSessionId!.Value);
+        ChildSearchPreparation.Observation observation = ChildSearchPreparation.ReadReport(witnessPreparationPath,
+            nonce, evidence.ChildSessionId.Value, Program.IdentityDigest(nonce, expectedWitnessSid), preparationNonce);
+        witnessPreparationObserved = true;
+        evidence.ChildSearchPreparationCleanupVerified = observation.CleanupVerified;
+        evidence.Event("child_search_preparation_observed", observation.Public);
+        if (!observation.Verified) throw new ExperimentFailure("child_search_preparation_not_verified");
+        evidence.ChildSearchPreparationVerified = true;
     }
 
     private void ReadWitnessRendering()
@@ -676,7 +723,8 @@ internal sealed class ExperimentForm : Form
                 arguments.Add(Assembly.GetExecutingAssembly().Location);
         }
         arguments.AddRange(new[] { "--witness", session.ToString(CultureInfo.InvariantCulture), nonce, result });
-        if (testDirectInput) arguments.Add("--prepare-input");
+        if (testDirectInput || testWindowInput) arguments.Add("--prepare-input");
+        if (childSearchHelper is not null) arguments.Add("--prepare-child-search");
         action.Path = executable;
         action.Arguments = string.Join(" ", arguments.Select(Program.QuoteArgument));
         action.WorkingDirectory = witnessSandbox?.BinaryDirectory ?? AppContext.BaseDirectory;
@@ -939,11 +987,19 @@ internal static class Program
     [STAThread]
     private static int Main(string[] args)
     {
-        if ((args.Length == 4 || (args.Length == 5 && args[4] == "--prepare-input")) && args[0] == "--witness") return RunWitness(args);
+        if (args.Length >= 4 && args[0] == "--witness")
+        {
+            string[] options = args.Skip(4).ToArray();
+            if (options.Length > 2 || options.Distinct(StringComparer.Ordinal).Count() != options.Length ||
+                options.Any(value => value is not "--prepare-input" and not "--prepare-child-search")) return 64;
+            return RunWitness(args);
+        }
         string? output = null;
+        string? childSearchHelper = null;
         bool allowEnable = false;
         bool alternateTestAccount = false;
         bool testDirectInput = false;
+        bool testWindowInput = false;
         int timeout = 120;
         for (int i = 0; i < args.Length; i++)
         {
@@ -951,12 +1007,19 @@ internal static class Program
             else if (args[i] == "--allow-enable-child-sessions") allowEnable = true;
             else if (args[i] == "--alternate-test-account") alternateTestAccount = true;
             else if (args[i] == "--test-direct-input") testDirectInput = true;
+            else if (args[i] == "--test-window-input") testWindowInput = true;
+            else if (args[i] == "--child-search-helper" && i + 1 < args.Length && childSearchHelper is null) childSearchHelper = Path.GetFullPath(args[++i]);
             else if (args[i] == "--timeout-seconds" && i + 1 < args.Length && int.TryParse(args[++i], out int value) && value is >= 15 and <= 300) timeout = value;
-            else { Console.Error.WriteLine("Usage: SessionContractExperiment --output FILE [--allow-enable-child-sessions] [--timeout-seconds 15..300] [--alternate-test-account] [--test-direct-input]"); return 64; }
+            else { Console.Error.WriteLine("Usage: SessionContractExperiment --output FILE [--allow-enable-child-sessions] [--timeout-seconds 15..300] [--alternate-test-account] [--test-direct-input | --test-window-input] [--child-search-helper FILE]"); return 64; }
         }
-        if (testDirectInput && !alternateTestAccount) { Console.Error.WriteLine("--test-direct-input requires --alternate-test-account."); return 64; }
+        if ((testDirectInput || testWindowInput) && !alternateTestAccount)
+        { Console.Error.WriteLine("An input experiment requires --alternate-test-account."); return 64; }
+        if (testDirectInput && testWindowInput)
+        { Console.Error.WriteLine("--test-direct-input and --test-window-input are mutually exclusive."); return 64; }
+        if (childSearchHelper is not null && !alternateTestAccount) { Console.Error.WriteLine("--child-search-helper requires --alternate-test-account."); return 64; }
         if (output is null || File.Exists(output)) { Console.Error.WriteLine("A new --output file is required."); return 64; }
-        Evidence evidence = new() { AlternateTestAccountRequested = alternateTestAccount, DirectInputRequested = testDirectInput };
+        Evidence evidence = new() { AlternateTestAccountRequested = alternateTestAccount, DirectInputRequested = testDirectInput, WindowInputRequested = testWindowInput,
+            ChildSearchPreparationRequested = childSearchHelper is not null, ChildSearchPreparationCleanupVerified = childSearchHelper is null };
         int result = 1;
         using Mutex mutex = new(false, "Local\\SessionContractExperiment");
         bool acquired = false;
@@ -979,7 +1042,7 @@ internal static class Program
                 Application.SetUnhandledExceptionMode(UnhandledExceptionMode.ThrowException);
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
-                using ExperimentForm form = new(evidence, allowEnable, TimeSpan.FromSeconds(timeout), alternateTestAccount, testDirectInput);
+                using ExperimentForm form = new(evidence, allowEnable, TimeSpan.FromSeconds(timeout), alternateTestAccount, testDirectInput, testWindowInput, childSearchHelper);
                 Application.Run(form);
                 result = form.ExitCode;
             }
@@ -1019,12 +1082,19 @@ internal static class Program
         {
             bool administratorGroupPresent = TokenEvidence.HasAdministratorGroupIncludingDenyOnly(identity);
             string digest = IdentityDigest(args[2], sid);
-            render = new WitnessRenderEvidence(output, args[2], actual, digest);
             string json = JsonSerializer.Serialize(new { nonce = args[2], session_id = actual, identity_digest = digest,
                 administrator_group_present = administratorGroupPresent });
             string temporary = output + "." + Guid.NewGuid().ToString("N") + ".tmp";
             File.WriteAllText(temporary, json, new UTF8Encoding(false));
             File.Move(temporary, output, false);
+            if (args.Contains("--prepare-child-search", StringComparer.Ordinal))
+            {
+                if (administratorGroupPresent) throw new ExperimentFailure("child_preparation_requires_nonadministrator_witness");
+                ChildSearchPreparation.RunAndWrite(output, args[2], actual, digest, sid).GetAwaiter().GetResult();
+            }
+            // The native preparation finishes before computing the palette,
+            // creating a Form, or registering the witness input baseline.
+            render = new WitnessRenderEvidence(output, args[2], actual, digest);
             render.IdentityWritten();
             // Handle this test process's own UI errors without opening an error
             // dialog. Record only numeric errors and then terminate its UI loop.
@@ -1040,7 +1110,7 @@ internal static class Program
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             using WitnessForm form = new(args[2], render);
-            if (args.Length == 5) input = form.AttachInputProbe(output, args[2], actual, digest);
+            if (args.Contains("--prepare-input", StringComparer.Ordinal)) input = form.AttachInputProbe(output, args[2], actual, digest);
             result = 0;
             Application.Run(form);
             if (render.UiFailed) result = 2;

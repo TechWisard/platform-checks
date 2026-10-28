@@ -4,12 +4,57 @@ param(
     [switch] $AllowEnableChildSessions,
     [switch] $AlternateTestAccount,
     [switch] $TestDirectInput,
+    [switch] $TestWindowInput,
+    [string] $ChildSearchHelper,
     [ValidateRange(15, 300)]
     [int] $TimeoutSeconds = 120
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+if ($TestDirectInput -and $TestWindowInput) {
+    throw 'TestDirectInput and TestWindowInput are mutually exclusive.'
+}
+
+function Test-ExactBoolean {
+    param([object] $Report, [string] $Name, [bool] $Expected)
+    $property = $Report.PSObject.Properties[$Name]
+    return $null -ne $property -and $property.Value -is [bool] -and $property.Value -eq $Expected
+}
+
+function Test-WindowInputReport {
+    param([string] $Json, [bool] $ChildPreparationRequested)
+    try { $report = ConvertFrom-Json -InputObject $Json -NoEnumerate }
+    catch { return $false }
+    if ($null -eq $report -or $report -isnot [pscustomobject]) { return $false }
+    $schema = $report.PSObject.Properties['schema']
+    $status = $report.PSObject.Properties['status']
+    if ($null -eq $schema -or $schema.Value -isnot [string] -or
+        $schema.Value -cne 'session-contract-experiment/v1' -or
+        $null -eq $status -or $status.Value -isnot [string] -or
+        $status.Value -cne 'different_account_child_frame_and_window_input_verified') { return $false }
+    $required = @('window_input_requested', 'window_input_verified', 'window_input_cleanup_verified',
+        'window_child_received_expected_text', 'window_child_received_expected_button_sequence',
+        'frame_challenge_verified', 'different_account_verified', 'child_matches_created_account_sid',
+        'witness_in_expected_session', 'witness_identity_matches', 'child_removed', 'enable_state_restored',
+        'task_removed', 'task_instances_stopped', 'test_account_removed', 'witness_sandbox_removed',
+        'parent_still_active_after_cleanup')
+    foreach ($name in $required) {
+        if (-not (Test-ExactBoolean $report $name $true)) { return $false }
+    }
+    foreach ($name in @('direct_input_requested', 'direct_input_channel_verified',
+        'physical_input_isolation_verified', 'native_multiseat_verified', 'same_user_sid')) {
+        if (-not (Test-ExactBoolean $report $name $false)) { return $false }
+    }
+    if (-not (Test-ExactBoolean $report 'child_search_preparation_requested' $ChildPreparationRequested)) { return $false }
+    if ($ChildPreparationRequested) {
+        foreach ($name in @('child_search_preparation_verified', 'child_search_preparation_cleanup_verified')) {
+            if (-not (Test-ExactBoolean $report $name $true)) { return $false }
+        }
+    }
+    return $true
+}
+
 $project = Join-Path $PSScriptRoot 'SessionContractExperiment.csproj'
 $buildDirectory = Join-Path $PSScriptRoot 'bin\experiment'
 $results = [System.IO.Path]::GetFullPath($ResultsDirectory)
@@ -29,6 +74,11 @@ $programArgs = @('--output', $evidencePath, '--timeout-seconds', $TimeoutSeconds
 if ($AllowEnableChildSessions) { $programArgs += '--allow-enable-child-sessions' }
 if ($AlternateTestAccount) { $programArgs += '--alternate-test-account' }
 if ($TestDirectInput) { $programArgs += '--test-direct-input' }
+if ($TestWindowInput) { $programArgs += '--test-window-input' }
+if ($ChildSearchHelper) {
+    if (-not $AlternateTestAccount) { throw 'Child Search preparation requires the owned alternate account.' }
+    $programArgs += @('--child-search-helper', [System.IO.Path]::GetFullPath($ChildSearchHelper))
+}
 . (Join-Path $PSScriptRoot 'environment-snapshot.ps1')
 'environment_snapshot_phase=before'
 Write-SessionEnvironmentSnapshot
@@ -63,7 +113,34 @@ Write-RecentRdpEvents -StartTime $authWindowStart
 'environment_snapshot_phase=after'
 Write-SessionEnvironmentSnapshot
 if (Test-Path -LiteralPath $evidencePath) {
-    Get-Content -LiteralPath $evidencePath -Raw
+    $evidenceText = Get-Content -LiteralPath $evidencePath -Raw
+    Write-Output $evidenceText
+    if ($ChildSearchHelper) {
+        try {
+            $reported = $evidenceText | ConvertFrom-Json -AsHashtable
+            $preparationVerified = $true
+            foreach ($field in @('child_search_preparation_requested', 'child_search_preparation_verified', 'child_search_preparation_cleanup_verified')) {
+                if (-not $reported.ContainsKey($field) -or $reported[$field] -isnot [bool] -or $reported[$field] -ne $true) {
+                    $preparationVerified = $false
+                }
+            }
+            if (-not $preparationVerified) {
+                $result = 1
+                'runner_child_preparation_gate=not_verified'
+            }
+        } catch {
+            $result = 1
+            'runner_child_preparation_gate=invalid_evidence'
+        }
+    }
+    if ($TestWindowInput) {
+        $windowContractVerified = $result -eq 0 -and
+            (Test-WindowInputReport -Json $evidenceText -ChildPreparationRequested ([bool]$ChildSearchHelper))
+        'window_input_runner_contract_verified=' + $windowContractVerified.ToString().ToLowerInvariant()
+        # A report cannot override a nonzero process result. A zero exit alone
+        # cannot replace typed frame/input/account/cleanup evidence.
+        if ($result -eq 0 -and -not $windowContractVerified) { $result = 1 }
+    }
 } elseif ($timedOut) {
     [ordered]@{
         schema = 'session-contract-runner/v1'
@@ -72,5 +149,11 @@ if (Test-Path -LiteralPath $evidencePath) {
         functional_pass = $false
     } | ConvertTo-Json | Set-Content -LiteralPath $evidencePath -Encoding utf8
     Get-Content -LiteralPath $evidencePath -Raw
+} elseif ($ChildSearchHelper) {
+    $result = 1
+    'runner_child_preparation_gate=missing_evidence'
+} elseif ($TestWindowInput -and $result -eq 0) {
+    $result = 1
+    'window_input_runner_contract_verified=false; evidence_missing=true'
 }
 exit $result

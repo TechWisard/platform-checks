@@ -40,6 +40,12 @@ jobs:
         run: cmake -S checks/session/first-logon -B build/first-logon -A ${{ matrix.arch }}
       - name: Compile first-logon preparation helper
         run: cmake --build build/first-logon --config Release --parallel 2
+      - name: Configure owned child Search preparation helper
+        run: cmake -S checks/session/child-search -B build/child-search -A ${{ matrix.arch }}
+      - name: Compile owned child Search helper and receipt contracts
+        run: cmake --build build/child-search --config Release --target child_search_prepare child_search_receipt_tests --parallel 2
+      - name: Check bounded receipt decoder
+        run: .\build\child-search\Release\child_search_receipt_tests.exe
       - name: Query actual environment
         shell: pwsh
         run: |
@@ -64,6 +70,7 @@ jobs:
           & .\checks\session\first-logon\run-prepared.ps1 `
             -PreparationProgram .\build\first-logon\Release\first_logon_prepare.exe `
             -CalibrationProgram .\build\Release\win32_window_calibration.exe `
+            -ChildSearchPreparationProgram .\build\child-search\Release\child_search_prepare.exe `
             -ResultsDirectory "$env:RUNNER_TEMP\session-contract-$env:GITHUB_RUN_ID" `
             -AllowDisposablePrivacyPreparation -TimeoutSeconds 120
           exit $LASTEXITCODE

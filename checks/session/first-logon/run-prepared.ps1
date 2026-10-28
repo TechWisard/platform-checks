@@ -1,6 +1,7 @@
 param(
     [Parameter(Mandatory = $true)][string] $PreparationProgram,
     [Parameter(Mandatory = $true)][string] $CalibrationProgram,
+    [string] $ChildSearchPreparationProgram,
     [Parameter(Mandatory = $true)][string] $ResultsDirectory,
     [switch] $AllowDisposablePrivacyPreparation,
     [ValidateRange(15, 300)][int] $TimeoutSeconds = 120
@@ -357,11 +358,15 @@ try {
         if (-not $readback.ValueExisted -or $readback.Kind -ne [Microsoft.Win32.RegistryValueKind]::DWord -or
             $readback.Value -ne [int]$snapshot.Specification.Desired) { throw 'Presentation policy changed before fresh account.' }
     }
-    $phase = 'child_session_frame_and_input'
-    $experiment = Invoke-OwnedProcess -Executable $powershell -WaitMilliseconds (($TimeoutSeconds + 210) * 1000) -MaximumOutput 1048576 `
-        -Arguments @('-NoLogo', '-NoProfile', '-NonInteractive',
+    $phase = 'child_session_frame_and_window_input'
+    $childArguments = @('-NoLogo', '-NoProfile', '-NonInteractive',
         '-File', $childRunner, '-ResultsDirectory', [System.IO.Path]::GetFullPath($ResultsDirectory),
-        '-AllowEnableChildSessions', '-AlternateTestAccount', '-TestDirectInput', '-TimeoutSeconds', $TimeoutSeconds.ToString())
+        '-AllowEnableChildSessions', '-AlternateTestAccount', '-TestWindowInput', '-TimeoutSeconds', $TimeoutSeconds.ToString())
+    if ($ChildSearchPreparationProgram) {
+        $childArguments += @('-ChildSearchHelper', [System.IO.Path]::GetFullPath($ChildSearchPreparationProgram))
+    }
+    $experiment = Invoke-OwnedProcess -Executable $powershell -WaitMilliseconds (($TimeoutSeconds + 210) * 1000) -MaximumOutput 1048576 `
+        -Arguments $childArguments
     $experimentExit = $experiment.ExitCode
     Write-Output $experiment.Output
     if ($experiment.ErrorOutput.Length) { throw 'Unexpected experiment stderr.' }

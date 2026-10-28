@@ -18,6 +18,7 @@ internal sealed class WitnessSandbox
     internal string ResultPath => Path.Combine(root, "result", "witness.json");
     internal string AssemblyPath => Path.Combine(BinaryDirectory, Path.GetFileName(Assembly.GetExecutingAssembly().Location));
     internal string RuntimeExecutable { get; private set; } = "";
+    internal string? PreparationNonce { get; private set; }
 
     [StructLayout(LayoutKind.Sequential)]
     private struct SecurityAttributes
@@ -94,6 +95,13 @@ internal sealed class WitnessSandbox
         DirectorySecurity resultSecurity = result.GetAccessControl();
         Add(resultSecurity, test, FileSystemRights.Modify);
         result.SetAccessControl(resultSecurity);
+    }
+
+    internal void PrepareChildSearch(string helper, string parentSid, string childSid, uint parentSession, uint childSession, uint consoleSession)
+    {
+        if (!Created || Removed || PreparationNonce is not null) throw new ExperimentFailure("child_preparation_sandbox_lifecycle_invalid");
+        PreparationNonce = ChildSearchPreparation.Install(BinaryDirectory, helper, parentSid, childSid,
+            parentSession, childSession, consoleSession);
     }
 
     private static void Add(DirectorySecurity security, SecurityIdentifier sid, FileSystemRights rights) =>
