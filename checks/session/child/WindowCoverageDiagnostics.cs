@@ -3,11 +3,14 @@ using System.Runtime.InteropServices;
 
 namespace SessionContractExperiment;
 
-// Read-only, bounded observations. Native identifiers and raw image/class
-// names stay inside this method; the returned records contain only categories,
-// equality booleans, own geometry/styles, and numeric query results.
+// Read-only, bounded observations. Native identifiers and full image paths
+// stay internal. An otherwise unclassified, stable same-session owner may
+// expose only a short validated process basename and window class name.
 internal static class WindowCoverageDiagnostics
 {
+    private const int MaximumProcessBaseNameLength = 128;
+    private const int MaximumWindowClassNameLength = 256;
+
     internal static WindowCoverageDiagnosticSnapshot Capture(Form form, IntPtr ownRoot,
         IntPtr foregroundRoot, IntPtr[] hitRoots)
     {
@@ -64,9 +67,11 @@ internal static class WindowCoverageDiagnostics
         bool isOwn = process == ownProcess;
         bool sessionOkay = ProcessIdToSessionId(process, out uint session);
         int sessionError = sessionOkay ? 0 : Marshal.GetLastWin32Error();
-        (string classCategory, bool classOkay, int classError) = ReadClass(window, isOwn);
-        (string processCategory, bool? imageOkay, int imageError) = isOwn ?
-            ("own", null, 0) : ReadProcessCategory(process);
+        bool mayIdentifyOther = !isOwn && currentSessionOkay && sessionOkay && session == currentSession;
+        (string classCategory, bool classOkay, int classError, string? otherClassName) =
+            ReadClass(window, isOwn, mayIdentifyOther);
+        (string processCategory, bool? imageOkay, int imageError, string? otherProcessBaseName) = isOwn ?
+            ("own", null, 0, null) : ReadProcessCategory(process, mayIdentifyOther);
         NativeStyle style = ReadStyle(window);
 
         // HWND/process lifetime can change during any read-only snapshot.
@@ -87,9 +92,13 @@ internal static class WindowCoverageDiagnostics
             ProcessCategory = stable ? processCategory : "unavailable",
             ProcessImageQuerySucceeded = imageOkay,
             ProcessImageQueryWin32Error = imageError,
+            OtherProcessBaseName = stable && mayIdentifyOther && imageOkay == true && processCategory == "other" ?
+                otherProcessBaseName : null,
             ClassCategory = stable ? classCategory : "unavailable",
             ClassQuerySucceeded = classOkay,
             ClassQueryWin32Error = classError,
+            OtherWindowClassName = stable && mayIdentifyOther && classOkay && classCategory == "other" ?
+                otherClassName : null,
             ExtendedStyleQuerySucceeded = style.Succeeded,
             ActualTopMost = stable ? style.TopMost : null,
             ExtendedStyleQueryWin32Error = style.Error,
@@ -111,38 +120,44 @@ internal static class WindowCoverageDiagnostics
             succeeded ? 0 : error);
     }
 
-    private static (string Category, bool Succeeded, int Error) ReadClass(IntPtr window, bool ownProcess)
+    private static (string Category, bool Succeeded, int Error, string? OtherName)
+        ReadClass(IntPtr window, bool ownProcess, bool mayIdentifyOther)
     {
-        char[] buffer = new char[256];
+        // Two extra characters distinguish an accepted maximum-length name
+        // from a buffer-filling result that might have been truncated.
+        char[] buffer = new char[MaximumWindowClassNameLength + 2];
         try
         {
             int length = GetClassNameW(window, buffer, buffer.Length);
-            if (length == 0) return ("unavailable", false, Marshal.GetLastWin32Error());
-            if (length < 0 || length >= buffer.Length - 1) return ("unavailable", false, 122);
+            if (length == 0) return ("unavailable", false, Marshal.GetLastWin32Error(), null);
+            if (length < 0 || length > MaximumWindowClassNameLength) return ("unavailable", false, 122, null);
             ReadOnlySpan<char> name = buffer.AsSpan(0, length);
-            if (ownProcess) return ("own", true, 0);
+            if (ownProcess) return ("own", true, 0, null);
             string category = name.Equals("ConsoleWindowClass", StringComparison.OrdinalIgnoreCase) ? "conhost" :
                 name.Equals("CASCADIA_HOSTING_WINDOW_CLASS", StringComparison.OrdinalIgnoreCase) ? "windows-terminal" :
                 name.Equals("Shell_TrayWnd", StringComparison.OrdinalIgnoreCase) ||
                 name.Equals("Shell_SecondaryTrayWnd", StringComparison.OrdinalIgnoreCase) ||
                 name.Equals("Progman", StringComparison.OrdinalIgnoreCase) ||
                 name.Equals("WorkerW", StringComparison.OrdinalIgnoreCase) ? "shell" : "other";
-            return (category, true, 0);
+            string? otherName = category == "other" && mayIdentifyOther ?
+                SafeShortName(name, MaximumWindowClassNameLength, windowClass: true) : null;
+            return (category, true, 0, otherName);
         }
         finally { Array.Clear(buffer); }
     }
 
-    private static (string Category, bool? Succeeded, int Error) ReadProcessCategory(uint process)
+    private static (string Category, bool? Succeeded, int Error, string? OtherName)
+        ReadProcessCategory(uint process, bool mayIdentifyOther)
     {
         using SafeProcessHandle handle = OpenProcess(0x1000 /* PROCESS_QUERY_LIMITED_INFORMATION */, false, process);
-        if (handle.IsInvalid) return ("unavailable", false, Marshal.GetLastWin32Error());
+        if (handle.IsInvalid) return ("unavailable", false, Marshal.GetLastWin32Error(), null);
         char[] buffer = new char[1024];
         try
         {
             uint length = checked((uint)buffer.Length);
             if (!QueryFullProcessImageNameW(handle, 0, buffer, ref length))
-                return ("unavailable", false, Marshal.GetLastWin32Error());
-            if (length == 0 || length >= buffer.Length) return ("unavailable", false, 13);
+                return ("unavailable", false, Marshal.GetLastWin32Error(), null);
+            if (length == 0 || length >= buffer.Length) return ("unavailable", false, 13, null);
             ReadOnlySpan<char> image = buffer.AsSpan(0, checked((int)length));
             int separator = Math.Max(image.LastIndexOf('\\'), image.LastIndexOf('/'));
             ReadOnlySpan<char> name = image[(separator + 1)..];
@@ -154,9 +169,25 @@ internal static class WindowCoverageDiagnostics
                 name.Equals("windowsterminal.exe", StringComparison.OrdinalIgnoreCase) ? "windows-terminal" :
                 name.Equals("shellexperiencehost.exe", StringComparison.OrdinalIgnoreCase) ||
                 name.Equals("startmenuexperiencehost.exe", StringComparison.OrdinalIgnoreCase) ? "shell" : "other";
-            return (category, true, 0);
+            string? otherName = category == "other" && mayIdentifyOther ?
+                SafeShortName(name, MaximumProcessBaseNameLength, windowClass: false) : null;
+            return (category, true, 0, otherName);
         }
         finally { Array.Clear(buffer); }
+    }
+
+    private static string? SafeShortName(ReadOnlySpan<char> name, int maximumLength, bool windowClass)
+    {
+        if (name.IsEmpty || name.Length > maximumLength) return null;
+        foreach (char value in name)
+        {
+            bool permitted = value is >= 'A' and <= 'Z' or >= 'a' and <= 'z' or >= '0' and <= '9' or
+                '.' or '_' or '-' or ' ' or '(' or ')';
+            if (windowClass && (value is '#' or ':' or ';' or '[' or ']' or '{' or '}')) permitted = true;
+            if (!permitted) return null;
+        }
+        // Never sanitize or truncate into a misleading different identifier.
+        return new string(name);
     }
 
     private readonly record struct NativeStyle(bool Succeeded, uint? Value, bool? TopMost, int Error);
@@ -215,9 +246,11 @@ internal sealed record WindowRootOwnership
     public string ProcessCategory { get; init; } = "unavailable";
     public bool? ProcessImageQuerySucceeded { get; init; }
     public int ProcessImageQueryWin32Error { get; init; }
+    public string? OtherProcessBaseName { get; init; }
     public string ClassCategory { get; init; } = "unavailable";
     public bool ClassQuerySucceeded { get; init; }
     public int ClassQueryWin32Error { get; init; }
+    public string? OtherWindowClassName { get; init; }
     public bool ExtendedStyleQuerySucceeded { get; init; }
     public bool? ActualTopMost { get; init; }
     public int ExtendedStyleQueryWin32Error { get; init; }

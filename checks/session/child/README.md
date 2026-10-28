@@ -225,6 +225,27 @@ visibility/ownership measurements. None of those diagnostic fields substitutes
 for receiving the unpredictable frame challenge. This geometry probe targets
 modern Windows 10/11 and Server 2016+ APIs; the CI matrix records its actual OS.
 
+The read-only coverage probe also records native topmost state and owner
+process/session equality for the foreground and the same nine sampled roots.
+An owner must be a different process in the current session, with successful
+queries and an unchanged thread/process pair on recheck, before an otherwise
+`other` category can include `other_process_base_name` (at most 128 characters)
+or `other_window_class_name` (at most 256). Already classified and own windows
+keep their fixed categories without additional names. These names are
+diagnostic labels, not authenticated component identities.
+
+Names accept only ASCII letters, digits, space, dot, underscore, hyphen and
+parentheses; window classes additionally accept `#`, `:`, `;`, brackets and
+braces. Invalid, over-limit, failed, potentially truncated or ineligible names
+are null/unknown; strings are never altered or clipped into different names.
+Only the targeted owner's existing `PROCESS_QUERY_LIMITED_INFORMATION` image
+query is used. Its temporary full-path buffer is cleared after taking the
+basename; full paths are neither saved nor emitted. No process inventory,
+command line, window title, account data or extra process rights are requested.
+Class buffers are also cleared. No foreign window is activated or changed.
+Owner checks remain sequential observations rather than an atomic lifetime
+guarantee, and these diagnostic names cannot make the frame challenge pass.
+
 `EnableFrameBufferRedirection` is requested as a documented optional loopback
 optimization. Its accepted setting does not prove that the optimized transport
 was negotiated, and no performance claim follows from this experiment.
@@ -267,6 +288,8 @@ identifiers and contracts are from these Microsoft references:
 - [NetUserDel](https://learn.microsoft.com/en-us/windows/win32/api/lmaccess/nf-lmaccess-netuserdel)
 - [ClearTextPassword](https://learn.microsoft.com/en-us/windows/win32/termserv/imstscnonscriptable-cleartextpassword)
 - [GetTokenInformation](https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-gettokeninformation)
+- [GetClassNameW](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getclassnamew)
+- [QueryFullProcessImageNameW](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-queryfullprocessimagenamew)
 
 The `IMsRdpExtendedSettings` method offsets, calling convention, HRESULT return,
 BSTR/VARIANT-pointer parameters and direction flags are validated against the
