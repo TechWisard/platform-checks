@@ -295,9 +295,13 @@ internal static class WindowInputExperiment
 
 internal sealed class WindowInputTarget
 {
+    private enum OwnerRole { Parent, Host, Control, Focus, PointHit }
+    private enum ValidationPhase { Constructor, BeforeFocus, AfterFocus, Runtime, Point }
+
     private readonly Form parent;
     private readonly RdpHost host;
     private readonly object control;
+    private readonly Action<string, object?> record;
     private readonly IOleInPlaceObject oleWindow;
     private readonly uint thread = InputNative.GetCurrentThreadId();
     private readonly uint process = checked((uint)Environment.ProcessId);
@@ -305,6 +309,7 @@ internal sealed class WindowInputTarget
     private readonly IntPtr hostWindow;
     private readonly IntPtr layout;
     private bool focusSelected;
+    private bool ownerFailureRecorded;
     internal IntPtr Window { get; }
     internal InputRectangle ClientRectangle { get; }
     internal Rectangle Desktop { get; }
@@ -314,6 +319,7 @@ internal sealed class WindowInputTarget
         this.parent = parent;
         this.host = host;
         this.control = control;
+        this.record = record;
         if (parent.IsDisposed || host.IsDisposed || !parent.IsHandleCreated || !host.IsHandleCreated)
             throw new ExperimentFailure("window_input_parent_not_ready");
         parentWindow = parent.Handle;
@@ -350,19 +356,21 @@ internal sealed class WindowInputTarget
             throw new ExperimentFailure("window_input_advanced_settings_unavailable");
         if (Dispatch.Get(advanced, "SmartSizing") is not bool smartSizing || smartSizing)
             throw new ExperimentFailure("window_input_smart_sizing_not_supported");
-        Require(requireFocus: false);
+        Require(requireFocus: false, ValidationPhase.Constructor);
     }
 
     internal void SelectOwnFocusOnce()
     {
         if (focusSelected) throw new ExperimentFailure("window_input_focus_request_repeated");
-        Require(requireFocus: false);
+        Require(requireFocus: false, ValidationPhase.BeforeFocus);
         focusSelected = true;
         WindowInputNative.SetFocus(Window);
-        Require();
+        Require(requireFocus: true, ValidationPhase.AfterFocus);
     }
 
-    internal void Require(bool requireFocus = true)
+    internal void Require(bool requireFocus = true) => Require(requireFocus, ValidationPhase.Runtime);
+
+    private void Require(bool requireFocus, ValidationPhase phase)
     {
         if (InputNative.GetCurrentThreadId() != thread || parent.IsDisposed || host.IsDisposed ||
             !parent.IsHandleCreated || !host.IsHandleCreated || parent.Handle != parentWindow || host.Handle != hostWindow ||
@@ -372,9 +380,9 @@ internal sealed class WindowInputTarget
             !WindowInputNative.IsWindowEnabled(Window) || WindowInputNative.IsIconic(parentWindow) ||
             InputNative.GetForegroundWindow() != parentWindow)
             throw new ExperimentFailure("window_input_target_ownership_or_foreground_changed");
-        RequireOwnThread(parentWindow);
-        RequireOwnThread(hostWindow);
-        RequireOwnThread(Window);
+        RequireOwnThread(parentWindow, OwnerRole.Parent, phase);
+        RequireOwnThread(hostWindow, OwnerRole.Host, phase);
+        RequireOwnThread(Window, OwnerRole.Control, phase);
         int result = oleWindow.GetWindow(out IntPtr actual);
         if (result != 0 || actual != Window)
             throw new ExperimentFailure("window_input_control_window_changed", result);
@@ -384,7 +392,7 @@ internal sealed class WindowInputTarget
         {
             IntPtr focus = InputNative.GetFocus();
             if (!Own(focus, Window)) throw new ExperimentFailure("window_input_focus_left_own_control");
-            RequireOwnThread(focus);
+            RequireOwnThread(focus, OwnerRole.Focus, phase);
         }
         if (NativeRectangle() != ClientRectangle ||
             InputRectangle.From(host.RectangleToScreen(host.ClientRectangle)) != ClientRectangle ||
@@ -401,12 +409,12 @@ internal sealed class WindowInputTarget
 
     internal void RequirePoint(InputPoint point, bool requireCursor)
     {
-        Require();
+        Require(requireFocus: true, ValidationPhase.Point);
         if (!ClientRectangle.Rectangle.Contains(point.X, point.Y))
             throw new ExperimentFailure("window_input_point_outside_control");
         IntPtr hit = InputNative.WindowFromPoint(new InputNative.Point(point.X, point.Y));
         if (!Own(hit, Window)) throw new ExperimentFailure("window_input_point_not_over_control");
-        RequireOwnThread(hit);
+        RequireOwnThread(hit, OwnerRole.PointHit, ValidationPhase.Point);
         if (requireCursor && WindowInputNative.Cursor() != point)
             throw new ExperimentFailure("window_input_parent_cursor_changed");
     }
@@ -439,11 +447,49 @@ internal sealed class WindowInputTarget
         return new(first.X, first.Y, bounds.Right, bounds.Bottom);
     }
 
-    private void RequireOwnThread(IntPtr window)
+    private void RequireOwnThread(IntPtr window, OwnerRole role, ValidationPhase phase)
     {
         uint actualThread = WindowInputNative.GetWindowThreadProcessId(window, out uint actualProcess);
         if (actualThread != thread || actualProcess != process)
+        {
+            int? queryError = actualThread == 0 ? Marshal.GetLastPInvokeError() : null;
+            RecordOwnerFailure(window, actualThread, actualProcess, queryError, role, phase);
             throw new ExperimentFailure("window_input_target_thread_or_process_changed");
+        }
+    }
+
+    private void RecordOwnerFailure(IntPtr window, uint actualThread, uint actualProcess, int? queryError,
+        OwnerRole role, ValidationPhase phase)
+    {
+        // One failure record per target. Successful polling and input checks
+        // add no observations or allocations; no raw HWND, PID or TID is logged.
+        if (ownerFailureRecorded) return;
+        ownerFailureRecorded = true;
+        try
+        {
+            record("window_input_target_owner_mismatch", new
+            {
+                role = role.ToString(),
+                validation_phase = phase.ToString(),
+                owner_query_succeeded = actualThread != 0,
+                owner_query_error = queryError,
+                owner_thread_is_expected = actualThread != 0 ? actualThread == thread : (bool?)null,
+                owner_process_is_own = actualThread != 0 ? actualProcess == process : (bool?)null,
+                current_thread_is_expected = InputNative.GetCurrentThreadId() == thread,
+                window_nonzero = window != IntPtr.Zero,
+                window_is_parent = window == parentWindow,
+                window_is_host = window == hostWindow,
+                window_is_control = window == Window,
+                window_inside_host = Own(window, hostWindow),
+                window_inside_control = Own(window, Window),
+                focus_request_made = focusSelected
+            });
+        }
+        catch (Exception)
+        {
+            // A diagnostic failure must not replace the original ownership
+            // failure, trigger another focus request, or retry any input.
+        }
     }
 
     internal static bool Own(IntPtr window, IntPtr parent) => window != IntPtr.Zero &&
@@ -769,7 +815,7 @@ internal static class WindowInputNative
     internal static extern bool GetKeyboardState([Out] byte[] state);
     [DllImport("user32.dll", ExactSpelling = true, SetLastError = true)]
     internal static extern IntPtr SetFocus(IntPtr window);
-    [DllImport("user32.dll", ExactSpelling = true)]
+    [DllImport("user32.dll", ExactSpelling = true, SetLastError = true)]
     internal static extern uint GetWindowThreadProcessId(IntPtr window, out uint process);
     [DllImport("user32.dll", ExactSpelling = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
