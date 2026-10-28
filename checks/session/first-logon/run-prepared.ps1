@@ -140,6 +140,48 @@ function Invoke-OwnedProcess {
     }
 }
 
+function Test-PreparationEligibility {
+    param([object] $Report, [int] $ExitCode)
+    if ($Report.schema -ne 'first-logon-prepare/v1' -or $Report.opted_in -ne $true -or
+        $Report.disposable_environment_verified -ne $true -or $Report.session_id -le 0 -or
+        $Report.input_default_desktop_verified -ne $true -or $Report.final_active_input_desktop_verified -ne $true -or
+        $Report.cleanup_verified -ne $true -or $Report.cleanup_hresult -ne 0 -or
+        $Report.session_functionality_verified -ne $false -or $Report.other_ui_invoked -ne $false -or
+        $Report.force_closed_window -ne $false -or $Report.credential_fields_read -ne $false -or
+        $Report.privacy_toggle_values_changed_by_helper -ne $false) { return $false }
+    $noAction = $Report.target_initially_foreground -eq $false -and $Report.invoke_count -eq 0 -and
+        $Report.invoke_attempted -eq $false -and $Report.invoke_succeeded -eq $false
+    $ownedAction = $Report.target_initially_foreground -eq $true -and $Report.invoke_count -eq 1 -and
+        $Report.invoke_attempted -eq $true -and $Report.invoke_succeeded -eq $true -and $Report.invoke_hresult -eq 0 -and
+        $Report.target_owner_verified -eq $true -and $Report.target_owner_reverified -eq $true -and
+        $Report.root_handle_verified -eq $true -and $Report.same_button_reverified -eq $true -and
+        $Report.initial_heading_count -ge 1 -and $Report.initial_heading_count -le 8 -and
+        $Report.recheck_heading_count -ge 1 -and $Report.recheck_heading_count -le 8 -and
+        $Report.initial_button_count -eq 1 -and $Report.recheck_button_count -eq 1 -and $Report.com_uninitialized -eq $true
+    if (-not ($noAction -or $ownedAction)) { return $false }
+    $ordinary = $ExitCode -eq 0 -and $Report.status -in @('completed', 'not_needed') -and
+        $Report.hresult -eq 0 -and $Report.ordinary_desktop_verified -eq $true
+    # Only the observed foreground-category timeout is eligible. API, ownership,
+    # cleanup, session, desktop and other errors remain failures. This is not a
+    # setup-completion claim; independent pixel/ownership calibration must pass.
+    $foregroundTimeout = $ExitCode -eq 1 -and $Report.status -eq 'failed' -and
+        $Report.stage -eq 'ordinary_desktop_timeout' -and $Report.hresult -eq 2147942658L -and
+        $Report.wait_guard -eq 3 -and $Report.explorer_shell_verified -eq $true
+    return $ordinary -or $foregroundTimeout
+}
+
+function Test-NativeCalibration {
+    param([object] $Report, [int] $ExitCode, [long] $SessionId)
+    return $ExitCode -eq 0 -and $Report.schema -eq 'native-window-calibration/v1' -and
+        $Report.status -eq 'passed' -and $Report.exit_code -eq 0 -and $Report.session_query_ok -eq $true -and
+        $Report.session_id -eq $SessionId -and $SessionId -gt 0 -and $Report.observed_challenge_and_grid -eq $true -and
+        $Report.own_root_mask_before -eq 511 -and $Report.own_root_mask_after -eq 511 -and
+        $Report.window_visible -eq $true -and $Report.inside_virtual_screen -eq $true -and
+        $Report.paint_count -gt 0 -and $Report.capture_count -gt 0 -and $Report.capture_ok -eq $true -and
+        @($Report.counts_within3).Count -eq 8 -and @($Report.counts_within3 | Where-Object { $_ -lt 80 }).Count -eq 0 -and
+        $Report.own_window_cleanup -eq $true -and $Report.class_cleanup -eq $true -and $Report.gdi_cleanup -eq $true
+}
+
 $specifications = @(
     [pscustomobject]@{ Id = 'disable_privacy_experience'; Path = 'SOFTWARE\Policies\Microsoft\Windows\OOBE'; Name = 'DisablePrivacyExperience'; Desired = 1 },
     [pscustomobject]@{ Id = 'first_logon_animation'; Path = 'SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'; Name = 'EnableFirstLogonAnimation'; Desired = 0 }
@@ -155,6 +197,10 @@ $preparationExit = $null
 $calibrationExit = $null
 $experimentExit = $null
 $preparationVerified = $false
+$preparationEligible = $false
+$nativeCalibrationVerified = $false
+$parentDisplayVerified = $false
+$foregroundTimeoutAccepted = $false
 $calibrationDiagnosticOnly = $false
 $calibrationErrorHresult = $null
 $calibrationErrorType = $null
@@ -188,11 +234,13 @@ try {
     $preparationVerified = $preparationExit -eq 0 -and $report.status -in @('completed', 'not_needed') -and
         $report.ordinary_desktop_verified -eq $true -and $report.cleanup_verified -eq $true -and
         $report.session_functionality_verified -eq $false
-    $calibrationDiagnosticOnly = -not $preparationVerified
+    $preparationEligible = Test-PreparationEligibility -Report $report -ExitCode $preparationExit
+    $calibrationDiagnosticOnly = -not $preparationEligible
     $phase = 'native_window_calibration'
     # A completed helper result always receives an independent pixel/ownership
-    # calibration. A preparation failure stays a failure even if calibration
-    # passes. No child account/session starts unless both original gates pass.
+    # calibration. The helper report/status is preserved. Only the explicitly
+    # recognized foreground timeout may use actual display proof instead of
+    # the ordinary-foreground heuristic; every other helper failure blocks.
     try {
         $calibration = Invoke-OwnedProcess -Executable $powershell -WaitMilliseconds 65000 -MaximumOutput 1048576 `
             -Arguments @('-NoLogo', '-NoProfile', '-NonInteractive',
@@ -200,16 +248,24 @@ try {
         $calibrationExit = $calibration.ExitCode
         Write-Output $calibration.Output
         if ($calibration.ErrorOutput.Length) { throw 'Unexpected calibration stderr.' }
+        $calibrationLines = @($calibration.Output -split '\r?\n' | Where-Object {
+            $_.StartsWith('{"schema":"native-window-calibration/v1",', [System.StringComparison]::Ordinal)
+        })
+        if ($calibrationLines.Count -ne 1) { throw 'Expected one actual native calibration report.' }
+        $calibrationReport = $calibrationLines[0] | ConvertFrom-Json -Depth 8
+        $nativeCalibrationVerified = Test-NativeCalibration -Report $calibrationReport -ExitCode $calibrationExit -SessionId $report.session_id
     } catch {
         $calibrationErrorHresult = ([long]$_.Exception.HResult -band 4294967295L)
         $calibrationErrorType = $_.Exception.GetType().Name
     }
-    if (-not $preparationVerified) {
+    if (-not $preparationEligible) {
         $phase = 'prepare_parent_first_logon'
-        throw 'Parent desktop preparation not verified; calibration is diagnostic only.'
+        throw 'Helper action ownership, cleanup or active desktop not verified; calibration is diagnostic only.'
     }
     if ($null -ne $calibrationErrorHresult) { throw 'Independent native calibration did not complete.' }
-    if ($calibrationExit -ne 0) { throw 'Independent native window calibration failed.' }
+    if (-not $nativeCalibrationVerified) { throw 'Independent native window calibration failed.' }
+    $parentDisplayVerified = $true
+    $foregroundTimeoutAccepted = -not $preparationVerified
     $phase = 'verify_policies_before_new_account'
     foreach ($snapshot in $snapshots) {
         $readback = Read-PolicySnapshot -Base $base -Specification $snapshot.Specification
@@ -253,8 +309,14 @@ if (-not $restored) { $outcome = 1 }
     error_type = $failureType
     presentation_policies_applied = $policiesApplied
     parent_preparation_verified = $preparationVerified
+    helper_outcome_eligible = $preparationEligible
+    parent_display_verified = $parentDisplayVerified
+    readiness_basis = $(if ($parentDisplayVerified) { 'independent_native_calibration' } else { 'unverified' })
+    foreground_heuristic_timeout_accepted = $foregroundTimeoutAccepted
+    setup_completion_verified = $false
     preparation_exit = $preparationExit
     native_calibration_exit = $calibrationExit
+    native_calibration_verified = $nativeCalibrationVerified
     calibration_diagnostic_only = $calibrationDiagnosticOnly
     calibration_error_hresult = $calibrationErrorHresult
     calibration_error_type = $calibrationErrorType

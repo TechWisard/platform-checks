@@ -1,6 +1,6 @@
 # Disposable first-logon preparation
 
-This is a separate, explicitly opted-in CI helper. It completes only the exact
+This is a separate, explicitly opted-in CI helper. It invokes only the exact
 privacy page previously observed on an owned disposable GitHub-hosted Windows
 runner. It is not a general OOBE, login, activation, credential or popup handler.
 It creates no windows and performs no action unless the fixed checks below
@@ -30,8 +30,9 @@ The helper obtains a second fresh page snapshot, compares button identity, and
 rechecks foreground, process, thread, package, application ID and active session
 immediately before one normal `IUIAutomationInvokePattern::Invoke` call.
 
-No switch values are toggled. The action accepts the privacy settings currently
-shown by the verified page. A missing/changed page, a duplicate or disabled
+No switch values are toggled. The single action invokes the fixed privacy-page
+button; its current label is observed rather than assuming that its ID means
+the page has completed. A missing/changed page, a duplicate or disabled
 button, an owner change or an API failure stops the helper. There is no second
 Invoke, fallback button, key injection, focus request, process kill or window
 close directed at Windows UI.
@@ -53,16 +54,19 @@ desktop checks. It makes no assertion that a future child session has no pages.
 
 The native helper uses an MTA thread without its own windows. UI Automation
 connection and transaction timeouts are one second. The overall observation
-budget is 32 seconds. A synchronous provider may still block, so the wrapper
+budget is 32 seconds, with the ordinary-desktop wait ending at 29 seconds to
+reserve three seconds for a post-Invoke content observation. A synchronous provider may still block, so the wrapper
 adds a 40-second process wait and at most one three-second stop wait, within a
 45-second outer bound. Only the process tree created by that wrapper is stopped.
 Forced termination is reported as failure and cannot prove native cleanup.
 
 Output consists only of a bounded JSON record with fixed status labels, numeric
-counts and HRESULTs, and booleans. No arbitrary UI text, user/domain/SID,
+counts and HRESULTs, and booleans. The only variable UI text emitted is the
+bounded safe ASCII label of the fixed button on the verified privacy page.
+No arbitrary UI text, user/domain/SID,
 credentials, window handles, screenshots, or process paths are emitted. The
 exact Explorer image path is used transiently only to check the basename and
-its buffer is cleared. UI text values or credential fields are not inspected.
+its buffer is cleared. Arbitrary UI values or credential fields are not inspected.
 
 Exit 0 means `completed` or `not_needed` with the stated parent-desktop
 observations and cleanup. Exit 1 means the preparation did not establish those
@@ -83,10 +87,22 @@ and unexpanded data; then sets only:
 
 Both snapshots are completed before either write. The wrapper verifies writes
 and runs the unchanged independent native window calibration after every
-completed, parsed helper result, including a preparation timeout. After failed
-preparation, calibration is diagnostic only: the original preparation failure
-and final failure remain. The child runner starts only if both the original
-preparation gate and calibration pass. The two policy values are rechecked
+completed, parsed helper result, including a preparation timeout. The original
+helper status and `parent_preparation_verified` observation are retained.
+The independently measured display is the downstream readiness gate: the
+wrapper requires the same nonzero session, successful screen capture, both
+9-point own-root masks equal to 511, all eight unpredictable color counts at
+least 80 within tolerance 3, and verified own window/class/GDI cleanup.
+
+Only a helper success or the exact observed `ordinary_desktop_timeout` with
+`WAIT_TIMEOUT`, `wait_guard=3`, verified Explorer shell, fresh final active own
+console/Default input desktop, verified cleanup and correct action ownership
+is eligible for this gate. Other helper errors still block the child. The
+zero-action branch requires that the target was not initially foreground; the
+one-action branch requires all original heading/button/root/owner checks and
+successful Invoke. `parent_display_verified` is distinct from setup completion,
+which is not claimed. Failed native calibration always blocks the child.
+The two policy values are rechecked
 before starting it with `-AlternateTestAccount -TestDirectInput`.
 
 The calibration and child runner execute as owned PowerShell subprocesses, so
@@ -111,14 +127,19 @@ RDP security, licensing, activation, Secure Boot, TPM, or driver settings.
 
 The session-contracts workflow builds this helper separately and encloses
 the existing native calibration and child experiment in the prepared wrapper.
-Source compilation and script validation passed locally. This revision has
-not yet completed its first Windows runtime execution.
+The prior diagnostic run [40699423335](https://github.com/TechWisard/platform-checks/actions/runs/40699423335)
+proved a usable own-window display on Server 2025 despite Windows Terminal
+remaining foreground, while Windows 11 ARM failed the same independent
+calibration. That measured difference motivates the display-based gate.
+This source revision still requires a Windows runtime execution.
 
 ## Primary contracts and observed-page provenance
 
 - Exact page observation: [run 40695413656, job 122840761797](https://github.com/TechWisard/platform-checks/actions/runs/40695413656/job/122840761797), commit `da86cbf68d3303e70d4d46525f4881bd71bb0750`.
 - [UI Automation Invoke](https://learn.microsoft.com/en-us/windows/win32/api/uiautomationclient/nf-uiautomationclient-iuiautomationinvokepattern-invoke).
 - [UI Automation threading](https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-threading).
+- [Read-only UI Automation Name](https://learn.microsoft.com/en-us/windows/win32/api/uiautomationclient/nf-uiautomationclient-iuiautomationelement-get_currentname).
+- [Unicode 16.0 White_Space](https://www.unicode.org/Public/16.0.0/ucd/PropList.txt) and [General_Category=Cf](https://www.unicode.org/Public/16.0.0/ucd/extracted/DerivedGeneralCategory.txt).
 - [DisablePrivacyExperience](https://learn.microsoft.com/en-us/windows/client-management/mdm/policy-csp-privacy#disableprivacyexperience).
 - [EnableFirstLogonAnimation](https://learn.microsoft.com/en-us/windows/client-management/mdm/policy-csp-windowslogon#enablefirstlogonanimation).
 
@@ -145,4 +166,53 @@ poll. Other API errors retain their explicit failure stage.
 3 = CabinetWClass; 4 = ConsoleWindowClass; 5 = CASCADIA_HOSTING_WINDOW_CLASS;
 6 = Windows.UI.Core.CoreWindow; 7 = ApplicationFrameWindow; 255 = unclassified.
 These classifications authorize no additional action. The single-Invoke limit,
-32-second native budget, foreground/absence checks and child gates are unchanged.
+32-second native budget and the helper's foreground/absence observations remain.
+The downstream wrapper now uses the separately verified display gate described
+above; the existing child frame and direct-input assertions are unchanged.
+
+## Bounded post-Invoke observation
+
+After the wait, one fresh UIA observation can inspect only the original
+CloudExperienceHost root with its process handle still held. Session, process,
+thread, package, AUMID, class, visibility and foreground are checked before the
+read and rechecked after it. Content is discarded if ownership changes.
+The UIA root's native HWND and process must also match. A closed or changed
+target produces an unavailable diagnostic; it does not trigger another action.
+
+Provider conditions search only fixed visible, non-password text headings and
+the known non-password button ID. The post-read button search includes disabled
+and offscreen states so those changes are observable. At most one matching
+button may expose metadata, and its label is read only while the exact visible
+privacy heading remains. There is no enumeration of arbitrary element names.
+The original verified button's label is also read immediately before the final
+action ownership recheck. Label observations never authorize another action.
+
+Raw label length is limited to 128 UTF-16 code units; no oversized prefix is
+emitted. Unicode White_Space is collapsed and trimmed, Unicode format code
+points are removed, and all other non-ASCII characters are rejected. The safe
+ASCII fallback permits letters, digits, spaces, hyphens, apostrophes,
+parentheses, question marks and exclamation marks only, excluding controls,
+quotes, URL/email/path punctuation. Category 1=More, 2=Next, 3=Accept,
+4=Continue, 5=Done, 255=another safe label, 0=not classified/available.
+The full raw BSTR is cleared before release.
+
+`post_invoke.heading_counts` uses these fixed positions; -1 means unread and
+zero means the completed query found no visible match:
+
+| Index | Exact fixed heading |
+|---:|---|
+| 0 | Choose privacy settings for your device |
+| 1 | Privacy settings |
+| 2 | Hi |
+| 3 | Just a moment... |
+| 4 | Just a moment |
+| 5 | Getting things ready |
+| 6 | We're getting things ready for you |
+| 7 | This might take a few minutes |
+| 8 | Let's finish setting up your device |
+| 9 | Something went wrong |
+| 10 | Microsoft account |
+
+Read errors and the deadline are reported separately under `post_invoke`.
+A successful UIA Invoke, a known label, or a heading count does not prove setup,
+remote frames or input. The one-Invoke limit remains in force for this revision.

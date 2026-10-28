@@ -22,6 +22,28 @@ constexpr wchar_t TargetClass[] = L"Windows.UI.Core.CoreWindow";
 constexpr wchar_t PrivacyHeading[] = L"Choose privacy settings for your device";
 constexpr wchar_t AcceptId[] = L"OobeSettingsAcceptButton";
 constexpr ULONGLONG TotalBudgetMs = 32000;
+constexpr ULONGLONG PostReadBudgetMs = 3000;
+// These exact fixed OS headings are also used by the read-only presentation probe.
+constexpr const wchar_t* KnownHeadings[]{PrivacyHeading, L"Privacy settings", L"Hi", L"Just a moment...",
+    L"Just a moment", L"Getting things ready", L"We're getting things ready for you",
+    L"This might take a few minutes", L"Let's finish setting up your device", L"Something went wrong",
+    L"Microsoft account"};
+struct ButtonLabel {
+    const char* status{"not_read"};
+    HRESULT error{S_OK};
+    unsigned category{}; // 1 More, 2 Next, 3 Accept, 4 Continue, 5 Done, 255 other safe label.
+    std::array<char, 129> ascii{};
+};
+struct PostPage {
+    const char* stage{"not_attempted"};
+    HRESULT error{S_OK}, invoke_pattern_error{S_OK};
+    bool attempted{}, owner_verified{}, owner_stable{}, root_verified{}, completed{}, button_verified{};
+    bool enabled{}, offscreen{true}, invoke_available{};
+    int button_count{-1};
+    std::array<int, sizeof(KnownHeadings) / sizeof(KnownHeadings[0])> headings{};
+    ButtonLabel label;
+    PostPage() { headings.fill(-1); }
+};
 struct Failure { const char* stage; HRESULT result; };
 void need(bool value, const char* stage, HRESULT error = E_UNEXPECTED) {
     if (!value) throw Failure{stage, error};
@@ -62,6 +84,9 @@ struct Result {
     bool foreground_is_shell{}, foreground_matches_associated_console{}, foreground_shares_shell_process{};
     bool foreground_is_observed_target{}, observed_target_sampled{}, observed_target_exists{}, observed_target_visible{};
     bool observed_target_cloak_query_attempted{};
+    bool final_active_input_desktop_verified{};
+    ButtonLabel button_before;
+    PostPage post;
 };
 struct Handle final {
     HANDLE value{};
@@ -93,7 +118,56 @@ bool text_equals(BSTR value, const wchar_t* expected) noexcept {
     const auto expected_size = std::wcslen(expected);
     return value && SysStringLen(value) == expected_size && std::wcscmp(value, expected) == 0;
 }
+bool unicode_space(std::uint32_t c) noexcept {
+    // Unicode 16.0 White_Space; collapse to one ASCII space and trim.
+    return (c >= 9 && c <= 13) || c == 0x20 || c == 0x85 || c == 0xA0 || c == 0x1680 ||
+        (c >= 0x2000 && c <= 0x200A) || c == 0x2028 || c == 0x2029 || c == 0x202F || c == 0x205F || c == 0x3000;
+}
+bool unicode_format(std::uint32_t c) noexcept {
+    // Unicode 16.0 General_Category=Cf, used only to normalize this fixed button's label.
+    constexpr std::uint32_t ranges[][2]{{0xAD,0xAD},{0x600,0x605},{0x61C,0x61C},{0x6DD,0x6DD},
+        {0x70F,0x70F},{0x890,0x891},{0x8E2,0x8E2},{0x180E,0x180E},{0x200B,0x200F},
+        {0x202A,0x202E},{0x2060,0x2064},{0x2066,0x206F},{0xFEFF,0xFEFF},{0xFFF9,0xFFFB},
+        {0x110BD,0x110BD},{0x110CD,0x110CD},{0x13430,0x1343F},{0x1BCA0,0x1BCA3},
+        {0x1D173,0x1D17A},{0xE0001,0xE0001},{0xE0020,0xE007F}};
+    for (const auto& range : ranges) if (c >= range[0] && c <= range[1]) return true;
+    return false;
+}
+void normalize_button_label(BSTR value, ButtonLabel& out) {
+    const UINT length = value ? SysStringLen(value) : 0;
+    if (!length || length > 128) { out.status = length ? "oversized" : "empty"; return; }
+    std::array<char, 129> normalized{}; std::size_t used{}; bool space{};
+    for (UINT index = 0; index < length; ++index) {
+        std::uint32_t c = static_cast<std::uint16_t>(value[index]);
+        if (c >= 0xD800 && c <= 0xDBFF && index + 1 < length) {
+            const auto low = static_cast<std::uint16_t>(value[index + 1]);
+            if (low >= 0xDC00 && low <= 0xDFFF) { c = 0x10000 + ((c - 0xD800) << 10) + low - 0xDC00; ++index; }
+        }
+        if (unicode_format(c)) continue;
+        if (unicode_space(c)) { space = used != 0; continue; }
+        // No controls, non-ASCII text, quotes, slash, backslash, colon, dot or @.
+        // Consequently the fallback cannot contain a URL, email or path.
+        const bool safe = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '\'' || c == '(' || c == ')' || c == '?' || c == '!';
+        if (!safe) { out.status = "unsafe_or_non_ascii"; return; }
+        if (space) normalized[used++] = ' ';
+        space = false; normalized[used++] = static_cast<char>(c);
+    }
+    if (!used) { out.status = "empty_after_normalization"; return; }
+    out.ascii = normalized; out.category = 255; out.status = "safe_ascii";
+    for (std::size_t index = 0; index < used; ++index)
+        if (normalized[index] >= 'A' && normalized[index] <= 'Z')
+            normalized[index] = static_cast<char>(normalized[index] + ('a' - 'A'));
+    constexpr const char* labels[]{"more", "next", "accept", "continue", "done"};
+    for (unsigned index = 0; index < sizeof(labels) / sizeof(labels[0]); ++index)
+        if (std::strcmp(normalized.data(), labels[index]) == 0) { out.category = index + 1; out.status = "classified"; break; }
+}
 void budget(ULONGLONG end) { need(GetTickCount64() < end, "preparation_deadline", HRESULT_FROM_WIN32(WAIT_TIMEOUT)); }
+void read_button_label(IUIAutomationElement* button, ButtonLabel& out, ULONGLONG end) {
+    Text name; budget(end); out.error = button->get_CurrentName(&name.value);
+    if (FAILED(out.error)) { out.status = "name_unavailable"; return; }
+    normalize_button_label(name.value, out);
+}
 void verify_desktop(Result& out) {
     DWORD session{};
     win32(ProcessIdToSessionId(GetCurrentProcessId(), &session), "current_session");
@@ -245,14 +319,14 @@ Com<IUIAutomationCondition> text_property(IUIAutomation2* automation, PROPERTYID
     VARIANT value{}; value.vt = VT_BSTR; value.bstrVal = stored.value; return property(automation, id, value, end);
 }
 Com<IUIAutomationElementArray> matches(IUIAutomation2* automation, IUIAutomationElement* root, DWORD owner,
-    bool button, ULONGLONG end) {
+    bool button, ULONGLONG end, const wchar_t* heading = PrivacyHeading) {
     need(owner <= static_cast<DWORD>(INT_MAX), "automation_process_id_range");
     std::array<Com<IUIAutomationCondition>, 6> conditions{
         number_property(automation, UIA_ProcessIdPropertyId, static_cast<int>(owner), end),
         bool_property(automation, UIA_IsPasswordPropertyId, false, end),
         bool_property(automation, UIA_IsOffscreenPropertyId, false, end),
         number_property(automation, UIA_ControlTypePropertyId, button ? UIA_ButtonControlTypeId : UIA_TextControlTypeId, end),
-        text_property(automation, button ? UIA_AutomationIdPropertyId : UIA_NamePropertyId, button ? AcceptId : PrivacyHeading, end),
+        text_property(automation, button ? UIA_AutomationIdPropertyId : UIA_NamePropertyId, button ? AcceptId : heading, end),
         bool_property(automation, UIA_IsEnabledPropertyId, true, end)
     };
     std::array<IUIAutomationCondition*, 6> raw{};
@@ -298,7 +372,83 @@ Page read_page(IUIAutomation2* automation, HWND window, DWORD owner, ULONGLONG e
         reinterpret_cast<void**>(page.invoke.put())), "button_invoke_pattern");
     need(page.invoke.get() != nullptr, "invoke_pattern_unavailable"); return page;
 }
+void observe_after_invoke(HWND window, DWORD owner, DWORD thread, HANDLE process, ULONGLONG end, Result& out) {
+    PostPage observation; observation.attempted = true;
+    try {
+        budget(end); verify_target(window, owner, thread, process, out); observation.owner_verified = true;
+        Apartment apartment(out); Com<IUIAutomation2> automation; Com<IUIAutomationElement> root;
+        hr(CoCreateInstance(__uuidof(CUIAutomation8), nullptr, CLSCTX_INPROC_SERVER,
+            __uuidof(IUIAutomation2), reinterpret_cast<void**>(automation.put())), "post_automation_create");
+        need(automation.get() != nullptr, "post_automation_null");
+        hr(automation->put_AutoSetFocus(FALSE), "post_no_focus");
+        hr(automation->put_ConnectionTimeout(1000), "post_connection_timeout");
+        hr(automation->put_TransactionTimeout(1000), "post_transaction_timeout");
+        budget(end); hr(automation->ElementFromHandle(window, root.put()), "post_root");
+        need(root.get() != nullptr, "post_null_root");
+        UIA_HWND native{}; int root_owner{};
+        budget(end); hr(root->get_CurrentNativeWindowHandle(&native), "post_root_handle");
+        budget(end); hr(root->get_CurrentProcessId(&root_owner), "post_root_process");
+        need(native == window && root_owner > 0 && static_cast<DWORD>(root_owner) == owner, "post_root_identity");
+        observation.root_verified = true;
+        auto privacy = matches(automation.get(), root.get(), owner, false, end);
+        budget(end); hr(privacy->get_Length(&observation.headings[0]), "post_privacy_count");
+        need(observation.headings[0] >= 0 && observation.headings[0] <= 8, "post_privacy_count_bound");
+        std::array<Com<IUIAutomationCondition>, 4> conditions{
+            number_property(automation.get(), UIA_ProcessIdPropertyId, static_cast<int>(owner), end),
+            bool_property(automation.get(), UIA_IsPasswordPropertyId, false, end),
+            number_property(automation.get(), UIA_ControlTypePropertyId, UIA_ButtonControlTypeId, end),
+            text_property(automation.get(), UIA_AutomationIdPropertyId, AcceptId, end)};
+        std::array<IUIAutomationCondition*, 4> raw{};
+        for (std::size_t index = 0; index < raw.size(); ++index) raw[index] = conditions[index].get();
+        Com<IUIAutomationCondition> combined; Com<IUIAutomationElementArray> buttons;
+        budget(end); hr(automation->CreateAndConditionFromNativeArray(raw.data(), static_cast<int>(raw.size()), combined.put()), "post_button_condition");
+        budget(end); hr(root->FindAll(TreeScope_Descendants, combined.get(), buttons.put()), "post_button_search");
+        need(buttons.get() != nullptr, "post_null_buttons");
+        budget(end); hr(buttons->get_Length(&observation.button_count), "post_button_count");
+        need(observation.button_count >= 0 && observation.button_count <= 8, "post_button_count_bound");
+        if (observation.button_count == 1) {
+            Com<IUIAutomationElement> button;
+            budget(end); hr(buttons->GetElement(0, button.put()), "post_button_element");
+            need(button.get() != nullptr, "post_null_button");
+            int actual_owner{}, type{}; BOOL password = TRUE, enabled = FALSE, offscreen = TRUE;
+            Text id;
+            budget(end); hr(button->get_CurrentProcessId(&actual_owner), "post_button_owner");
+            budget(end); hr(button->get_CurrentControlType(&type), "post_button_type");
+            budget(end); hr(button->get_CurrentIsPassword(&password), "post_button_password");
+            budget(end); hr(button->get_CurrentAutomationId(&id.value), "post_button_id");
+            need(actual_owner > 0 && static_cast<DWORD>(actual_owner) == owner && type == UIA_ButtonControlTypeId &&
+                !password && text_equals(id.value, AcceptId), "post_button_identity");
+            observation.button_verified = true;
+            budget(end); hr(button->get_CurrentIsEnabled(&enabled), "post_button_enabled");
+            budget(end); hr(button->get_CurrentIsOffscreen(&offscreen), "post_button_offscreen");
+            observation.enabled = enabled != FALSE; observation.offscreen = offscreen != FALSE;
+            Com<IUIAutomationInvokePattern> pattern;
+            budget(end); observation.invoke_pattern_error = button->GetCurrentPatternAs(UIA_InvokePatternId,
+                __uuidof(IUIAutomationInvokePattern), reinterpret_cast<void**>(pattern.put()));
+            observation.invoke_available = SUCCEEDED(observation.invoke_pattern_error) && pattern.get() != nullptr;
+            // Only this fixed non-password button on the still-verified privacy page exposes a name.
+            if (observation.headings[0] > 0) read_button_label(button.get(), observation.label, end);
+            else observation.label.status = "privacy_heading_absent";
+        }
+        for (std::size_t index = 1; index < observation.headings.size(); ++index) {
+            auto headings = matches(automation.get(), root.get(), owner, false, end, KnownHeadings[index]);
+            budget(end); hr(headings->get_Length(&observation.headings[index]), "post_known_heading_count");
+            need(observation.headings[index] >= 0 && observation.headings[index] <= 8, "post_known_heading_count_bound");
+        }
+        observation.completed = true; observation.stage = "completed";
+    } catch (const Failure& failure) { observation.stage = failure.stage; observation.error = failure.result; }
+    catch (...) { observation.stage = "post_unexpected_exception"; observation.error = E_UNEXPECTED; }
+    if (observation.owner_verified) {
+        try { verify_target(window, owner, thread, process, out); observation.owner_stable = true; }
+        catch (const Failure& failure) {
+            observation = PostPage{}; observation.attempted = true;
+            observation.stage = failure.stage; observation.error = failure.result;
+        }
+    }
+    out.post = observation; // Discard content if ownership changed during the bounded read.
+}
 void prepare(Result& out, ULONGLONG end) {
+    const ULONGLONG wait_end = end - PostReadBudgetMs;
     need(environment_equals(L"GITHUB_ACTIONS", L"true") && environment_equals(L"RUNNER_ENVIRONMENT", L"github-hosted") &&
         environment_equals(L"RUNNER_OS", L"Windows"), "disposable_hosted_windows_required");
     out.disposable_environment_verified = true; verify_desktop(out);
@@ -313,38 +463,47 @@ void prepare(Result& out, ULONGLONG end) {
         out.target_owner_verified = true;
         Apartment apartment(out);
         Com<IUIAutomation2> automation;
-        budget(end); hr(CoCreateInstance(__uuidof(CUIAutomation8), nullptr, CLSCTX_INPROC_SERVER,
+        budget(wait_end); hr(CoCreateInstance(__uuidof(CUIAutomation8), nullptr, CLSCTX_INPROC_SERVER,
             __uuidof(IUIAutomation2), reinterpret_cast<void**>(automation.put())), "automation_create");
         need(automation.get() != nullptr, "automation_null_client");
         hr(automation->put_AutoSetFocus(FALSE), "automation_no_focus");
         hr(automation->put_ConnectionTimeout(1000), "automation_connection_timeout");
         hr(automation->put_TransactionTimeout(1000), "automation_transaction_timeout");
-        Page first = read_page(automation.get(), foreground, owner, end, out);
+        Page first = read_page(automation.get(), foreground, owner, wait_end, out);
         out.initial_heading_count = first.headings; out.initial_button_count = first.buttons;
         verify_target(foreground, owner, thread, process.value, out);
-        Page fresh = read_page(automation.get(), foreground, owner, end, out);
+        Page fresh = read_page(automation.get(), foreground, owner, wait_end, out);
         out.recheck_heading_count = fresh.headings; out.recheck_button_count = fresh.buttons;
-        BOOL same{}; budget(end); hr(automation->CompareElements(first.button.get(), fresh.button.get(), &same), "same_accept_button");
+        BOOL same{}; budget(wait_end); hr(automation->CompareElements(first.button.get(), fresh.button.get(), &same), "same_accept_button");
         need(same != FALSE, "accept_button_replaced"); out.same_button_reverified = true;
+        read_button_label(fresh.button.get(), out.button_before, wait_end);
         // Last checks immediately precede the one and only action. No generic
         // retry, other button, focus request, key injection or process stop.
-        budget(end); verify_target(foreground, owner, thread, process.value, out); out.target_owner_reverified = true;
-        out.stage = "invoke_exact_privacy_accept"; out.invoke_attempted = true; ++out.invoke_count;
-        out.invoke_error = fresh.invoke->Invoke(); hr(out.invoke_error, "privacy_accept_invoke"); out.invoke_succeeded = true;
+        budget(wait_end); verify_target(foreground, owner, thread, process.value, out); out.target_owner_reverified = true;
+        out.stage = "invoke_exact_privacy_button"; out.invoke_attempted = true; ++out.invoke_count;
+        out.invoke_error = fresh.invoke->Invoke(); hr(out.invoke_error, "privacy_button_invoke"); out.invoke_succeeded = true;
     }
     out.stage = "wait_ordinary_desktop";
     unsigned stable{};
-    while (GetTickCount64() < end) {
+    while (GetTickCount64() < wait_end) {
         ++out.wait_observations;
         const bool ready = ordinary_desktop(observed_target, out);
         stable = ready ? stable + 1 : 0; out.stable_observations = stable;
         if (stable >= 5) {
-            out.ordinary_desktop_verified = true; out.stage = "completed";
-            out.status = out.invoke_attempted ? "completed" : "not_needed"; return;
+            out.ordinary_desktop_verified = true; break;
         }
         Sleep(250);
     }
+    if (out.invoke_succeeded) observe_after_invoke(observed_target, owner, thread, process.value, end, out);
+    verify_desktop(out); out.final_active_input_desktop_verified = true;
+    if (out.ordinary_desktop_verified) {
+        out.stage = "completed"; out.status = out.invoke_attempted ? "completed" : "not_needed"; return;
+    }
     throw Failure{"ordinary_desktop_timeout", HRESULT_FROM_WIN32(WAIT_TIMEOUT)};
+}
+void write_label(const ButtonLabel& label) {
+    std::cout << "{\"status\":\"" << label.status << "\",\"hresult\":" << static_cast<std::uint32_t>(label.error)
+        << ",\"category\":" << label.category << ",\"safe_ascii\":\"" << label.ascii.data() << "\"}";
 }
 void write(const Result& out, ULONGLONG elapsed) {
     std::cout << std::boolalpha << "{\"schema\":\"first-logon-prepare/v1\",\"status\":\"" << out.status
@@ -365,7 +524,22 @@ void write(const Result& out, ULONGLONG elapsed) {
     FIELD(observed_target_exists); FIELD(observed_target_visible); FIELD(observed_target_cloak_query_attempted);
     FIELD(observed_target_cloak_flags);
     FIELD(wait_observations); FIELD(stable_observations); FIELD(ordinary_desktop_verified); FIELD(com_uninitialized); FIELD(cleanup_verified);
+    FIELD(final_active_input_desktop_verified);
 #undef FIELD
+    std::cout << ",\"button_label_before\":"; write_label(out.button_before);
+    std::cout << ",\"post_invoke\":{\"attempted\":" << out.post.attempted << ",\"stage\":\"" << out.post.stage
+        << "\",\"hresult\":" << static_cast<std::uint32_t>(out.post.error) << ",\"owner_verified\":" << out.post.owner_verified
+        << ",\"owner_stable\":" << out.post.owner_stable << ",\"root_verified\":" << out.post.root_verified
+        << ",\"completed\":" << out.post.completed << ",\"button_count\":" << out.post.button_count
+        << ",\"button_verified\":" << out.post.button_verified << ",\"button_enabled\":" << out.post.enabled
+        << ",\"button_offscreen\":" << out.post.offscreen << ",\"invoke_available\":" << out.post.invoke_available
+        << ",\"invoke_pattern_hresult\":" << static_cast<std::uint32_t>(out.post.invoke_pattern_error)
+        << ",\"heading_counts\":[";
+    for (std::size_t index = 0; index < out.post.headings.size(); ++index) {
+        if (index) std::cout << ',';
+        std::cout << out.post.headings[index];
+    }
+    std::cout << "],\"button_label\":"; write_label(out.post.label); std::cout << '}';
     std::cout << ",\"foreground_class_hresult\":" << static_cast<std::uint32_t>(out.foreground_class_hresult)
         << ",\"observed_target_cloak_hresult\":" << static_cast<std::uint32_t>(out.observed_target_cloak_hresult)
         << ",\"privacy_toggle_values_changed_by_helper\":false,\"credential_fields_read\":false,"
@@ -382,7 +556,7 @@ int main(int argc, char** argv) {
     } catch (const Failure& failure) { out.stage = failure.stage; out.error = failure.result; out.status = "failed"; }
     catch (...) { out.stage = "unexpected_exception"; out.error = E_UNEXPECTED; out.status = "failed"; }
     if (!out.cleanup_verified) { out.status = "failed"; out.stage = "own_cleanup_failed"; }
-    const bool success = out.ordinary_desktop_verified && out.cleanup_verified && SUCCEEDED(out.error) &&
+    const bool success = out.ordinary_desktop_verified && out.final_active_input_desktop_verified && out.cleanup_verified && SUCCEEDED(out.error) &&
         ((out.invoke_count == 0 && !out.target_initially_foreground) ||
          (out.invoke_count == 1 && out.invoke_succeeded && out.target_owner_reverified && out.same_button_reverified &&
           out.observed_page_hidden_or_destroyed && out.com_uninitialized));
