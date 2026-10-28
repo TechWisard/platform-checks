@@ -97,3 +97,8 @@ exit $LASTEXITCODE
 - [Client-pixel object rectangles](https://learn.microsoft.com/en-us/windows/win32/api/oleidl/nf-oleidl-ioleinplaceobject-setobjectrects)
 - [Input desktop observation](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getuserobjectinformationw)
 - [Window visibility limitations](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-iswindowvisible)
+# Native execution request
+
+The first hosted run checks this source revision on native ARM64 and x64.
+Runtime evidence is pending until the actual per-platform report is available.
+
