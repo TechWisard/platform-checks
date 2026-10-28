@@ -111,12 +111,16 @@ std::uint64_t unix_time() {
     return (ticks - 116444736000000000ULL) / 10000000ULL;
 }
 std::vector<unsigned char> token_information(HANDLE token, TOKEN_INFORMATION_CLASS kind) {
-    DWORD bytes{}; SetLastError(ERROR_SUCCESS);
-    const BOOL initial = GetTokenInformation(token, kind, nullptr, 0, &bytes);
-    need(!initial && GetLastError() == ERROR_INSUFFICIENT_BUFFER && bytes > 0 && bytes <= 65536, "token_query_size");
-    std::vector<unsigned char> data(bytes); DWORD returned{};
-    win32(GetTokenInformation(token, kind, data.data(), bytes, &returned), "token_query");
-    need(returned > 0 && returned <= bytes, "token_query_length"); return data;
+    need(kind == TokenUser || kind == TokenGroups, "variable_token_class_required");
+    // The fixture already rejects token records above 64 KiB. Request that
+    // bounded buffer directly instead of relying on a particular error code
+    // from a NULL-buffer size probe. Shrinking retains the allocation and the
+    // SID pointers that Windows wrote into it.
+    std::vector<unsigned char> data(65536); DWORD returned{};
+    win32(GetTokenInformation(token, kind, data.data(), static_cast<DWORD>(data.size()), &returned),
+        kind == TokenUser ? "token_user_query" : "token_groups_query");
+    need(returned > 0 && returned <= data.size(), "token_query_length");
+    data.resize(returned); return data;
 }
 void verify_identity(HANDLE token, Result& out) {
     auto user = token_information(token, TokenUser);
@@ -125,9 +129,11 @@ void verify_identity(HANDLE token, Result& out) {
     need(sid && IsValidSid(sid) && GetLengthSid(sid) == out.receipt.child_sid_bytes &&
         EqualSid(sid, out.receipt.child_sid.data()) != FALSE, "receipt_child_sid_mismatch");
     out.identity_verified = true;
-    auto elevation = token_information(token, TokenElevation);
-    need(elevation.size() >= sizeof(TOKEN_ELEVATION) && reinterpret_cast<TOKEN_ELEVATION*>(elevation.data())->TokenIsElevated == 0,
-        "nonelevated_child_required");
+    TOKEN_ELEVATION elevation{}; DWORD elevation_bytes{};
+    win32(GetTokenInformation(token, TokenElevation, &elevation, sizeof(elevation), &elevation_bytes),
+        "token_elevation_query");
+    need(elevation_bytes == sizeof(elevation), "token_elevation_size");
+    need(elevation.TokenIsElevated == 0, "nonelevated_child_required");
     auto groups = token_information(token, TokenGroups);
     need(groups.size() >= sizeof(TOKEN_GROUPS), "token_group_size");
     auto* list = reinterpret_cast<TOKEN_GROUPS*>(groups.data());
