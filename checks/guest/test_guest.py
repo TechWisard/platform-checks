@@ -134,12 +134,13 @@ class HostContractTests(unittest.TestCase):
                      power_request={"acquired": True, "cleanup_verified": True},
                      activation_observation={"candidate_count": 1, "license_status": 1, "step": 7},
                      activation_audit=self.audit(),
-                     test={"different_account_verified": True, "frame_challenge_verified": True, "direct_input_channel_verified": True})
+                     test=self.session_contract())
         self.assertTrue(guest.successful_result(value))
         for key in gates:
             changed = copy.deepcopy(value); changed[key] = False
             self.assertFalse(guest.successful_result(changed), key)
-        for key in ("different_account_verified", "frame_challenge_verified", "direct_input_channel_verified"):
+        for key in ("different_account_verified", "frame_challenge_verified", "window_input_verified",
+                    "window_input_cleanup_verified", "window_child_received_expected_text", "window_child_received_expected_button_sequence"):
             changed = copy.deepcopy(value); changed["test"][key] = False
             self.assertFalse(guest.successful_result(changed), key)
         for key, replacement in (("test_exit_code", False), ("test_exit_code", 1), ("cleanup_unverified", True),
@@ -153,6 +154,54 @@ class HostContractTests(unittest.TestCase):
                                  ("license_status", 2), ("license_status", True), ("step", 6)):
             changed = copy.deepcopy(value); changed["activation_observation"][key] = replacement
             self.assertFalse(guest.successful_result(changed), key)
+
+    def session_contract(self):
+        # A synthetic own-window receipt only; no physical or direct input is
+        # represented by this data or inferred from a subprocess exit code.
+        value = dict(schema="session-contract-experiment/v1", status="different_account_child_frame_and_window_input_verified")
+        value.update({key: True for key in (
+            "window_input_requested", "window_input_verified", "window_input_cleanup_verified",
+            "window_child_received_expected_text", "window_child_received_expected_button_sequence",
+            "frame_challenge_verified", "different_account_verified", "parent_and_child_active",
+            "child_matches_created_account_sid", "witness_in_expected_session", "witness_identity_matches",
+            "alternate_test_account_requested", "test_account_created", "test_account_non_administrator_verified", "test_credentials_applied",
+            "child_removed", "enable_state_restored", "task_removed", "task_instances_stopped", "test_account_removed",
+            "witness_sandbox_removed", "parent_still_active_after_cleanup", "console_session_unchanged",
+            "child_search_preparation_cleanup_verified")})
+        value.update({key: False for key in (
+            "direct_input_requested", "direct_input_channel_verified", "physical_input_isolation_verified",
+            "native_multiseat_verified", "same_user_sid", "witness_administrator_group_present", "child_search_preparation_requested")})
+        return value
+
+    def test_window_input_requires_exact_mode_receipts_and_each_boolean(self):
+        value = self.session_contract()
+        self.assertTrue(guest.successful_session_contract(value))
+        for key, expected in value.items():
+            if type(expected) is not bool:
+                continue
+            for replacement in (not expected, None, str(expected).lower(), int(expected), [], {}):
+                changed = copy.deepcopy(value); changed[key] = replacement
+                self.assertFalse(guest.successful_session_contract(changed), (key, replacement))
+            changed = copy.deepcopy(value); del changed[key]
+            self.assertFalse(guest.successful_session_contract(changed), (key, "missing"))
+        for key in ("schema", "status"):
+            for replacement in (None, True, [], {}, value[key].upper(), "unrecognized"):
+                changed = copy.deepcopy(value); changed[key] = replacement
+                self.assertFalse(guest.successful_session_contract(changed), (key, replacement))
+        for replacement in (None, [], "verified", True):
+            self.assertFalse(guest.successful_session_contract(replacement))
+
+    def test_old_direct_input_or_frame_only_receipts_cannot_pass_window_mode(self):
+        value = self.session_contract()
+        for status in ("different_account_child_frame_and_input_verified", "different_account_child_and_frame_verified"):
+            changed = copy.deepcopy(value); changed["status"] = status
+            self.assertFalse(guest.successful_session_contract(changed))
+        changed = copy.deepcopy(value)
+        changed.update(direct_input_requested=True, direct_input_channel_verified=True,
+                       child_received_expected_text=True, child_received_expected_button_sequence=True,
+                       window_input_requested=False, window_input_verified=False,
+                       window_child_received_expected_text=False, window_child_received_expected_button_sequence=False)
+        self.assertFalse(guest.successful_session_contract(changed))
 
     def audit(self):
         snapshot = dict(candidate_count=1, license_status=1, license_status_reason=0, grace_period_remaining=0,
@@ -169,7 +218,8 @@ class HostContractTests(unittest.TestCase):
                      network=[dict(endpoint_id=i, dns_succeeded=True, tcp_succeeded=True, tls_succeeded=True, error_hresult=None)
                               for i in (1, 2)],
                      method_reply=dict(invocation_started=True, invocation_returned=True, return_value=0,
-                                       error_hresult=None, guard_code=0, same_product_verified=True))
+                                       error_hresult=None, guard_code=0, same_product_verified=True,
+                                       result_shape=3, result_error_hresult=None))
         return audit
 
     def test_activation_audit_requires_fresh_license_not_method_return(self):
@@ -189,12 +239,54 @@ class HostContractTests(unittest.TestCase):
 
     def test_activation_audit_unknown_completion_never_passes(self):
         for completed, reply in ((False, None), (True, None), (True, dict(invocation_started=True,
-                invocation_returned=False, return_value=None, error_hresult=-2147023436, guard_code=0, same_product_verified=True))):
+                invocation_returned=False, return_value=None, error_hresult=-2147023436, guard_code=0, same_product_verified=True,
+                result_shape=0, result_error_hresult=None))):
             changed = self.method_audit()
             changed.update(method_process_completed=completed, method_process_exit_code=0 if completed else None, method_reply=reply)
             self.assertFalse(guest.licensed_audit(changed))
         changed = self.method_audit(); changed["attempt_count"] = 2
         self.assertFalse(guest.licensed_audit(changed))
+
+    def test_returned_unknown_output_needs_actual_fresh_same_product_license(self):
+        for shape in (1, 2, 4, 5, 6):
+            with self.subTest(shape=shape):
+                audit = self.method_audit()
+                audit["method_reply"].update(return_value=None, result_shape=shape,
+                                             result_error_hresult=-2146233087 if shape == 6 else None)
+                self.assertEqual(guest.activation_audit_projection(audit), audit)
+                self.assertTrue(guest.licensed_audit(audit))
+                self.assertIsNone(audit["method_reply"]["return_value"])
+                for key in ("same_product_verified", "licensed_status_confirmed"):
+                    broken = copy.deepcopy(audit); broken[key] = False
+                    self.assertFalse(guest.licensed_audit(broken))
+                for after in (None, audit["before"], audit["after"] | {"license_status": 0},
+                              audit["after"] | {"license_status": 5}):
+                    broken = copy.deepcopy(audit); broken["after"] = after
+                    self.assertFalse(guest.licensed_audit(broken))
+                broken = copy.deepcopy(audit)
+                broken["method_reply"]["same_product_verified"] = False
+                self.assertFalse(guest.licensed_audit(broken))
+
+    def test_method_result_shape_and_error_domains_are_not_interchangeable(self):
+        for fields in (
+            {"result_shape": 0}, {"result_shape": 1}, {"result_shape": 2}, {"result_shape": 6},
+            {"result_shape": 7}, {"result_shape": True}, {"result_shape": "3"},
+            {"result_error_hresult": -1}, {"result_error_hresult": True},
+            {"result_error_hresult": 2**31}, {"error_hresult": -2146233087},
+            {"return_value": None}, {"return_value": False},
+            {"invocation_returned": False, "return_value": None, "error_hresult": -1},
+        ):
+            with self.subTest(fields=fields):
+                audit = self.method_audit(); audit["method_reply"].update(fields)
+                self.assertFalse(guest.licensed_audit(audit))
+                with self.assertRaises(guest.Failure): guest.activation_audit_projection(audit)
+        # An unknown native completion remains unknown even if a later status
+        # claims Licensed. A local post-return projection error is different.
+        audit = self.method_audit()
+        audit["method_reply"].update(invocation_returned=False, return_value=None,
+                                     result_shape=0, error_hresult=-2147023436)
+        self.assertEqual(guest.activation_audit_projection(audit), audit)
+        self.assertFalse(guest.licensed_audit(audit))
 
     def test_activation_audit_expiry_unknowns_and_clock_types(self):
         self.assertTrue(guest.licensed_audit(self.audit()))
@@ -236,7 +328,7 @@ class HostContractTests(unittest.TestCase):
 
     def test_activation_preinvoke_guards_and_already_licensed(self):
         changed = self.method_audit()
-        changed["method_reply"].update(invocation_started=False, invocation_returned=False, return_value=None, guard_code=1)
+        changed["method_reply"].update(invocation_started=False, invocation_returned=False, return_value=None, guard_code=1, result_shape=0)
         self.assertTrue(guest.licensed_audit(changed))
         changed["method_reply"]["guard_code"] = 2
         self.assertFalse(guest.licensed_audit(changed))

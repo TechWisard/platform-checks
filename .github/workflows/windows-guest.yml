@@ -24,7 +24,32 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  powershell-contracts:
+    runs-on: windows-2025
+    timeout-minutes: 10
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+      DOTNET_SKIP_FIRST_TIME_EXPERIENCE: '1'
+      DOTNET_GENERATE_ASPNET_CERTIFICATE: 'false'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify exact compiled scripts with Windows PowerShell 5.1 mocks
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $scripts = Join-Path $env:RUNNER_TEMP 'guest-activation-script-contracts'
+          dotnet build checks/guest/ContractTests/ContractTests.csproj --configuration Release --configfile checks/guest/NuGet.Config --nologo -p:UseSharedCompilation=false -p:NuGetAudit=false -nodeReuse:false
+          if ($LASTEXITCODE -ne 0) { throw 'contract_build_failed' }
+          dotnet checks/guest/ContractTests/bin/Release/net8.0/ContractTests.dll
+          if ($LASTEXITCODE -ne 0) { throw 'managed_contracts_failed' }
+          dotnet checks/guest/ContractTests/bin/Release/net8.0/ContractTests.dll --export-scripts $scripts
+          if ($LASTEXITCODE -ne 0) { throw 'script_export_failed' }
+          & checks/guest/ContractTests/ActivationScriptContracts.ps1 -ScriptDirectory $scripts -RequireWindowsPowerShell51
+          if ($LASTEXITCODE -ne 0) { throw 'powershell_script_contracts_failed' }
   guest:
+    needs: powershell-contracts
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:

@@ -47,6 +47,7 @@ internal static class ActivationScripts
             throw new ArgumentException("product_digest_invalid", nameof(expectedDigest));
         return Prelude + "\n$expected='" + expectedDigest.ToUpperInvariant() + "';\n" + """
             $started=$false; $returned=$false; $rv=$null; $errorCode=$null; $guard=4; $same=$false
+            $shape=0; $resultError=$null
             try {
               $p=@(Read-Primary)
               if($p.Count -ne 1 -or (Identity-Digest $p[0]) -cne $expected){$guard=3}
@@ -59,14 +60,29 @@ internal static class ActivationScripts
                 elseif($null -ne $p[0].LicenseStatus -and [uint32]$p[0].LicenseStatus -eq 1){$guard=1}
                 else {
                   $guard=0; $started=$true
-                  $reply=Invoke-CimMethod -InputObject $p[0] -MethodName Activate -OperationTimeoutSec 60
+                  $output=@(Invoke-CimMethod -InputObject $p[0] -MethodName Activate -OperationTimeoutSec 60)
                   $returned=$true
-                  if($null -eq $reply.ReturnValue){throw 'activation_return_value_missing'}
-                  $rv=[uint32]$reply.ReturnValue
+                  # Invocation completion and the optional output projection
+                  # are separate evidence. Missing output never means zero.
+                  try {
+                    if($output.Count -eq 0){$shape=1}
+                    elseif($output.Count -ne 1){$shape=5}
+                    elseif($null -eq $output[0]){$shape=2}
+                    else {
+                      $property=$output[0].PSObject.Properties['ReturnValue']
+                      if($null -eq $property){$shape=2}
+                      else {
+                        $value=$property.Value
+                        if($null -eq $value){$shape=2}
+                        elseif($value -is [uint32]){$rv=$value; $shape=3}
+                        else{$shape=4}
+                      }
+                    }
+                  } catch { $shape=6; $rv=$null; $resultError=[int]$_.Exception.HResult }
                 }
               }
             } catch { $errorCode=[int]$_.Exception.HResult }
-            [ordered]@{invocation_started=$started;invocation_returned=$returned;return_value=$rv;error_hresult=$errorCode;guard_code=$guard;same_product_verified=$same}|ConvertTo-Json -Compress
+            [ordered]@{invocation_started=$started;invocation_returned=$returned;return_value=$rv;error_hresult=$errorCode;guard_code=$guard;same_product_verified=$same;result_shape=$shape;result_error_hresult=$resultError}|ConvertTo-Json -Compress
             """;
     }
 }

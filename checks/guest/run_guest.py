@@ -721,18 +721,24 @@ def activation_audit_projection(value):
         network = copied
     reply = value["method_reply"]
     if reply is not None:
-        names = ("invocation_started", "invocation_returned", "return_value", "error_hresult", "guard_code", "same_product_verified")
+        names = ("invocation_started", "invocation_returned", "return_value", "error_hresult", "guard_code", "same_product_verified",
+                 "result_shape", "result_error_hresult")
         shape(reply, names)
         require(all(boolean(reply[key]) for key in ("invocation_started", "invocation_returned", "same_product_verified")) and
-                integer(reply["guard_code"], 0, 4) and nullable_int(reply["return_value"], 0, 2**32 - 1) and
-                nullable_int(reply["error_hresult"], -(2**31), 2**31 - 1), "activation_method_values_invalid")
+                integer(reply["guard_code"], 0, 4) and integer(reply["result_shape"], 0, 6) and
+                nullable_int(reply["return_value"], 0, 2**32 - 1) and
+                all(nullable_int(reply[key], -(2**31), 2**31 - 1) for key in ("error_hresult", "result_error_hresult")),
+                "activation_method_values_invalid")
         started, returned, guard, same = (reply[key] for key in ("invocation_started", "invocation_returned", "guard_code", "same_product_verified"))
         rv, error = reply["return_value"], reply["error_hresult"]
+        result_shape, result_error = reply["result_shape"], reply["result_error_hresult"]
         require(not ((started and (guard != 0 or not same)) or (not started and returned) or (rv is not None and not returned) or
                 (not started and rv is not None) or (started and not returned and error is None) or
-                (returned and rv is None and error is None) or (guard == 4 and error is None) or
+                (returned and error is not None) or (guard == 4 and error is None) or
                 (guard in {1, 2} and (not same or started or error is not None)) or (guard == 3 and (same or started or error is not None)) or
-                (guard == 0 and not started)), "activation_method_reply_inconsistent")
+                (guard == 0 and not started) or (returned != (result_shape != 0)) or
+                ((rv is not None) != (result_shape == 3)) or ((result_error is not None) != (result_shape == 6))),
+                "activation_method_reply_inconsistent")
         reply = {key: reply[key] for key in names}
     started, completed, code = (value[key] for key in ("method_process_started", "method_process_completed", "method_process_exit_code"))
     require((not completed or started) and (completed == (code is not None)) and
@@ -763,6 +769,22 @@ def licensed_audit(value) -> bool:
             (not reply["invocation_started"] or reply["invocation_returned"]))
 
 
+def successful_session_contract(value) -> bool:
+    required = ("window_input_requested", "window_input_verified", "window_input_cleanup_verified",
+                "window_child_received_expected_text", "window_child_received_expected_button_sequence",
+                "frame_challenge_verified", "different_account_verified", "parent_and_child_active",
+                "child_matches_created_account_sid", "witness_in_expected_session", "witness_identity_matches",
+                "alternate_test_account_requested", "test_account_created", "test_account_non_administrator_verified", "test_credentials_applied",
+                "child_removed", "enable_state_restored", "task_removed", "task_instances_stopped", "test_account_removed",
+                "witness_sandbox_removed", "parent_still_active_after_cleanup", "console_session_unchanged",
+                "child_search_preparation_cleanup_verified")
+    excluded = ("direct_input_requested", "direct_input_channel_verified", "physical_input_isolation_verified",
+                "native_multiseat_verified", "same_user_sid", "witness_administrator_group_present", "child_search_preparation_requested")
+    return (isinstance(value, dict) and value.get("schema") == "session-contract-experiment/v1" and
+            value.get("status") == "different_account_child_frame_and_window_input_verified" and
+            all(value.get(key) is True for key in required) and all(value.get(key) is False for key in excluded))
+
+
 def successful_result(value: dict) -> bool:
     required = ("guest_identity_verified", "elevated", "interactive_console_verified", "secure_boot_verified", "tpm2_verified",
                 "fixture_presentation_verified", "activation_licensed_observed", "offline_runtime_verified", "harness_compiled", "autologon_disabled",
@@ -777,8 +799,7 @@ def successful_result(value: dict) -> bool:
             isinstance(power, dict) and power.get("acquired") is True and power.get("cleanup_verified") is True and
             isinstance(activation, dict) and type(activation.get("candidate_count")) is int and activation["candidate_count"] == 1 and
             type(activation.get("license_status")) is int and activation["license_status"] == 1 and activation.get("step") == 7 and
-            licensed_audit(value.get("activation_audit")) and isinstance(test, dict) and
-            all(test.get(key) is True for key in ("different_account_verified", "frame_challenge_verified", "direct_input_channel_verified")))
+            licensed_audit(value.get("activation_audit")) and successful_session_contract(test))
 
 
 def stop_owned(process: subprocess.Popen | None) -> bool:

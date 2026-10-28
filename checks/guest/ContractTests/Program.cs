@@ -125,9 +125,10 @@ foreach (string text in new[] {
     Snapshot().Replace("\"grace_period_remaining\":0", "\"grace_period_remaining\":false", StringComparison.Ordinal),
     new string('x', 8193), "[]" }) Reject(() => LicensingSnapshot.Parse(text));
 passed++;
-string Reply(bool started, bool returned, uint? rv, int? error, int guard, bool same) =>
+string Reply(bool started, bool returned, uint? rv, int? error, int guard, bool same, int? shape = null, int? resultError = null) =>
     JsonSerializer.Serialize(new { invocation_started = started, invocation_returned = returned, return_value = rv,
-        error_hresult = error, guard_code = guard, same_product_verified = same });
+        error_hresult = error, guard_code = guard, same_product_verified = same,
+        result_shape = shape ?? (returned ? (rv.HasValue ? 3 : 2) : 0), result_error_hresult = resultError });
 Check(ActivationMethodReply.Parse(Reply(true, true, 0, null, 0, true)).ReturnValue == 0);
 Check(ActivationMethodReply.Parse(Reply(true, false, null, -1, 0, true)).InvocationReturned == false);
 Check(!ActivationMethodReply.Parse(Reply(false, false, null, null, 1, true)).InvocationStarted);
@@ -135,12 +136,31 @@ Check(!ActivationMethodReply.Parse(Reply(false, false, null, null, 2, true)).Inv
 Check(!ActivationMethodReply.Parse(Reply(false, false, null, null, 3, false)).InvocationStarted);
 Check(!ActivationMethodReply.Parse(Reply(false, false, null, -1, 4, false)).InvocationStarted);
 passed++;
+// A normal invocation with unavailable output is explicit, not a fabricated
+// zero and not an invocation error. The public host still needs fresh status.
+foreach (int shape in new[] { 1, 2, 4, 5, 6 })
+{
+    int? resultError = shape == 6 ? unchecked((int)0x80131501) : null;
+    ActivationMethodReply reply = ActivationMethodReply.Parse(Reply(true, true, null, null, 0, true, shape, resultError));
+    Check(reply.InvocationStarted && reply.InvocationReturned && reply.ReturnValue is null && reply.ErrorHresult is null &&
+        reply.ResultShape == shape && reply.ResultErrorHresult == resultError && reply.SameProductVerified);
+    Check(!notification.Licensed && LicensingSnapshot.Parse(Snapshot(1)).Licensed);
+}
+passed++;
 foreach (string text in new[] {
     Reply(true, true, 0, null, 0, false), Reply(true, false, 0, -1, 0, true),
     Reply(false, true, 0, null, 1, true), Reply(true, false, null, null, 0, true),
     Reply(false, false, null, null, 0, true), Reply(false, false, null, null, 4, false),
     Reply(false, false, null, null, 2, false), Reply(false, false, null, null, 3, true),
-    Reply(true, true, 0, null, 0, true).Replace("\"guard_code\":0", "\"guard_code\":true", StringComparison.Ordinal) })
+    Reply(true, true, 0, -1, 0, true), Reply(true, true, null, null, 0, true, 0),
+    Reply(true, true, null, null, 0, true, 3), Reply(true, true, 0, null, 0, true, 2),
+    Reply(true, true, null, null, 0, true, 6), Reply(true, true, null, null, 0, true, 2, -1),
+    Reply(true, false, null, -1, 0, true, 6, -1), Reply(false, false, null, null, 1, true, 2),
+    Reply(true, true, null, null, 0, true, 7),
+    Reply(true, true, 0, null, 0, true).Replace("\"guard_code\":0", "\"guard_code\":true", StringComparison.Ordinal),
+    Reply(true, true, 0, null, 0, true).Replace("\"result_shape\":3", "\"result_shape\":true", StringComparison.Ordinal),
+    Reply(true, true, 0, null, 0, true).Replace("\"result_error_hresult\":null", "\"result_error_hresult\":4294967296", StringComparison.Ordinal),
+    Reply(true, true, 0, null, 0, true).Replace("\"result_shape\":3", "\"result_shape\":3,\"result_shape\":2", StringComparison.Ordinal) })
     Reject(() => ActivationMethodReply.Parse(text));
 passed++;
 Reject(() => ActivationScripts.Activate("';unexpected-command"));

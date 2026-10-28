@@ -43,13 +43,18 @@ internal sealed record LicensingSnapshot(LicensingEvidence Evidence, string? Ide
 }
 
 internal sealed record ActivationMethodReply(bool InvocationStarted, bool InvocationReturned, uint? ReturnValue,
-    int? ErrorHresult, int GuardCode, bool SameProductVerified)
+    int? ErrorHresult, int GuardCode, bool SameProductVerified, int ResultShape, int? ResultErrorHresult)
 {
+    // Shape is a bounded observation, not an activation result:
+    // 0 invocation not returned; 1 no output; 2 absent/null ReturnValue;
+    // 3 observed UInt32; 4 unsupported value type; 5 multiple outputs;
+    // 6 local projection exception. Only a fresh same-product status licenses.
     internal static ActivationMethodReply Parse(string text)
     {
         using JsonDocument document = StrictJson.Parse(text, 4096);
         JsonElement value = document.RootElement;
-        StrictJson.Keys(value, "invocation_started", "invocation_returned", "return_value", "error_hresult", "guard_code", "same_product_verified");
+        StrictJson.Keys(value, "invocation_started", "invocation_returned", "return_value", "error_hresult", "guard_code", "same_product_verified",
+            "result_shape", "result_error_hresult");
         bool started = value.GetProperty("invocation_started").GetBoolean();
         bool returned = value.GetProperty("invocation_returned").GetBoolean();
         uint? result = StrictJson.NullableUInt(value, "return_value");
@@ -57,13 +62,17 @@ internal sealed record ActivationMethodReply(bool InvocationStarted, bool Invoca
         int? error = errorElement.ValueKind == JsonValueKind.Null ? null : errorElement.GetInt32();
         int guard = StrictJson.Int(value, "guard_code", 0, 4);
         bool same = value.GetProperty("same_product_verified").GetBoolean();
+        int shape = StrictJson.Int(value, "result_shape", 0, 6);
+        JsonElement resultErrorElement = value.GetProperty("result_error_hresult");
+        int? resultError = resultErrorElement.ValueKind == JsonValueKind.Null ? null : resultErrorElement.GetInt32();
         if ((started && (guard != 0 || !same)) || (!started && returned) || (result.HasValue && !returned) ||
             (!started && result.HasValue) || (started && !returned && !error.HasValue) ||
-            (returned && !result.HasValue && !error.HasValue) || (guard == 4 && !error.HasValue) ||
+            (returned && error.HasValue) || (guard == 4 && !error.HasValue) ||
             (guard is 1 or 2 && (!same || started || error.HasValue)) || (guard == 3 && (same || started || error.HasValue)) ||
-            (guard == 0 && !started))
+            (guard == 0 && !started) || (returned != (shape != 0)) ||
+            (result.HasValue != (shape == 3)) || (resultError.HasValue != (shape == 6)))
             throw new InvalidDataException("activation_method_reply_inconsistent");
-        return new(started, returned, result, error, guard, same);
+        return new(started, returned, result, error, guard, same, shape, resultError);
     }
 }
 

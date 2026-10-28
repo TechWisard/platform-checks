@@ -236,19 +236,16 @@ internal static class GuestSupervisor
             result.Stage = "run_session_contract";
             string evidenceFile = Path.Combine(work, "result.json");
             (int testExit, _) = await RunProcess(dotnet, new[] { Path.Combine(output, "SessionContractExperiment.dll"),
-                "--output", evidenceFile, "--allow-enable-child-sessions", "--alternate-test-account", "--test-direct-input",
+                "--output", evidenceFile, "--allow-enable-child-sessions", "--alternate-test-account", "--test-window-input",
                 "--timeout-seconds", "180" }, work, TimeSpan.FromSeconds(225), environment, serial);
             result.TestExitCode = testExit;
             Require(File.Exists(evidenceFile) && new FileInfo(evidenceFile).Length is > 0 and <= 1048576, "harness_evidence_missing_or_large");
             using JsonDocument evidence = JsonDocument.Parse(File.ReadAllBytes(evidenceFile));
             JsonElement root = evidence.RootElement;
             result.Test = SelectEvidence(root);
-            string[] cleanupFields = { "child_removed", "enable_state_restored", "task_removed", "task_instances_stopped",
-                "test_account_removed", "witness_sandbox_removed", "parent_still_active_after_cleanup", "console_session_unchanged" };
-            result.HarnessCleanupVerified = cleanupFields.All(name => root.TryGetProperty(name, out JsonElement element) && element.ValueKind == JsonValueKind.True);
+            result.HarnessCleanupVerified = SessionCleanupVerified(root);
             result.CleanupUnverified = !result.HarnessCleanupVerified;
-            Require(testExit == 0 && result.HarnessCleanupVerified && root.GetProperty("frame_challenge_verified").GetBoolean() &&
-                root.GetProperty("different_account_verified").GetBoolean() && root.GetProperty("direct_input_channel_verified").GetBoolean(),
+            Require(testExit == 0 && result.HarnessCleanupVerified && SessionContractPassed(root),
                 "session_contract_did_not_pass");
             result.Status = "verified";
             result.Stage = "completed";
@@ -441,9 +438,11 @@ internal static class GuestSupervisor
                 throw new GuestFailure("activation_provider_completion_unverified");
             }
             Require(reply.ErrorHresult is null, "activation_method_reply_error");
-            // A zero method result never substitutes for a fresh status query
-            // on the exact same product. A second bounded query allows normal
-            // provider state propagation without retrying the activation call.
+            // Missing/unsupported ReturnValue or a local output projection
+            // exception never discards a normally returned invocation's fresh
+            // same-product status. Such output remains explicitly unavailable;
+            // neither it nor a numeric zero licenses the product. A second
+            // bounded query allows propagation without another activation call.
             for (int iteration = 2; iteration <= 3; iteration++)
             {
                 if (iteration == 3) await Task.Delay(5000);
@@ -596,7 +595,8 @@ internal static class GuestSupervisor
         bool lineOverflow = false;
         char[] buffer = new char[2048];
         string[] stages = { "simultaneous_sessions_observed", "witness_process_verified", "rendered_frame_challenge_matched",
-            "direct_input_channel_verified", "cleanup_started", "test_account_cleanup_verified" };
+            "window_input_target_resolved", "window_input_ready", "window_input_move_observed", "window_input_click_observed",
+            "window_input_verified", "cleanup_started", "test_account_cleanup_verified" };
         int count;
         while ((count = await reader.ReadAsync(buffer.AsMemory())) != 0)
         {
@@ -622,16 +622,55 @@ internal static class GuestSupervisor
         return result.ToString();
     }
 
+    private static bool ExactBooleans(JsonElement value, bool expected, params string[] names) =>
+        value.ValueKind == JsonValueKind.Object && names.All(name => value.TryGetProperty(name, out JsonElement item) &&
+            item.ValueKind == (expected ? JsonValueKind.True : JsonValueKind.False));
+
+    private static bool SessionCleanupVerified(JsonElement value) => ExactBooleans(value, true,
+        "child_removed", "enable_state_restored", "task_removed", "task_instances_stopped", "test_account_removed",
+        "witness_sandbox_removed", "parent_still_active_after_cleanup", "console_session_unchanged", "window_input_cleanup_verified");
+
+    private static bool SessionContractPassed(JsonElement value) =>
+        value.ValueKind == JsonValueKind.Object &&
+        value.TryGetProperty("schema", out JsonElement schema) && schema.ValueKind == JsonValueKind.String &&
+        schema.GetString() == "session-contract-experiment/v1" &&
+        value.TryGetProperty("status", out JsonElement status) && status.ValueKind == JsonValueKind.String &&
+        status.GetString() == "different_account_child_frame_and_window_input_verified" &&
+        SessionCleanupVerified(value) && ExactBooleans(value, true,
+            "window_input_requested", "window_input_verified", "window_child_received_expected_text",
+            "window_child_received_expected_button_sequence", "frame_challenge_verified", "different_account_verified",
+            "parent_and_child_active", "child_matches_created_account_sid", "witness_in_expected_session", "witness_identity_matches",
+            "alternate_test_account_requested", "test_account_created", "test_account_non_administrator_verified", "test_credentials_applied",
+            "child_search_preparation_cleanup_verified") &&
+        ExactBooleans(value, false, "direct_input_requested", "direct_input_channel_verified",
+            "physical_input_isolation_verified", "native_multiseat_verified", "same_user_sid",
+            "witness_administrator_group_present", "child_search_preparation_requested");
+
     private static JsonObject SelectEvidence(JsonElement value)
     {
         JsonObject result = new();
-        string[] names = { "status", "parent_and_child_active", "same_user_sid", "different_account_verified", "witness_in_expected_session",
-            "witness_identity_matches", "witness_administrator_group_present", "frame_challenge_verified", "direct_input_channel_verified",
-            "child_received_expected_text", "child_received_expected_button_sequence", "parent_probe_input_event_count", "parent_cursor_unchanged",
+        string[] names = { "parent_and_child_active", "same_user_sid", "different_account_verified", "child_matches_created_account_sid",
+            "alternate_test_account_requested", "test_account_created", "test_account_non_administrator_verified", "test_credentials_applied",
+            "witness_in_expected_session", "witness_identity_matches", "witness_administrator_group_present", "frame_challenge_verified",
+            "window_input_requested", "window_input_verified", "window_input_cleanup_verified",
+            "window_child_received_expected_text", "window_child_received_expected_button_sequence",
+            "direct_input_requested", "direct_input_channel_verified", "physical_input_isolation_verified", "native_multiseat_verified",
+            "child_search_preparation_requested", "child_search_preparation_cleanup_verified",
+            "child_received_expected_text", "child_received_expected_button_sequence", "parent_cursor_unchanged",
             "child_removed", "enable_state_restored", "task_removed", "task_instances_stopped", "test_account_removed", "witness_sandbox_removed",
             "parent_still_active_after_cleanup", "console_session_unchanged" };
         foreach (string name in names)
-            if (value.TryGetProperty(name, out JsonElement item)) result[name] = JsonNode.Parse(item.GetRawText());
+            if (value.TryGetProperty(name, out JsonElement item) && item.ValueKind is JsonValueKind.True or JsonValueKind.False or JsonValueKind.Null)
+                result[name] = JsonNode.Parse(item.GetRawText());
+        if (value.TryGetProperty("schema", out JsonElement schema) && schema.ValueKind == JsonValueKind.String &&
+            schema.GetString() == "session-contract-experiment/v1") result["schema"] = schema.GetString();
+        string[] statuses = { "starting", "failed", "cleanup_failed", "unsupported_environment", "child_session_and_frame_verified",
+            "different_account_child_and_frame_verified", "different_account_child_frame_and_input_verified",
+            "different_account_child_frame_and_window_input_verified" };
+        if (value.TryGetProperty("status", out JsonElement status) && status.ValueKind == JsonValueKind.String &&
+            status.GetString() is string fixedStatus && statuses.Contains(fixedStatus, StringComparer.Ordinal)) result["status"] = fixedStatus;
+        if (value.TryGetProperty("parent_probe_input_event_count", out JsonElement count) && count.ValueKind == JsonValueKind.Number &&
+            count.TryGetInt32(out int inputCount) && inputCount >= 0) result["parent_probe_input_event_count"] = inputCount;
         JsonArray failures = new();
         if (value.TryGetProperty("events", out JsonElement events))
         {
