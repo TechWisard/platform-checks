@@ -46,3 +46,20 @@ jobs:
             exit 0
           }
           exit $probeExit
+      - name: Report .NET SDK
+        run: dotnet --info
+      - name: Exercise local child-session lifecycle and frame contract
+        shell: pwsh
+        env:
+          DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+          DOTNET_NOLOGO: '1'
+          DOTNET_GENERATE_ASPNET_CERTIFICATE: 'false'
+        run: |
+          & .\checks\session\child\run.ps1 -ResultsDirectory "$env:RUNNER_TEMP\session-contract-$env:GITHUB_RUN_ID" -AllowEnableChildSessions -TimeoutSeconds 120
+          $experimentExit = $LASTEXITCODE
+          "experiment_exit=$experimentExit"
+          if ($experimentExit -eq 77) {
+            "::notice::Child-session experiment unsupported in this environment; no functional pass."
+            exit 0
+          }
+          exit $experimentExit

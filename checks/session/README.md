@@ -25,3 +25,10 @@ Sources:
 Microsoft documents a maximum of one active connected child session per machine.
 Its lifetime depends on its parent, and it has no independent lock/logon screen.
 These limits must remain visible when interpreting any experiment.
+
+`child/` contains a separate, time-limited connection/rendering contract
+experiment for disposable Windows test machines. It requires an explicit flag
+before changing child-session enablement, records actual session and frame
+evidence, and restores the state it changed. It is not an application backend.
+See its README for cleanup, identity, authentication, and functional limits.
+CI publishes only text logs, with no binaries or screenshots.

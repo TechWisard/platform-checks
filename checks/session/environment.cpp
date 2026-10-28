@@ -217,7 +217,13 @@ bool child_queries() {
               << "\nchild_id_query_error=" << child_error
               << "\nexisting_child_id=" << child
               << "\nexisting_child_present=" << (child_ok && child != MAXDWORD) << '\n';
-    return enabled_ok && child_ok && child == MAXDWORD;
+    // On the tested Windows 11/Server images absence is FALSE/ERROR_NOT_FOUND,
+    // whereas the documented success form is TRUE/ULONG(-1). Preserve both raw
+    // results above; no other error is interpreted as absence.
+    const bool absent = (child_ok && child == MAXDWORD) ||
+        (!child_ok && child_error == ERROR_NOT_FOUND);
+    std::cout << "no_child_reported=" << absent << '\n';
+    return enabled_ok && absent;
 }
 
 bool get_child_property(ITypeInfo* type, IUnknown* settings, unsigned index) {
