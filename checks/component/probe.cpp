@@ -30,6 +30,21 @@ struct Property {
     const char* id{""}; bool required{true}, attempted{}, verified{};
     int expected_type{-1}, actual_type{-1}; HRESULT error{S_OK}; const char* failure{""};
 };
+struct EnumConstant {
+    bool seen{}, identifier_accepted{}, value_present{}, integer_present{}, integer_unsigned{};
+    std::array<char, 129> identifier{};
+    int variable_kind{-1}, declared_type{-1}, variant_type{-1};
+    unsigned known_name_bits{}, strict_constant_bits{};
+    std::int64_t signed_value{}; std::uint64_t unsigned_value{};
+};
+struct CloseEnumDiagnostic {
+    bool attempted{}, referenced_type_read{}, attributes_read{}, identifier_accepted{}, type_name_matches{}, complete{}, truncated{};
+    std::array<char, 129> identifier{};
+    int type_kind{-1}, variable_count{-1}, alias_type{-1}, alias_pointee{-1};
+    unsigned type_flags{}, instance_bytes{}, count{}, known_name_bits{}, strict_constant_bits{};
+    HRESULT error{S_OK}; const char* failure{""};
+    std::array<EnumConstant, 16> constants{};
+};
 struct Result {
     HRESULT error{S_OK}, close_error{S_OK}; const char* failure{""};
     unsigned architecture{}, pointer_bits{sizeof(void*) * 8}; int apartment{-1};
@@ -40,6 +55,7 @@ struct Result {
     std::array<Native, 4> native{};
     std::array<Method, 10> events{};
     std::array<Property, 15> properties{};
+    CloseEnumDiagnostic close_enum_diagnostic{};
 };
 void failed(Result& result, const char* stage, HRESULT error) noexcept {
     if (SUCCEEDED(result.error)) { result.error = error; result.failure = stage; }
@@ -55,6 +71,80 @@ void capture(Method& output, const FUNCDESC& value) noexcept {
         row.type = parameter.tdesc.vt; row.flags = parameter.paramdesc.wParamFlags;
         if (parameter.tdesc.vt == VT_PTR && parameter.tdesc.lptdesc) row.pointee = parameter.tdesc.lptdesc->vt;
     }
+}
+bool copy_identifier(std::wstring_view name, std::array<char, 129>& destination) noexcept {
+    if (name.empty() || name.size() >= destination.size()) return false;
+    for (const wchar_t value : name)
+        if (!((value >= L'A' && value <= L'Z') || (value >= L'a' && value <= L'z') ||
+            (value >= L'0' && value <= L'9') || value == L'_')) return false;
+    for (std::size_t i = 0; i < name.size(); ++i) destination[i] = static_cast<char>(name[i]);
+    return true;
+}
+void capture_integer(const VARIANT& value, EnumConstant& output) noexcept {
+    output.integer_present = true;
+    switch (value.vt) {
+    case VT_I1: output.signed_value = value.cVal; break;
+    case VT_I2: output.signed_value = value.iVal; break;
+    case VT_I4: output.signed_value = value.lVal; break;
+    case VT_I8: output.signed_value = value.llVal; break;
+    case VT_INT: output.signed_value = value.intVal; break;
+    case VT_UI1: output.integer_unsigned = true; output.unsigned_value = value.bVal; break;
+    case VT_UI2: output.integer_unsigned = true; output.unsigned_value = value.uiVal; break;
+    case VT_UI4: output.integer_unsigned = true; output.unsigned_value = value.ulVal; break;
+    case VT_UI8: output.integer_unsigned = true; output.unsigned_value = value.ullVal; break;
+    case VT_UINT: output.integer_unsigned = true; output.unsigned_value = value.uintVal; break;
+    default: output.integer_present = false; break;
+    }
+}
+void inspect_close_enum(ITypeInfo* owner, const FUNCDESC& method, CloseEnumDiagnostic& output) noexcept {
+    output.attempted = true;
+    try {
+        check(method.cParams == 1 && method.lprgelemdescParam, "enum_diagnostic_parameter_shape");
+        const TYPEDESC& descriptor = method.lprgelemdescParam[0].tdesc;
+        check(descriptor.vt == VT_PTR && descriptor.lptdesc && descriptor.lptdesc->vt == VT_USERDEFINED,
+            "enum_diagnostic_reference_shape");
+        ComPtr<ITypeInfo> info;
+        require(owner->GetRefTypeInfo(descriptor.lptdesc->hreftype, info.put()), "enum_diagnostic_reference");
+        check(info.get() != nullptr, "enum_diagnostic_null_reference"); output.referenced_type_read = true;
+        TypeAttribute attributes(info.get()); const TYPEATTR& type = *attributes.value;
+        output.attributes_read = true; output.type_kind = type.typekind; output.variable_count = type.cVars;
+        output.type_flags = type.wTypeFlags; output.instance_bytes = type.cbSizeInstance;
+        if (type.typekind == TKIND_ALIAS) {
+            output.alias_type = type.tdescAlias.vt;
+            if (type.tdescAlias.vt == VT_PTR && type.tdescAlias.lptdesc) output.alias_pointee = type.tdescAlias.lptdesc->vt;
+        }
+        TextResult name;
+        require(info->GetDocumentation(MEMBERID_NIL, &name.value, nullptr, nullptr, nullptr), "enum_diagnostic_type_name");
+        output.identifier_accepted = copy_identifier(name.view(), output.identifier);
+        output.type_name_matches = name.view() == L"ControlCloseStatus";
+        output.truncated = type.cVars > output.constants.size();
+        for (UINT index = 0; index < type.cVars && index < output.constants.size(); ++index) {
+            EnumConstant& row = output.constants[index]; ++output.count;
+            struct Variable {
+                ITypeInfo* owner; VARDESC* value{};
+                ~Variable() { if (value) owner->ReleaseVarDesc(value); }
+            } variable{info.get()};
+            require(info->GetVarDesc(index, &variable.value), "enum_diagnostic_variable");
+            check(variable.value != nullptr, "enum_diagnostic_null_variable");
+            row.seen = true; row.variable_kind = variable.value->varkind;
+            row.declared_type = variable.value->elemdescVar.tdesc.vt;
+            TextResult member;
+            require(info->GetDocumentation(variable.value->memid, &member.value, nullptr, nullptr, nullptr), "enum_diagnostic_member_name");
+            row.identifier_accepted = copy_identifier(member.view(), row.identifier);
+            row.known_name_bits = member.view() == L"controlCloseCanProceed" ? 1U :
+                member.view() == L"controlCloseWaitForEvents" ? 2U : 0U;
+            output.known_name_bits |= row.known_name_bits;
+            if (variable.value->varkind == VAR_CONST && variable.value->lpvarValue) {
+                const VARIANT& value = *variable.value->lpvarValue;
+                row.value_present = true; row.variant_type = value.vt; capture_integer(value, row);
+                if (value.vt == VT_I4 && ((row.known_name_bits == 1 && value.lVal == 0) ||
+                    (row.known_name_bits == 2 && value.lVal == 1))) row.strict_constant_bits = row.known_name_bits;
+                output.strict_constant_bits |= row.strict_constant_bits;
+            }
+        }
+        output.complete = !output.truncated;
+    } catch (const Failure& error) { output.error = error.result(); output.failure = error.what(); }
+    catch (...) { output.error = E_UNEXPECTED; output.failure = "enum_diagnostic_unexpected_exception"; }
 }
 ComPtr<ITypeLib> type_library() {
     std::array<wchar_t, 32768> path{};
@@ -96,6 +186,8 @@ void inspect_native(IUnknown* control, ITypeLib* library, REFIID iid, const char
                 if (!matches(name.view(), descriptor.value->invkind, spec.specification)) continue;
                 check(!method.seen, "duplicate_native_member", TYPE_E_AMBIGUOUSNAME);
                 capture(method, *descriptor.value);
+                if (spec.specification.signature == Signature::close_out)
+                    inspect_close_enum(info.get(), *descriptor.value, result.close_enum_diagnostic);
                 validate_method(info.get(), type, *descriptor.value, spec.specification.signature);
                 method.verified = true;
             }
@@ -294,6 +386,37 @@ void method_json(const Method& value) {
     }
     std::cout << "]}";
 }
+void close_enum_json(const CloseEnumDiagnostic& value) {
+    std::cout << "{\"attempted\":" << value.attempted << ",\"referenced_type_read\":" << value.referenced_type_read
+        << ",\"attributes_read\":" << value.attributes_read << ",\"identifier_accepted\":" << value.identifier_accepted
+        << ",\"identifier\":\"" << value.identifier.data() << "\",\"exact_type_name_match\":" << value.type_name_matches
+        << ",\"type_kind\":" << value.type_kind << ",\"variable_count\":" << value.variable_count
+        << ",\"type_flags\":" << value.type_flags << ",\"instance_bytes\":" << value.instance_bytes
+        << ",\"alias_type\":" << value.alias_type << ",\"alias_pointee\":" << value.alias_pointee
+        << ",\"complete\":" << value.complete << ",\"truncated\":" << value.truncated
+        << ",\"hresult\":" << static_cast<std::uint32_t>(value.error) << ",\"failure_operation\":\"" << value.failure
+        << "\",\"known_name_bits\":" << value.known_name_bits << ",\"strict_constant_bits\":" << value.strict_constant_bits
+        << ",\"constants\":[";
+    for (unsigned i = 0; i < value.count; ++i) {
+        if (i) std::cout << ',';
+        const EnumConstant& row = value.constants[i];
+        std::cout << "{\"seen\":" << row.seen << ",\"identifier_accepted\":" << row.identifier_accepted
+            << ",\"identifier\":\"" << row.identifier.data() << "\",\"variable_kind\":" << row.variable_kind
+            << ",\"declared_type\":" << row.declared_type << ",\"value_present\":" << row.value_present
+            << ",\"variant_type\":" << row.variant_type << ",\"known_name_bits\":" << row.known_name_bits
+            << ",\"strict_constant_bits\":" << row.strict_constant_bits << ",\"integer_unsigned\":";
+        if (row.integer_present) std::cout << row.integer_unsigned; else std::cout << "null";
+        std::cout << ",\"integer_value_decimal\":";
+        if (!row.integer_present) std::cout << "null";
+        else {
+            std::cout << '"';
+            if (row.integer_unsigned) std::cout << row.unsigned_value; else std::cout << row.signed_value;
+            std::cout << '"';
+        }
+        std::cout << '}';
+    }
+    std::cout << "]}";
+}
 int report(Result& result, ULONGLONG elapsed) {
     bool natives = true, properties = true;
     for (const auto& value : result.native) natives = natives && value.verified && value.qi;
@@ -322,7 +445,8 @@ int report(Result& result, ULONGLONG elapsed) {
         for (std::size_t j = 0; j < value.count; ++j) { if (j) std::cout << ','; method_json(value.methods[j]); }
         std::cout << "]}";
     }
-    std::cout << "],\"events\":[";
+    std::cout << "],\"close_enum_diagnostic\":"; close_enum_json(result.close_enum_diagnostic);
+    std::cout << ",\"events\":[";
     for (std::size_t i = 0; i < result.events.size(); ++i) { if (i) std::cout << ','; method_json(result.events[i]); }
     std::cout << "],\"event_error_hresult\":" << static_cast<std::uint32_t>(result.event_error) << ",\"event_failure_operation\":\"" << result.event_failure << "\",\"properties\":[";
     for (std::size_t i = 0; i < result.properties.size(); ++i) {
