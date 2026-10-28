@@ -69,6 +69,14 @@ the account, not a possibly created profile. Discard the VM after every run.
 Forced termination leaves cleanup unverified. The existing child-session limits
 apply even if a different-account result succeeds.
 
+Account cleanup inventories both WTS session IDs and states. It does not query
+a user SID for a `WTSListen` record: Microsoft defines that listener as having
+no logged-on user and not being convertible to a regular client session. A
+7022/not-found response invalidates the entire snapshot and starts a fresh
+bounded pass. A successful pass must also have a matching second inventory;
+access errors and unresolved identities still block deletion. At most four
+passes are attempted, with numeric inventory diagnostics and no account names.
+
 ```powershell
 # Fresh disposable GitHub-hosted Windows VM only:
 .\run.ps1 -ResultsDirectory "$env:RUNNER_TEMP\account-contract-new" -AllowEnableChildSessions -AlternateTestAccount
@@ -113,6 +121,14 @@ policy changes, certificate-validation bypasses, firewall changes, RDP listener
 reconfiguration, system-DLL changes or driver installation are performed. An
 authentication prompt, certificate failure or policy block must produce failure
 or timeout. The process never tries to fill or dismiss credential dialogs.
+
+Both experiment windows are borderless and bounded by the primary monitor.
+Each makes one request to present its own window with TopMost, BringToFront and
+Activate. Actual foreground/root ownership, screen bounds and DWM cloak state
+are measured; a successful method return is not proof of visibility. No focus
+retry loop, foreign-window changes, desktop switch or display/DPI setting change
+is used. The child's screen-color observations supplement the unchanged parent
+frame challenge; they cannot make that challenge pass on their own.
 
 The normal path has a finite connection/frame deadline, with separate bounded
 cleanup checks for task instances, logoff and control disconnection. The wrapper

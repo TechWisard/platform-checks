@@ -40,6 +40,7 @@ internal sealed class WitnessRenderEvidence
         public Rect? FormBounds { get; set; }
         public Rect? ClientBounds { get; set; }
         public Rect? ClientScreenBounds { get; set; }
+        public OwnWindowCoverage? WindowCoverage { get; set; }
         public string CurrentWindowStationCategory { get; set; } = "unavailable";
         public int WindowStationQueryWin32Error { get; set; }
         public int WindowStationQueryHresult { get; set; }
@@ -150,6 +151,7 @@ internal sealed class WitnessRenderEvidence
                     state.IsWindowVisible = IsWindowVisible(form.Handle);
                     state.IsMinimized = IsIconic(form.Handle);
                     state.ClientScreenBounds = Rect.From(form.RectangleToScreen(form.ClientRectangle));
+                    state.WindowCoverage = OwnWindowPresentation.Observe(form);
                 }
                 InspectUserObjects();
                 if (captureFrame) CaptureOwnFrame(form);

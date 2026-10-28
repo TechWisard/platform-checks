@@ -12,6 +12,7 @@ internal sealed class OwnedTestAccount : IDisposable
     private const uint UserNotFound = 2221;
     private static readonly SecurityIdentifier Administrators = new(WellKnownSidType.BuiltinAdministratorsSid, null);
     private static readonly SecurityIdentifier RemoteDesktopUsers = new(WellKnownSidType.BuiltinRemoteDesktopUsersSid, null);
+    private readonly Action<string, object?> record;
     private readonly string name = "scx" + Convert.ToHexString(RandomNumberGenerator.GetBytes(8)).ToLowerInvariant();
     private SecureString? password = NewPassword();
     internal string Name => name;
@@ -20,6 +21,8 @@ internal sealed class OwnedTestAccount : IDisposable
     internal bool Removed { get; private set; }
     internal bool NonAdministratorVerified { get; private set; }
     internal bool RemoteDesktopUsersMembership { get; private set; }
+
+    internal OwnedTestAccount(Action<string, object?> record) => this.record = record;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct UserInfo1
@@ -135,15 +138,7 @@ internal sealed class OwnedTestAccount : IDisposable
         if (Sid.Length == 0) throw new ExperimentFailure("test_account_cleanup_sid_receipt_missing");
         string? current = ReadCurrentSid();
         if (current is not null && current != Sid) throw new ExperimentFailure("test_account_name_reused_do_not_delete");
-        foreach (uint session in Native.SessionIds())
-        {
-            try
-            {
-                if (Native.SessionSid(session) == Sid)
-                    throw new ExperimentFailure("test_account_session_still_exists_do_not_delete");
-            }
-            catch (ExperimentFailure failure) when (failure.Stage == "session_has_no_logged_on_user") { }
-        }
+        RequireNoAccountSessions();
         // Fresh checks immediately before deletion: no existing child link and
         // exact created SID. Unexpected sessions are left alone, never logged off.
         if (Native.ChildId() != Native.NoSession)
@@ -170,6 +165,47 @@ internal sealed class OwnedTestAccount : IDisposable
             return new SecurityIdentifier(user.Sid).Value; // Copy before freeing the NetAPI buffer.
         }
         finally { if (buffer != IntPtr.Zero) NetApiBufferFree(buffer); }
+    }
+
+    private void RequireNoAccountSessions()
+    {
+        for (int attempt = 0; attempt < 4; attempt++)
+        {
+            bool rescan = false;
+            Dictionary<uint, int> inventory = Native.SessionStatesForAccountCleanup();
+            record("cleanup_account_session_inventory", new
+            {
+                attempt = attempt + 1,
+                count = inventory.Count,
+                listener_count = inventory.Values.Count(state => state == 6)
+            });
+            foreach ((uint session, int state) in inventory)
+            {
+                // Microsoft: a WTSListen entry has no logged-on user and cannot
+                // transition into a regular client session. Do not ask it for a SID.
+                if (state == 6 /* WTSListen */) continue;
+                try
+                {
+                    if (Native.SessionSid(session) == Sid)
+                        throw new ExperimentFailure("test_account_session_still_exists_do_not_delete");
+                }
+                catch (ExperimentFailure failure) when (failure.Stage == "session_has_no_logged_on_user") { }
+                catch (ExperimentFailure failure) when (failure.Stage == "WTSQuerySessionInformation" && failure.Code == 7022)
+                {
+                    // The enumerated session no longer resolves. Discard this
+                    // entire snapshot; never turn a failed lookup into absence.
+                    rescan = true;
+                    record("cleanup_session_query_disappeared", new { session_id = session, state, code = failure.Code });
+                    break;
+                }
+            }
+            if (rescan) continue;
+            Dictionary<uint, int> after = Native.SessionStatesForAccountCleanup();
+            if (inventory.Count == after.Count && inventory.All(item =>
+                after.TryGetValue(item.Key, out int state) && state == item.Value)) return;
+            record("cleanup_account_session_inventory_changed", new { attempt = attempt + 1 });
+        }
+        throw new ExperimentFailure("cleanup_session_inventory_did_not_stabilize");
     }
 
     private static SecureString NewPassword()

@@ -90,6 +90,25 @@ internal static class Native
         }
         finally { WTSFreeMemory(value); }
     }
+    internal static Dictionary<uint, int> SessionStatesForAccountCleanup()
+    {
+        Require(Enumerate(IntPtr.Zero, 0, 1, out IntPtr data, out int count), "WTSEnumerateSessions_cleanup");
+        try
+        {
+            if (count < 0 || count > 16384 || (count != 0 && data == IntPtr.Zero))
+                throw new ExperimentFailure("invalid_cleanup_session_inventory");
+            Dictionary<uint, int> sessions = new();
+            int size = Marshal.SizeOf<WtsSession>();
+            for (int i = 0; i < count; i++)
+            {
+                WtsSession item = Marshal.PtrToStructure<WtsSession>(IntPtr.Add(data, checked(i * size)));
+                if (item.State is < 0 or > 9 || !sessions.TryAdd(item.Id, item.State))
+                    throw new ExperimentFailure("unknown_or_duplicate_cleanup_session_entry");
+            }
+            return sessions;
+        }
+        finally { WTSFreeMemory(data); }
+    }
     private static string Text(uint id, int field)
     {
         Require(Query(IntPtr.Zero, id, field, out IntPtr value, out uint bytes), "WTSQuerySessionInformation");
@@ -345,10 +364,7 @@ internal sealed class ExperimentForm : Form
         this.evidence = evidence; this.allowEnable = allowEnable; this.timeout = timeout;
         this.alternateTestAccount = alternateTestAccount;
         Text = "Session contract experiment — local child session";
-        ClientSize = new Size(1024, 768);
-        StartPosition = FormStartPosition.Manual;
-        Location = new Point(0, 0);
-        FormBorderStyle = FormBorderStyle.FixedDialog;
+        OwnWindowPresentation.Configure(this);
         MaximizeBox = false;
         Controls.Add(host);
         Shown += async (_, _) => await RunExperiment();
@@ -427,7 +443,7 @@ internal sealed class ExperimentForm : Form
                 evidence.Event("test_account_creation_started");
                 // Assign before Create: cleanup retains the ownership receipt
                 // even if a later SID/group read fails after NetUserAdd succeeds.
-                testAccount = new OwnedTestAccount();
+                testAccount = new OwnedTestAccount(evidence.Event);
                 try { testAccount.Create(); }
                 finally
                 {
@@ -513,6 +529,12 @@ internal sealed class ExperimentForm : Form
                 witnessFile = Path.Combine(work, "witness.json");
             }
             witnessRenderPath = Path.Combine(Path.GetDirectoryName(witnessFile)!, "witness-render.json");
+            // One request for our parent form, after connection and before the
+            // frame phase. Retry/capture loops never reassert activation.
+            OwnWindowCoverage beforePresentation = OwnWindowPresentation.Observe(this);
+            OwnWindowPresentation.Present(this);
+            evidence.Event("parent_window_presentation", new
+                { before = beforePresentation, after = OwnWindowPresentation.Observe(this) });
             StartWitness(evidence.ChildSessionId!.Value, witnessFile);
             bool witnessVerified = false;
             while (deadline.Elapsed < timeout)
@@ -833,15 +855,17 @@ internal sealed class WitnessForm : Form
         this.render = render;
         colors = Program.ChallengeColors(nonce);
         Text = "Session rendering witness";
-        FormBorderStyle = FormBorderStyle.None;
-        WindowState = FormWindowState.Maximized;
-        TopMost = true;
+        OwnWindowPresentation.Configure(this);
         BackColor = Color.Black;
         DoubleBuffered = true;
         lifetime.Tick += (_, _) => Close();
         Shown += (_, _) =>
         {
             render.Shown(this);
+            // Already TopMost before this point; explicitly request presentation
+            // once, then observe whether it actually took effect.
+            OwnWindowPresentation.Present(this);
+            render.Capture(this, "presentation_requested", captureFrame: false);
             shownFor.Start();
             lifetime.Start();
             diagnostics.Start();
