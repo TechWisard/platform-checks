@@ -55,8 +55,9 @@ device isolation. The source has no Connect/Disconnect/RequestClose call path.
 
 Build with native Windows MSVC using this CMake directory; ARM64 and x64 need
 separate builds. Local MinGW cross-compilation checks compilation/linking only.
-The initial draft has not run on Windows. This draft includes no workflow or
-publication action.
+The dedicated native-component workflow builds and executes this standalone
+probe on ARM64 and x64 Windows. This revision is being submitted for its first
+Windows runtime measurements; local compilation alone is not an execution result.
 
 `run.ps1 -Executable <built-exe>` imposes a 20-second process deadline, followed
 by at most five seconds to confirm termination of its own process. It caps its
