@@ -13,6 +13,8 @@ on:
       - '.github/workflows/windows-guest.yml'
       - 'checks/ole/**'
       - '.github/workflows/native-ole.yml'
+      - 'checks/component/**'
+      - '.github/workflows/native-component.yml'
   pull_request:
   workflow_dispatch:
 
