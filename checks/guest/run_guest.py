@@ -479,6 +479,48 @@ class Qmp:
             self.socket.close()
 
 
+def boot_media_arguments(disk: Path, installation_iso: Path) -> list[str]:
+    # OVMF consumes QEMU's fw_cfg device boot order. Use only bootindex;
+    # legacy order/once writes PC CMOS and must not be mixed with bootindex.
+    # An initially empty disk falls through to the stock installation CD.
+    # Once installed, the same disk remains ahead of that CD after reboots.
+    return ["-drive", f"if=none,id=osdisk,format=qcow2,file={disk}",
+            "-device", "ide-hd,id=osdiskdev,drive=osdisk,bus=sata.0,bootindex=1",
+            "-drive", f"if=none,id=install,format=raw,media=cdrom,readonly=on,file={installation_iso}",
+            "-device", "ide-cd,id=installcd,drive=install,bus=sata.1,bootindex=2",
+            "-boot", "menu=off"]
+
+
+def verify_boot_policy(qmp: Qmp, disk: Path, installation_iso: Path) -> dict:
+    state = qmp.call("query-status")
+    require(isinstance(state, dict) and state.get("running") is False and
+            type(state.get("status")) is str and
+            state.get("status") in {"prelaunch", "paused"}, "boot_policy_vm_not_paused")
+    indices = []
+    for device, expected in (("osdiskdev", 1), ("installcd", 2)):
+        value = qmp.call("qom-get", {"path": "/machine/peripheral/" + device, "property": "bootindex"})
+        require(type(value) is int and value == expected, "boot_policy_index_mismatch")
+        indices.append(value)
+    entries = qmp.call("query-block")
+    require(isinstance(entries, list) and 1 <= len(entries) <= 16 and
+            all(isinstance(entry, dict) for entry in entries), "boot_policy_block_inventory_invalid")
+    for backend, device, path, driver, removable in (
+            ("osdisk", "osdiskdev", disk, "qcow2", False),
+            ("install", "installcd", installation_iso, "raw", True)):
+        selected = [entry for entry in entries if entry.get("device") == backend]
+        require(len(selected) == 1, "boot_policy_backend_not_unique")
+        entry = selected[0]
+        inserted = entry.get("inserted")
+        require(entry.get("qdev") == device and entry.get("removable") is removable and
+                isinstance(inserted, dict) and inserted.get("file") == str(path) and
+                inserted.get("drv") == driver and inserted.get("ro") is removable,
+                "boot_policy_device_mapping_mismatch")
+    # Only fixed booleans and actual numeric indices leave this function.
+    # These are pre-boot configuration observations, never Windows boot proof.
+    return {"disk_bootindex": indices[0], "installation_cd_bootindex": indices[1],
+            "device_mapping_verified": True, "before_first_boot_verified": True}
+
+
 def block_progress(qmp: Qmp) -> dict:
     try:
         entries = qmp.call("query-blockstats")
@@ -922,10 +964,9 @@ def execute(args) -> int:
                      "-global", "driver=cfi.pflash01,property=secure,value=on", "-global", "ICH9-LPC.disable_s3=1",
                      "-drive", f"if=pflash,format=raw,unit=0,readonly=on,file={code}",
                      "-drive", f"if=pflash,format=raw,unit=1,file={work / 'OVMF_VARS.fd'}",
-                     "-device", "ich9-ahci,id=sata", "-drive", f"if=none,id=osdisk,format=qcow2,file={disk}",
-                     "-device", "ide-hd,drive=osdisk,bus=sata.0", "-drive", f"if=none,id=install,format=raw,media=cdrom,readonly=on,file={iso}",
-                     "-device", "ide-cd,drive=install,bus=sata.1", "-drive", f"if=none,id=payload,format=raw,media=cdrom,readonly=on,file={payload}",
-                     "-device", "ide-cd,drive=payload,bus=sata.2", "-boot", "order=c,once=d,menu=off",
+                     "-device", "ich9-ahci,id=sata"] + boot_media_arguments(disk, iso) + [
+                     "-drive", f"if=none,id=payload,format=raw,media=cdrom,readonly=on,file={payload}",
+                     "-device", "ide-cd,drive=payload,bus=sata.2",
                      "-drive", f"if=none,id=answerbackend,format=raw,media=cdrom,readonly=on,file={setup_iso}",
                      "-device", "ide-cd,id=setupcd,drive=answerbackend,bus=sata.3",
                      "-device", "VGA,vgamem_mb=16", "-display", "none", "-monitor", "none", "-parallel", "none",
@@ -943,6 +984,7 @@ def execute(args) -> int:
         kvm = qmp.call("query-kvm")
         require(kvm.get("enabled") is True and kvm.get("present") is True, "qemu_kvm_not_actually_enabled")
         emit("qemu_kvm_verified", guest_ram_mib=8192, disk_virtual_gib=64, cpu_count=4, public_port_forwarding=False)
+        emit("boot_policy_verified", **verify_boot_policy(qmp, disk, iso))
         reader = SerialReader(nonce)
         offset = 0
         boot_start = time.monotonic()

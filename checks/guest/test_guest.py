@@ -18,6 +18,72 @@ import failure_diagnostics as diagnostics
 class HostContractTests(unittest.TestCase):
     nonce = "1A" * 24
 
+    def test_boot_media_uses_one_explicit_device_priority_policy(self):
+        arguments = guest.boot_media_arguments(Path("/owned/guest.qcow2"), Path("/owned/windows.iso"))
+        pairs = list(zip(arguments[::2], arguments[1::2]))
+        self.assertEqual(len(arguments), 10)
+        devices = [dict(field.split("=", 1) for field in value.split(",")[1:])
+                   for option, value in pairs if option == "-device"]
+        self.assertEqual([(item["drive"], item["bus"], int(item["bootindex"])) for item in devices],
+                         [("osdisk", "sata.0", 1), ("install", "sata.1", 2)])
+        self.assertEqual([value for option, value in pairs if option == "-boot"], ["menu=off"])
+        drives = [dict(field.split("=", 1) for field in value.split(","))
+                  for option, value in pairs if option == "-drive"]
+        self.assertEqual(drives[0]["file"], "/owned/guest.qcow2")
+        self.assertEqual(drives[0]["format"], "qcow2")
+        self.assertEqual(drives[1]["file"], "/owned/windows.iso")
+        self.assertEqual((drives[1]["format"], drives[1]["media"], drives[1]["readonly"]), ("raw", "cdrom", "on"))
+
+    def test_actual_boot_configuration_requires_typed_indices_and_exact_owned_devices(self):
+        disk, iso = Path("/owned/guest.qcow2"), Path("/owned/windows.iso")
+        valid = [
+            {"running": False, "status": "prelaunch"}, 1, 2,
+            [{"device": "osdisk", "qdev": "osdiskdev", "removable": False,
+              "inserted": {"file": str(disk), "drv": "qcow2", "ro": False}},
+             {"device": "install", "qdev": "installcd", "removable": True,
+              "inserted": {"file": str(iso), "drv": "raw", "ro": True}}]]
+        expected_calls = [("query-status", None),
+                          ("qom-get", {"path": "/machine/peripheral/osdiskdev", "property": "bootindex"}),
+                          ("qom-get", {"path": "/machine/peripheral/installcd", "property": "bootindex"}),
+                          ("query-block", None)]
+
+        class FakeQmp:
+            def __init__(self, replies):
+                self.replies = replies
+                self.calls = []
+
+            def call(self, name, arguments=None):
+                self.calls.append((name, arguments))
+                return self.replies[len(self.calls) - 1]
+
+        qmp = FakeQmp(copy.deepcopy(valid))
+        self.assertEqual(guest.verify_boot_policy(qmp, disk, iso),
+                         {"disk_bootindex": 1, "installation_cd_bootindex": 2,
+                          "device_mapping_verified": True, "before_first_boot_verified": True})
+        self.assertEqual(qmp.calls, expected_calls)
+        paused = copy.deepcopy(valid); paused[0]["status"] = "paused"
+        self.assertTrue(guest.verify_boot_policy(FakeQmp(paused), disk, iso)["before_first_boot_verified"])
+        rejected = []
+        for bad in (True, "1", None, -1, 2):
+            value = copy.deepcopy(valid); value[1] = bad; rejected.append(value)
+        for bad in (False, "2", None, -1, 1):
+            value = copy.deepcopy(valid); value[2] = bad; rejected.append(value)
+        for bad in ({"running": True, "status": "running"}, {"running": 0, "status": "prelaunch"},
+                    {"running": False, "status": "io-error"}, {"running": False, "status": []},
+                    {"running": False, "status": None}, None):
+            value = copy.deepcopy(valid); value[0] = bad; rejected.append(value)
+        for bad in (None, {}, [], [None], [valid[3][0]], valid[3] + [valid[3][0]], [valid[3][0]] * 17):
+            value = copy.deepcopy(valid); value[3] = copy.deepcopy(bad); rejected.append(value)
+        for device_index in range(2):
+            for name, bad in (("qdev", "another_device"), ("removable", 1), ("inserted", None)):
+                value = copy.deepcopy(valid); value[3][device_index][name] = bad; rejected.append(value)
+            for name, bad in (("file", "/unowned/other.img"), ("drv", "another_driver"), ("ro", 1)):
+                value = copy.deepcopy(valid); value[3][device_index]["inserted"][name] = bad; rejected.append(value)
+        for index, value in enumerate(rejected):
+            with self.subTest(rejected=index):
+                with self.assertRaises(guest.Failure):
+                    guest.verify_boot_policy(FakeQmp(value), disk, iso)
+
     def hello(self, nonce=None):
         return b"\nGUEST_HELLO_V1 " + (nonce or self.nonce).encode("ascii") + b"\n"
 
