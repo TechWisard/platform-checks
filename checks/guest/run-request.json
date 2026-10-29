@@ -1,6 +1,6 @@
 {
   "schema": "windows-guest-run-request/v1",
-  "request_id": "w11-ltsc-x64-20261029-nullable-evidence-owned-cleanup",
-  "previous_execution_commit": "dadc1a8b012bdb3a3107f487c95d00e761b39b63",
-  "reviewed_source_commit": "e1e7dd31929d91412b7c299a4ec87e987a263d70"
+  "request_id": "w11-ltsc-x64-20261029-explicit-uefi-device-order",
+  "previous_execution_commit": "edf300db02e6df8e479c907ee65dec9651df0f3e",
+  "reviewed_source_commit": "29186113f726b5f06b1697ba7b1894f0a6966681"
 }
