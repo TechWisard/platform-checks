@@ -13,6 +13,23 @@ separate and are not set by this check.
 
 ## Preconditions and input sequence
 
+For window-input mode, the parent's existing single presentation request is
+deferred until the owned witness has started and the original identity and
+nonce-frame gates pass. The form is already configured with its bounded,
+borderless TopMost geometry. A guarded one-shot call presents that same owned
+form immediately before the input transition; no activation is repeated from
+a timer, frame loop or failed request. Other experiment modes retain their
+previous presentation timing.
+
+The transition rejects changed parent/host handles or logical, physical or
+desktop geometry. Observed foreground and all nine hit points must belong to
+the parent. The original `WindowInputTarget` validates its exact native window,
+process/thread, foreground, desktop, layout and geometry without requesting
+focus. A fresh screen capture must match the same unpredictable nonce frame;
+account and target checks run again afterward. A denied presentation, changed
+target or frame mismatch fails before input. This does not act on Terminal or
+identify what caused an earlier foreground loss.
+
 The control must be connected. The SDK `IOleInPlaceObject::GetWindow` supplies
 the real control HWND, which must belong to the test process and its UI thread,
 and be inside the existing AxHost and Form. The Form must already be the actual

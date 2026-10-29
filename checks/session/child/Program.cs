@@ -345,6 +345,28 @@ internal sealed class Evidence
     }
 }
 
+internal static class ParentInputPresentation
+{
+    // A presentation request cannot substitute for observed ownership or for
+    // a fresh nonce frame. This pure check also rejects a geometry change.
+    internal static void RequireStableCoverage(OwnWindowCoverage before, OwnWindowCoverage after)
+    {
+        if (after.ClientScreenBounds != before.ClientScreenBounds ||
+            after.VirtualScreen != before.VirtualScreen ||
+            after.PhysicalClientScreenBounds != before.PhysicalClientScreenBounds ||
+            after.PhysicalClientScreenBounds != after.ClientScreenBounds ||
+            after.ClientScreenBounds.Width is <= 0 or > 4096 ||
+            after.ClientScreenBounds.Height is <= 0 or > 4096 ||
+            !before.EntireRegionInsideVirtualScreen || !after.EntireRegionInsideVirtualScreen)
+            throw new ExperimentFailure("window_input_presentation_geometry_changed");
+        if (!after.WindowVisible || !after.WindowEnabled || after.WindowIconic ||
+            !after.OwnRootResolved || !after.ForegroundRootResolved || after.ForegroundRootIsOwn != true ||
+            after.HitTestPointCount != 9 || after.OwnRootHitMask != 511 ||
+            after.NoWindowHitMask != 0 || after.UnresolvedRootHitMask != 0)
+            throw new ExperimentFailure("window_input_presentation_ownership_not_observed");
+    }
+}
+
 internal sealed class ExperimentForm : Form
 {
     private readonly Evidence evidence;
@@ -561,12 +583,25 @@ internal sealed class ExperimentForm : Form
                 witnessFile = Path.Combine(work, "witness.json");
             }
             witnessRenderPath = Path.Combine(Path.GetDirectoryName(witnessFile)!, "witness-render.json");
-            // One request for our parent form, after connection and before the
-            // frame phase. Retry/capture loops never reassert activation.
-            OwnWindowCoverage beforePresentation = OwnWindowPresentation.Observe(this);
-            OwnWindowPresentation.Present(this);
-            evidence.Event("parent_window_presentation", new
-                { before = beforePresentation, after = OwnWindowPresentation.Observe(this) });
+            bool parentPresentationRequested = false;
+            (OwnWindowCoverage Before, OwnWindowCoverage After) PresentParentOnce(string phase)
+            {
+                if (parentPresentationRequested)
+                    throw new ExperimentFailure("parent_window_presentation_repeated");
+                // Consume the one request before invoking UI code; exceptions
+                // never authorize another activation attempt.
+                parentPresentationRequested = true;
+                OwnWindowCoverage before = OwnWindowPresentation.Observe(this);
+                OwnWindowPresentation.Present(this);
+                OwnWindowCoverage after = OwnWindowPresentation.Observe(this);
+                evidence.Event("parent_window_presentation", new
+                    { phase, request_count = 1, before, after });
+                return (before, after);
+            }
+            // Window-input mode defers this same single request until witness
+            // startup and the initial independent frame/identity gates finish.
+            // Other modes retain their original presentation timing.
+            if (!testWindowInput) _ = PresentParentOnce("before_witness");
             StartWitness(evidence.ChildSessionId!.Value, witnessFile);
             bool witnessVerified = false;
             while (deadline.Elapsed < timeout)
@@ -608,6 +643,36 @@ internal sealed class ExperimentForm : Form
             if (!evidence.FrameChallengeVerified) throw new ExperimentFailure("frame_challenge_timeout");
             if (testWindowInput)
             {
+                connectionEvents.ThrowIfConnectionFailed();
+                VerifyWitnessOwnership(evidence.ChildSessionId!.Value);
+                if (!witnessVerified || !evidence.DifferentAccountVerified ||
+                    evidence.ChildMatchesCreatedAccountSid != true || !evidence.WitnessIdentityMatches ||
+                    !evidence.WitnessInExpectedSession)
+                    throw new ExperimentFailure("window_input_presentation_identity_not_verified");
+                if (deadline.Elapsed >= timeout)
+                    throw new ExperimentFailure("window_input_presentation_budget_unavailable");
+                IntPtr parentWindowBefore = Handle, hostWindowBefore = host.Handle;
+                var presented = PresentParentOnce("verified_frame_before_window_input");
+                if (Handle != parentWindowBefore || host.Handle != hostWindowBefore)
+                    throw new ExperimentFailure("window_input_presentation_window_recreated");
+                ParentInputPresentation.RequireStableCoverage(presented.Before, presented.After);
+                // Reuse the original strict native ownership/foreground,
+                // desktop/layout and geometry checks without selecting focus.
+                WindowInputTarget transitionTarget = new(this, host, control, evidence.Event);
+                if (deadline.Elapsed >= timeout)
+                    throw new ExperimentFailure("window_input_presentation_budget_unavailable");
+                bool freshFrame = CheckFrame();
+                evidence.Event("parent_input_frame_recheck", new
+                {
+                    matched = freshFrame,
+                    presentation_requests = 1,
+                    target_ownership_and_geometry_rechecked = true,
+                    focus_request_or_input_sent = false
+                });
+                if (!freshFrame) throw new ExperimentFailure("window_input_post_presentation_frame_mismatch");
+                connectionEvents.ThrowIfConnectionFailed();
+                VerifyWitnessOwnership(evidence.ChildSessionId.Value);
+                transitionTarget.Require(requireFocus: false);
                 await WindowInputExperiment.Run(this, host, control, evidence, witnessFile, nonce,
                     evidence.ChildSessionId!.Value, Program.IdentityDigest(nonce, expectedWitnessSid),
                     () => { connectionEvents.ThrowIfConnectionFailed(); VerifyWitnessOwnership(evidence.ChildSessionId!.Value); },
