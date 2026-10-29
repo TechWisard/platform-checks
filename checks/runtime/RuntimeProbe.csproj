@@ -15,5 +15,6 @@
     <Compile Include="RunnerProcess.cs" />
     <Compile Include="ReceiverLauncher.cs" />
     <Compile Include="PayloadCleanup.cs" />
+    <Compile Include="ImageIdentity.cs" />
   </ItemGroup>
 </Project>

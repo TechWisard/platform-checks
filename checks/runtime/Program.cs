@@ -281,11 +281,14 @@ internal static class Program
                 string directory = Path.Combine(root, "payload");
                 Wire.Need(!Directory.Exists(directory) && !File.Exists(directory), 308);
                 Directory.CreateDirectory(directory);
+                OwnedImageIdentity?[] imageIdentities = [null, null];
                 try
                 {
                     string console = Path.Combine(directory, "console.exe"), window = Path.Combine(directory, "window.exe");
-                    using (var stream = new FileStream(console, FileMode.CreateNew, FileAccess.Write, FileShare.None)) stream.Write(payload.ConsoleBytes);
-                    using (var stream = new FileStream(window, FileMode.CreateNew, FileAccess.Write, FileShare.None)) stream.Write(payload.WindowBytes);
+                    using (var stream = new FileStream(console, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None))
+                    { stream.Write(payload.ConsoleBytes); imageIdentities[0] = ImageIdentity.Capture(stream.SafeFileHandle); }
+                    using (var stream = new FileStream(window, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None))
+                    { stream.Write(payload.WindowBytes); imageIdentities[1] = ImageIdentity.Capture(stream.SafeFileHandle); }
                     CryptographicOperations.ZeroMemory(payload.ConsoleBytes); CryptographicOperations.ZeroMemory(payload.WindowBytes);
                     string[] arguments = ["--version", "--help", "--runtime-probe-invalid"];
                     for (int i = 0; i < arguments.Length; i++)
@@ -304,7 +307,7 @@ internal static class Program
                     stage = executionComplete ? "cleanup" : stage;
                     // Never replace a case's original exception with a cleanup
                     // exception. The fixed cleanup diagnostics retain both facts.
-                    filesRemoved = PayloadCleanup.TryRemove(directory, cleanup);
+                    filesRemoved = PayloadCleanup.TryRemove(directory, cleanup, executionComplete && PayloadCleanup.CasesReleased(cases), imageIdentities);
                 }
                 Wire.Need(filesRemoved, 321);
             }

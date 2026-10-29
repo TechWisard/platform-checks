@@ -51,11 +51,12 @@ function Test-CaseSuccess([bool]$ReportedPass, [bool]$FilesRemoved, [long]$Error
     return $valid
 }
 function Read-Cleanup($Value) {
-    if ($Value -isnot [pscustomobject] -or (@($Value.PSObject.Properties.Name | Sort-Object) -join ',') -cne 'attempts,file_index,hresult,operation,retries') { throw 'cleanup_fields' }
-    $result = @{operation=(Read-Integer $Value.operation 0 5); file_index=(Read-Integer $Value.file_index 0 2); hresult=(Read-Integer $Value.hresult -2147483648 2147483647); attempts=(Read-Integer $Value.attempts 0 64); retries=(Read-Integer $Value.retries 0 50)}
+    if ($Value -isnot [pscustomobject] -or (@($Value.PSObject.Properties.Name | Sort-Object) -join ',') -cne 'attempts,file_index,hresult,image_hresult,image_retries,operation,retries') { throw 'cleanup_fields' }
+    $result = @{operation=(Read-Integer $Value.operation 0 5); file_index=(Read-Integer $Value.file_index 0 2); hresult=(Read-Integer $Value.hresult -2147483648 2147483647); attempts=(Read-Integer $Value.attempts 0 64); retries=(Read-Integer $Value.retries 0 50); image_hresult=(Read-Integer $Value.image_hresult -2147483648 2147483647); image_retries=(Read-Integer $Value.image_retries 0 50)}
+    if ($result.image_hresult -notin @(0,-2147024891L) -or $result.image_retries -gt $result.retries -or ($result.image_hresult -eq 0 -and $result.image_retries -ne 0)) { throw 'cleanup_image_counts' }
     if ($result.retries -gt 0 -and $result.retries -ge $result.attempts) { throw 'cleanup_counts' }
     if ($result.operation -eq 0) {
-        if ($result.file_index -ne 0 -or $result.hresult -ne 0 -or $result.retries -ne 0) { throw 'cleanup_empty' }
+        if ($result.file_index -ne 0 -or $result.hresult -ne 0 -or $result.retries -ne 0 -or $result.image_hresult -ne 0 -or $result.image_retries -ne 0) { throw 'cleanup_empty' }
     } else {
         if ($result.attempts -eq 0 -or $result.hresult -eq 0) { throw 'cleanup_error' }
         if ($result.operation -in @(2,3)) { if ($result.file_index -notin @(1,2)) { throw 'cleanup_index' } }
@@ -65,7 +66,9 @@ function Read-Cleanup($Value) {
 }
 function Test-CleanupSuccess($Value) {
     if ($Value.attempts -eq 0) { return $false }
+    if ($Value.image_hresult -ne 0 -and $Value.image_retries -eq 0) { return $false }
     if ($Value.hresult -eq 0) { return $Value.operation -eq 0 -and $Value.file_index -eq 0 -and $Value.retries -eq 0 }
+    if ($Value.hresult -eq -2147024891L) { return $Value.operation -eq 3 -and $Value.file_index -in @(1,2) -and $Value.image_hresult -eq -2147024891L -and $Value.image_retries -gt 0 }
     return $Value.retries -gt 0 -and $Value.hresult -in @(-2147024864L,-2147024863L)
 }
 function Remove-OwnedTree([string]$Directory) {

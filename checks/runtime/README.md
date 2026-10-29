@@ -102,19 +102,33 @@ missing report, and failed report parsing without forwarding diagnostic text.
 Payload cleanup removes only the two fixed executable paths and their empty
 directory, with no recursive deletion or attribute changes. It retries only
 Windows sharing and lock violations (`0x80070020` and `0x80070021`) within one
-five-second retry budget, with at most 50 retries. Access-denied, nonempty
-directory, unknown I/O, and reparse-point failures remain failures. Final
+five-second retry budget, with at most 50 retries. Access denied (`0x80070005`)
+is additionally eligible only while deleting either freshly created
+executable, after all four case processes/jobs have verified cleanup. The
+exclusive creation handle supplies its volume and 128-bit file identifier.
+Before allowing this retry and before each subsequent deletion attempt, a
+metadata-only handle must show the same identity and a regular, non-readonly,
+non-reparse file. Its share mode permits ordinary image mapping; no identity
+handle remains open during execution or deletion. Query failures, changed
+identity, other access-denied operations, nonempty directories, unknown I/O,
+and persistent denial remain failures. No ACL, security setting, or file
+attribute is changed. This checks owned test files in the stated trusted-runner
+boundary. The metadata handle closes before path-based deletion, so concurrent
+hostile replacement remains outside this ownership check. Final
 absence of the directory and both known files is mandatory. A cleanup failure
 does not overwrite an earlier case failure.
 
 The result includes fixed numeric cleanup diagnostics: `operation`,
-`file_index`, `hresult`, `attempts`, and `retries`. Operation 0 means no observed
+`file_index`, `hresult`, `attempts`, `retries`, `image_hresult`, and
+`image_retries`. The image fields retain code 5 and its retry count even if a
+later sharing violation becomes the last error. Operation 0 means no observed
 error; 1 inspects the directory, 2 inspects a file, 3 deletes a file, 4 removes
 the empty directory, and 5 verifies absence. File index 0 means the directory,
 1 the console fixture, and 2 the window fixture. The last failed operation and
 HRESULT remain visible even if a permitted retry succeeds. No path, filename
 from an input, or exception text is forwarded. The outer wrapper validates
-these numeric fields and accepts retry success only for the two allowed codes.
+these numeric fields and accepts retry success only for the narrowly allowed
+codes and completed-case conditions.
 
 ## Limits and interpretation
 
@@ -145,3 +159,5 @@ isolation, compatibility with other Windows machines, or performance limits.
 - [PowerShell process creation and inherited handles](https://github.com/PowerShell/PowerShell/blob/v7.6.0/src/Microsoft.PowerShell.Commands.Management/commands/management/Process.cs)
 - [Windows file closing and deletion](https://learn.microsoft.com/en-us/windows/win32/fileio/closing-and-deleting-files)
 - [Windows sharing and lock error codes](https://learn.microsoft.com/en-us/windows/win32/debug/system-error-codes--0-499-)
+- [.NET executable-in-use and other deletion errors](https://learn.microsoft.com/en-us/dotnet/api/system.io.file.delete)
+- [Metadata query by file handle](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getfileinformationbyhandleex)
