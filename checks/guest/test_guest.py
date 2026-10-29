@@ -134,6 +134,7 @@ class HostContractTests(unittest.TestCase):
                      power_request={"acquired": True, "cleanup_verified": True},
                      activation_observation={"candidate_count": 1, "license_status": 1, "step": 7},
                      activation_audit=self.audit(),
+                     work_directory_cleanup=self.work_cleanup(),
                      test=self.session_contract())
         self.assertTrue(guest.successful_result(value))
         for key in gates:
@@ -154,6 +155,39 @@ class HostContractTests(unittest.TestCase):
                                  ("license_status", 2), ("license_status", True), ("step", 6)):
             changed = copy.deepcopy(value); changed["activation_observation"][key] = replacement
             self.assertFalse(guest.successful_result(changed), key)
+        for replacement in (None, [], {}, True, [self.work_cleanup()[0]]):
+            changed = copy.deepcopy(value); changed["work_directory_cleanup"] = replacement
+            self.assertFalse(guest.successful_result(changed))
+
+    def work_cleanup(self):
+        return [dict(area_id=area, owned=True, present_before=True, removal_verified=True,
+                     error_stage=0, error_kind=None, error_hresult=None) for area in (1, 2)]
+
+    def test_work_cleanup_projection_and_acceptance_are_strict(self):
+        self.assertEqual(guest.work_directory_cleanup_projection(self.work_cleanup()), self.work_cleanup())
+        self.assertTrue(guest.work_directory_cleanup_verified(self.work_cleanup()))
+        self.assertEqual(guest.work_directory_cleanup_projection([]), [])
+        self.assertFalse(guest.work_directory_cleanup_verified([]))
+        for key, replacement in (("area_id", True), ("area_id", 2), ("owned", 1), ("present_before", "true"),
+                                 ("removal_verified", 1), ("error_stage", True), ("error_kind", "IOException"),
+                                 ("error_hresult", "private_path"), ("error_hresult", 2**31), ("extra", "private_path")):
+            changed = self.work_cleanup(); changed[0][key] = replacement
+            with self.assertRaises(guest.Failure): guest.work_directory_cleanup_projection(changed)
+            self.assertFalse(guest.work_directory_cleanup_verified(changed))
+        for key in self.work_cleanup()[0]:
+            changed = self.work_cleanup(); del changed[0][key]
+            with self.assertRaises(guest.Failure): guest.work_directory_cleanup_projection(changed)
+        locked = self.work_cleanup()
+        locked[0].update(removal_verified=False, error_stage=2, error_kind=2, error_hresult=-2147024864)
+        self.assertEqual(guest.work_directory_cleanup_projection(locked), locked)
+        self.assertFalse(guest.work_directory_cleanup_verified(locked))
+        for key, replacement in (("owned", False), ("present_before", False), ("error_stage", 0), ("error_kind", None),
+                                 ("error_hresult", None), ("removal_verified", True)):
+            changed = copy.deepcopy(locked); changed[0][key] = replacement
+            with self.assertRaises(guest.Failure): guest.work_directory_cleanup_projection(changed)
+        unowned = self.work_cleanup(); unowned[0].update(owned=False, present_before=None)
+        self.assertEqual(guest.work_directory_cleanup_projection(unowned), unowned)
+        self.assertFalse(guest.work_directory_cleanup_verified(unowned))
 
     def session_contract(self):
         # A synthetic own-window receipt only; no physical or direct input is

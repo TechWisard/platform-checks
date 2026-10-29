@@ -44,6 +44,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'contract_build_failed' }
           dotnet checks/guest/ContractTests/bin/Release/net8.0/ContractTests.dll
           if ($LASTEXITCODE -ne 0) { throw 'managed_contracts_failed' }
+          dotnet build checks/guest/GuestSupervisor/GuestSupervisor.csproj --configuration Release --output checks/guest/build --configfile checks/guest/NuGet.Config --nologo -p:UseSharedCompilation=false -p:NuGetAudit=false -nodeReuse:false
+          if ($LASTEXITCODE -ne 0) { throw 'supervisor_contract_build_failed' }
+          dotnet checks/guest/ContractTests/bin/Release/net8.0/ContractTests.dll --supervisor checks/guest/build/GuestSupervisor.dll --require-windows
+          if ($LASTEXITCODE -ne 0) { throw 'supervisor_evidence_contracts_failed' }
           dotnet checks/guest/ContractTests/bin/Release/net8.0/ContractTests.dll --export-scripts $scripts
           if ($LASTEXITCODE -ne 0) { throw 'script_export_failed' }
           & checks/guest/ContractTests/ActivationScriptContracts.ps1 -ScriptDirectory $scripts -RequireWindowsPowerShell51

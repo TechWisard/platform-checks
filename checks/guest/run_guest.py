@@ -785,6 +785,39 @@ def successful_session_contract(value) -> bool:
             all(value.get(key) is True for key in required) and all(value.get(key) is False for key in excluded))
 
 
+def work_directory_cleanup_projection(value):
+    """Fixed numeric/boolean observations only; no filesystem paths or text."""
+    require(isinstance(value, list) and len(value) in {0, 2}, "owned_directory_cleanup_count_invalid")
+    names = ("area_id", "owned", "present_before", "removal_verified", "error_stage", "error_kind", "error_hresult")
+    copied = []
+    for area, item in enumerate(value, 1):
+        require(isinstance(item, dict) and set(item) == set(names), "owned_directory_cleanup_shape_invalid")
+        require(type(item["area_id"]) is int and item["area_id"] == area and
+                type(item["owned"]) is bool and type(item["removal_verified"]) is bool and
+                (item["present_before"] is None or type(item["present_before"]) is bool) and
+                type(item["error_stage"]) is int and 0 <= item["error_stage"] <= 3 and
+                (item["error_kind"] is None or type(item["error_kind"]) is int and 1 <= item["error_kind"] <= 7) and
+                (item["error_hresult"] is None or type(item["error_hresult"]) is int and -(2**31) <= item["error_hresult"] < 2**31),
+                "owned_directory_cleanup_values_invalid")
+        if item["removal_verified"]:
+            require(item["error_stage"] == 0 and item["error_kind"] is None and item["error_hresult"] is None and
+                    (type(item["present_before"]) is bool if item["owned"] else item["present_before"] is None),
+                    "owned_directory_cleanup_success_inconsistent")
+        else:
+            require(item["owned"] and item["error_stage"] != 0 and item["error_kind"] is not None and item["error_hresult"] is not None and
+                    (item["error_stage"] == 1 or item["present_before"] is True), "owned_directory_cleanup_failure_inconsistent")
+        copied.append({key: item[key] for key in names})
+    return copied
+
+
+def work_directory_cleanup_verified(value):
+    try:
+        items = work_directory_cleanup_projection(value)
+    except Failure:
+        return False
+    return len(items) == 2 and all(item["owned"] and item["removal_verified"] for item in items)
+
+
 def successful_result(value: dict) -> bool:
     required = ("guest_identity_verified", "elevated", "interactive_console_verified", "secure_boot_verified", "tpm2_verified",
                 "fixture_presentation_verified", "activation_licensed_observed", "offline_runtime_verified", "harness_compiled", "autologon_disabled",
@@ -799,7 +832,8 @@ def successful_result(value: dict) -> bool:
             isinstance(power, dict) and power.get("acquired") is True and power.get("cleanup_verified") is True and
             isinstance(activation, dict) and type(activation.get("candidate_count")) is int and activation["candidate_count"] == 1 and
             type(activation.get("license_status")) is int and activation["license_status"] == 1 and activation.get("step") == 7 and
-            licensed_audit(value.get("activation_audit")) and successful_session_contract(test))
+            licensed_audit(value.get("activation_audit")) and successful_session_contract(test) and
+            work_directory_cleanup_verified(value.get("work_directory_cleanup")))
 
 
 def stop_owned(process: subprocess.Popen | None) -> bool:
@@ -991,6 +1025,12 @@ def execute(args) -> int:
         public = {key: value[key] for key in public_fields if key in value}
         if "activation_audit" in value:
             public["activation_audit"] = activation_audit_projection(value["activation_audit"])
+        if "work_directory_cleanup" in value:
+            public["work_directory_cleanup"] = work_directory_cleanup_projection(value["work_directory_cleanup"])
+        if "copied_read_only_files_cleared" in value:
+            count = value["copied_read_only_files_cleared"]
+            require(type(count) is int and 0 <= count <= 100000, "owned_copy_read_only_count_invalid")
+            public["copied_read_only_files_cleared"] = count
         emit("guest_result", result=public)
         outcome = 0 if setup_detached and successful_result(value) else 1
     finally:

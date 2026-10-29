@@ -41,6 +41,8 @@ internal static class GuestSupervisor
         public bool AutologonDisabled { get; set; }
         public bool HarnessCleanupVerified { get; set; }
         public bool GuestWorkDirectoriesRemoved { get; set; }
+        public int CopiedReadOnlyFilesCleared { get; set; }
+        public List<OwnedDirectoryCleanup> WorkDirectoryCleanup { get; } = new();
         public bool CleanupUnverified { get; set; }
         public bool PhysicalInputIsolationVerified { get; } = false;
         public bool NativeMultiseatVerified { get; } = false;
@@ -195,7 +197,8 @@ internal static class GuestSupervisor
             Require(CreateDirectory(work, IntPtr.Zero), "owned_work_directory_creation_failed");
             ownWork = true;
             result.Stage = "copy_offline_runtime";
-            CopyTree(Path.Combine(media, "dotnet"), runtime, () => ownRuntime = true);
+            Action copiedReadOnlyCleared = () => result.CopiedReadOnlyFilesCleared = checked(result.CopiedReadOnlyFilesCleared + 1);
+            CopyTree(Path.Combine(media, "dotnet"), runtime, () => ownRuntime = true, copiedReadOnlyCleared);
             string dotnet = Path.Combine(runtime, "dotnet.exe");
             Require(File.Exists(dotnet) && Directory.Exists(Path.Combine(runtime, "shared", "Microsoft.WindowsDesktop.App", "8.0.33")) &&
                 Directory.Exists(Path.Combine(runtime, "packs", "Microsoft.WindowsDesktop.App.Ref", "8.0.33")) &&
@@ -203,9 +206,9 @@ internal static class GuestSupervisor
             result.OfflineRuntimeVerified = true;
             serial.Phase("offline_runtime_verified");
             string source = Path.Combine(work, "source");
-            CopyTree(Path.Combine(media, "source"), source);
-            File.Copy(Path.Combine(media, "NuGet.Config"), Path.Combine(work, "NuGet.Config"), false);
-            File.Copy(Path.Combine(media, "global.json"), Path.Combine(work, "global.json"), false);
+            CopyTree(Path.Combine(media, "source"), source, readOnlyCleared: copiedReadOnlyCleared);
+            CopyVerifiedFile(Path.Combine(media, "NuGet.Config"), Path.Combine(work, "NuGet.Config"), copiedReadOnlyCleared);
+            CopyVerifiedFile(Path.Combine(media, "global.json"), Path.Combine(work, "global.json"), copiedReadOnlyCleared);
             string receipt = Path.Combine(work, "guest-receipt.json");
             using (FileStream file = new(receipt, FileMode.CreateNew, FileAccess.Write, FileShare.Read))
                 JsonSerializer.Serialize(file, new { schema = "owned-disposable-guest/v1", nonce = result.Nonce,
@@ -242,9 +245,9 @@ internal static class GuestSupervisor
             Require(File.Exists(evidenceFile) && new FileInfo(evidenceFile).Length is > 0 and <= 1048576, "harness_evidence_missing_or_large");
             using JsonDocument evidence = JsonDocument.Parse(File.ReadAllBytes(evidenceFile));
             JsonElement root = evidence.RootElement;
-            result.Test = SelectEvidence(root);
             result.HarnessCleanupVerified = SessionCleanupVerified(root);
             result.CleanupUnverified = !result.HarnessCleanupVerified;
+            result.Test = SelectEvidence(root);
             Require(testExit == 0 && result.HarnessCleanupVerified && SessionContractPassed(root),
                 "session_contract_did_not_pass");
             result.Status = "verified";
@@ -263,15 +266,11 @@ internal static class GuestSupervisor
         }
         finally
         {
-            bool removed = true;
-            foreach ((bool owned, string? path) in new[] { (ownWork, work), (ownRuntime, runtime) })
+            foreach ((int area, bool owned, string? path) in new[] { (1, ownWork, work), (2, ownRuntime, runtime) })
             {
-                try
-                {
-                    if (owned && path is not null && Directory.Exists(path)) Directory.Delete(path, true);
-                }
-                catch { removed = false; }
+                result.WorkDirectoryCleanup.Add(RemoveOwnedDirectory(area, owned, path));
             }
+            bool removed = result.WorkDirectoryCleanup.All(item => item.RemovalVerified);
             result.GuestWorkDirectoriesRemoved = removed;
             if (!removed) { result.CleanupUnverified = true; result.Status = "failed"; }
             if (powerRequest is not null && !powerRequest.Release().CleanupVerified)
@@ -515,20 +514,82 @@ internal static class GuestSupervisor
             !key.GetValueNames().Contains("DefaultPassword", StringComparer.OrdinalIgnoreCase), "owned_autologon_readback_failed");
     }
 
-    private static void CopyTree(string source, string destination, Action? created = null)
+    private sealed record OwnedDirectoryCleanup(int AreaId, bool Owned, bool? PresentBefore,
+        bool RemovalVerified, int ErrorStage, int? ErrorKind, int? ErrorHresult);
+
+    private static OwnedDirectoryCleanup RemoveOwnedDirectory(int area, bool owned, string? path)
+    {
+        // Only roots this invocation created are eligible. No path, exception
+        // message, stack, file name or provider output enters public evidence.
+        if (!owned) return new(area, false, null, true, 0, null, null);
+        bool? present = null;
+        int stage = 1; // inspect exact owned root
+        try
+        {
+            Require(path is not null, "owned_cleanup_path_missing");
+            FileAttributes attributes;
+            try { attributes = File.GetAttributes(path!); }
+            catch (FileNotFoundException) { return new(area, true, false, true, 0, null, null); }
+            catch (DirectoryNotFoundException) { return new(area, true, false, true, 0, null, null); }
+            present = true;
+            Require((attributes & FileAttributes.Directory) != 0 && (attributes & FileAttributes.ReparsePoint) == 0,
+                "owned_cleanup_root_changed");
+            stage = 2; // remove exact owned root
+            Directory.Delete(path!, true);
+            stage = 3; // verify absence without Directory.Exists hiding errors
+            try { _ = File.GetAttributes(path!); }
+            catch (FileNotFoundException) { return new(area, true, true, true, 0, null, null); }
+            catch (DirectoryNotFoundException) { return new(area, true, true, true, 0, null, null); }
+            throw new InvalidOperationException("owned_cleanup_root_still_present");
+        }
+        catch (Exception error)
+        {
+            int kind = error switch
+            {
+                UnauthorizedAccessException => 1,
+                IOException => 2,
+                System.Security.SecurityException => 3,
+                InvalidOperationException => 4,
+                ArgumentException => 5,
+                NotSupportedException => 6,
+                _ => 7
+            };
+            return new(area, true, present, false, stage, kind, error.HResult);
+        }
+    }
+
+    private static void CopyVerifiedFile(string source, string target, Action? readOnlyCleared = null)
+    {
+        Require((File.GetAttributes(source) & FileAttributes.ReparsePoint) == 0, "payload_reparse_point_rejected");
+        File.Copy(source, target, false);
+        using (FileStream original = File.OpenRead(source))
+        using (FileStream copied = File.OpenRead(target))
+            Require(CryptographicOperations.FixedTimeEquals(SHA256.HashData(original), SHA256.HashData(copied)), "payload_copy_hash_mismatch");
+        // CD files can carry ReadOnly through File.Copy. Normalize only this
+        // just-created, hash-verified copy, after both readers have closed.
+        // Preserve all other attributes and never alter the source medium.
+        FileAttributes attributes = File.GetAttributes(target);
+        Require((attributes & (FileAttributes.Directory | FileAttributes.ReparsePoint)) == 0, "payload_copy_type_changed");
+        if ((attributes & FileAttributes.ReadOnly) != 0)
+        {
+            FileAttributes writable = attributes & ~FileAttributes.ReadOnly;
+            if (writable == 0) writable = FileAttributes.Normal;
+            File.SetAttributes(target, writable);
+            Require(File.GetAttributes(target) == writable, "payload_copy_attributes_not_preserved");
+            readOnlyCleared?.Invoke();
+        }
+    }
+
+    private static void CopyTree(string source, string destination, Action? created = null, Action? readOnlyCleared = null)
     {
         Require(Directory.Exists(source) && !Directory.Exists(destination), "copy_source_or_destination_invalid");
         Require(CreateDirectory(destination, IntPtr.Zero), "owned_copy_root_creation_failed");
         created?.Invoke();
         foreach (string file in Directory.EnumerateFiles(source, "*", SearchOption.AllDirectories))
         {
-            Require((File.GetAttributes(file) & FileAttributes.ReparsePoint) == 0, "payload_reparse_point_rejected");
             string target = Path.Combine(destination, Path.GetRelativePath(source, file));
             Directory.CreateDirectory(Path.GetDirectoryName(target)!);
-            File.Copy(file, target, false);
-            using FileStream original = File.OpenRead(file);
-            using FileStream copied = File.OpenRead(target);
-            Require(CryptographicOperations.FixedTimeEquals(SHA256.HashData(original), SHA256.HashData(copied)), "payload_copy_hash_mismatch");
+            CopyVerifiedFile(file, target, readOnlyCleared);
         }
     }
 
@@ -649,6 +710,7 @@ internal static class GuestSupervisor
     private static JsonObject SelectEvidence(JsonElement value)
     {
         JsonObject result = new();
+        if (value.ValueKind != JsonValueKind.Object) return result;
         string[] names = { "parent_and_child_active", "same_user_sid", "different_account_verified", "child_matches_created_account_sid",
             "alternate_test_account_requested", "test_account_created", "test_account_non_administrator_verified", "test_credentials_applied",
             "witness_in_expected_session", "witness_identity_matches", "witness_administrator_group_present", "frame_challenge_verified",
@@ -672,18 +734,21 @@ internal static class GuestSupervisor
         if (value.TryGetProperty("parent_probe_input_event_count", out JsonElement count) && count.ValueKind == JsonValueKind.Number &&
             count.TryGetInt32(out int inputCount) && inputCount >= 0) result["parent_probe_input_event_count"] = inputCount;
         JsonArray failures = new();
-        if (value.TryGetProperty("events", out JsonElement events))
+        if (value.TryGetProperty("events", out JsonElement events) && events.ValueKind == JsonValueKind.Array)
         {
             foreach (JsonElement item in events.EnumerateArray())
             {
-                string? stage = item.GetProperty("stage").GetString();
-                if (stage is null || stage.Length > 96 || !stage.All(c => char.IsAsciiLetterOrDigit(c) || c == '_')) continue;
+                if (item.ValueKind != JsonValueKind.Object || !item.TryGetProperty("stage", out JsonElement stageValue) ||
+                    stageValue.ValueKind != JsonValueKind.String || stageValue.GetString() is not string stage ||
+                    stage.Length is 0 or > 96 || !stage.All(c => char.IsAsciiLetterOrDigit(c) || c == '_')) continue;
                 if (!item.TryGetProperty("details", out JsonElement details) || details.ValueKind != JsonValueKind.Object ||
-                    !details.TryGetProperty("code", out JsonElement code) || !code.TryGetInt32(out int number)) continue;
+                    !details.TryGetProperty("code", out JsonElement code) || code.ValueKind != JsonValueKind.Number ||
+                    !code.TryGetInt32(out int number)) continue;
                 if (failures.Count >= 16) break;
                 JsonObject failure = new() { ["stage"] = stage, ["code"] = number };
-                if (details.TryGetProperty("operation", out JsonElement operation) && operation.GetString() is string name &&
-                    name.Length <= 128 && name.All(c => char.IsAsciiLetterOrDigit(c) || c == '_')) failure["operation"] = name;
+                if (details.TryGetProperty("operation", out JsonElement operation) && operation.ValueKind == JsonValueKind.String &&
+                    operation.GetString() is string name && name.Length is > 0 and <= 128 &&
+                    name.All(c => char.IsAsciiLetterOrDigit(c) || c == '_')) failure["operation"] = name;
                 failures.Add(failure);
             }
         }

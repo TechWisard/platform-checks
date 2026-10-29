@@ -3,6 +3,13 @@ using System.Security.Cryptography;
 using System.Text;
 using SessionContractExperiment;
 
+if ((args.Length == 2 || args.Length == 3) && args[0] == "--supervisor")
+{
+    if (args.Length == 3 && args[2] != "--require-windows") throw new ArgumentException("unexpected_test_arguments");
+    SupervisorEvidenceContracts.Run(args[1], args.Length == 3);
+    return;
+}
+
 // Pure managed contracts only. No PowerShell, licensing query, Win32 call,
 // account, VM, serial device, screenshot, or product code is executed here.
 if (args.Length == 2 && args[0] == "--export-scripts")
