@@ -1,0 +1,65 @@
+name: Bounded runtime smoke test
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'checks/runtime/**'
+      - '.github/workflows/runtime-probe.yml'
+permissions:
+  contents: read
+
+concurrency:
+  group: runtime-probe-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  observe:
+    if: github.repository == 'TechWisard/platform-checks' && github.ref == 'refs/heads/main'
+    runs-on: windows-11-arm
+    timeout-minutes: 32
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Compile bounded receiver
+        shell: pwsh
+        env:
+          DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+          DOTNET_NOLOGO: '1'
+        run: |
+          dotnet build checks/runtime/RuntimeProbe.csproj --configuration Release --configfile checks/runtime/NuGet.Config --nologo -p:UseSharedCompilation=false -nodeReuse:false
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          dotnet checks/runtime/bin/Release/net8.0/RuntimeProbe.dll --self-test
+          exit $LASTEXITCODE
+      - name: Generate public per-run challenge
+        id: start
+        shell: pwsh
+        env:
+          RUNTIME_CONTENT_TOKEN: ${{ github.token }}
+        run: ./checks/runtime/Start-Probe.ps1
+      - name: Attest public challenge
+        id: attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ steps.start.outputs.challenge }}
+          show-summary: false
+          create-storage-record: false
+      - name: Publish public challenge and attestation
+        id: publish
+        shell: pwsh
+        env:
+          RUNTIME_CONTENT_TOKEN: ${{ github.token }}
+          RUNTIME_ATTESTATION_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: ./checks/runtime/Publish-Challenge.ps1 -BundlePath $env:RUNTIME_ATTESTATION_BUNDLE
+      - name: Wait for fixed cases and verify cleanup
+        if: always() && env.RUNTIME_PROBE_ROOT != ''
+        shell: pwsh
+        run: |
+          if ('${{ steps.publish.outcome }}' -eq 'success') { ./checks/runtime/Wait-Probe.ps1 }
+          else { ./checks/runtime/Wait-Probe.ps1 -CleanupOnly }
+          exit $LASTEXITCODE

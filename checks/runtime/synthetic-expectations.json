@@ -1,0 +1,9 @@
+{
+  "versionStdoutSha256": "340f97b9bb892ccbc89c7819389e37cb6568df5de100c7edc1dd3d32cbb747fc",
+  "versionStderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "helpStdoutSha256": "8d6fc655636e08bfa614c1a52ffa9b5b214195cbb5f116cd09418fcb128af401",
+  "helpStderrSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "invalidStdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "invalidStderrSha256": "c30286e7dcc8f8f970368c54e9e6498726ea1b24e5f34bae79f5fd08bdb10070",
+  "windowClass": "RuntimeProbeSyntheticWindow"
+}
