@@ -54,6 +54,27 @@ keeps its existing eight-character cap in every original mode; this one opt-in
 permits sixteen. The wrapper checks strict typed flags and a distinct terminal
 status. Failed or unknown calls are never replayed.
 
+For a failed background phase, the optional witness records at most 32 of its
+own key-up messages, with a saturating dropped counter. Metadata includes the
+ordinal, normal/system message kind and bounded repeat/extended/reserved/
+context/previous/transition flags. Digit and all other printable or unknown
+virtual-key and scan codes are redacted. Only the explicit modifier/lock
+allowlist retains codes, and a scan is retained only for an explicitly allowed
+VK/scan pair. The parent reapplies both allowlists before logging.
+Category values are 0 (other redacted), 1 (digit redacted), 2 (modifier) and
+3 (lock). The optional JSON has no role in receipt parsing or acceptance, and
+malformed diagnostics are reported best effort without replacing the failure.
+Ordinary modes do not collect this metadata or add it to their reports.
+
+The failure event also records only a nullable expected-text equality boolean.
+Comparison is eligible only after one send attempt and a nonce-bound report
+newer than the accepted baseline; otherwise it is not performed. Neither the
+expected nor received text is logged. This comparison does not imply acceptance:
+all original counts, flags, UI guards, quiet interval and cleanup gates remain.
+The metadata describes observed messages; it does not attribute their source
+or prove which operation caused an extra release. Diagnostic collection adds
+no input, focus changes, window queries, retries or replay.
+
 `ContractTests` run against the actual compiled harness before Windows use.
 They reject malformed ABI metadata, invalid array sizes/scan codes, stale or
 incorrect child receipts, wrong counts, changed UI ownership and missing

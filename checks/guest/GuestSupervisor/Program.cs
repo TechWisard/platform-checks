@@ -13,6 +13,7 @@ namespace SessionContractExperiment;
 internal static class GuestSupervisor
 {
     private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower };
+    private static bool bootstrapHelloWritten;
     private sealed class Result
     {
         public string Schema { get; } = "windows-guest-session-result/v1";
@@ -88,24 +89,43 @@ internal static class GuestSupervisor
 
     private static async Task<int> Main(string[] args)
     {
-        if (args.Length != 2 || args[0] != "--media-root") return 64;
+        SerialChannel.Bootstrap(10, 0);
+        try { return await Run(args); }
+        catch (Exception ex)
+        {
+            if (!bootstrapHelloWritten) SerialChannel.BootstrapFailure(ex);
+            throw;
+        }
+    }
+
+    private static async Task<int> Run(string[] args)
+    {
+        bool argumentsValid = args.Length == 2 && args[0] == "--media-root";
+        SerialChannel.Bootstrap(11, argumentsValid ? 0 : 64);
+        if (!argumentsValid) return 64;
         Result result = new();
         string? work = null, runtime = null;
         bool ownWork = false, ownRuntime = false;
         OwnedPowerRequest? powerRequest = null;
         using SerialChannel serial = new();
+        SerialChannel.Bootstrap(12, 0);
         try
         {
             string media = Path.GetFullPath(args[1]);
             DriveInfo drive = new(media);
             Require(drive.DriveType == DriveType.CDRom && drive.VolumeLabel == "SESSIONPAYLOAD", "payload_media_invalid");
+            SerialChannel.Bootstrap(13, 0);
             string configPath = Path.Combine(media, "guest-config.json");
             Require(new FileInfo(configPath).Length is > 0 and <= 4096, "guest_config_size_invalid");
+            SerialChannel.Bootstrap(14, 0);
             using JsonDocument config = JsonDocument.Parse(File.ReadAllBytes(configPath));
+            SerialChannel.Bootstrap(15, 0);
             JsonElement settings = config.RootElement;
             result.Nonce = settings.GetProperty("nonce").GetString() ?? "";
             Require(result.Nonce.Length == 48 && result.Nonce.All(Uri.IsHexDigit), "guest_nonce_invalid");
+            SerialChannel.Bootstrap(16, 0);
             serial.Hello(result.Nonce);
+            bootstrapHelloWritten = true;
             serial.Phase("supervisor_started");
             Guid uuid = settings.GetProperty("firmware_uuid").GetGuid();
             string account = settings.GetProperty("account_name").GetString() ?? "";
@@ -255,6 +275,7 @@ internal static class GuestSupervisor
         }
         catch (Exception exception)
         {
+            if (!serial.HelloWritten) SerialChannel.BootstrapFailure(exception);
             result.Status = "failed";
             result.ErrorType = exception.GetType().Name;
             result.FailureCode = exception is GuestFailure failure ? failure.Code :
@@ -789,20 +810,41 @@ internal sealed class SerialChannel : IDisposable
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool WriteFile(SafeFileHandle file, byte[] bytes, uint count, out uint written, IntPtr overlapped);
 
-    internal SerialChannel()
+    internal SerialChannel() : this(@"\\.\COM1", 5000) { }
+
+    private SerialChannel(string port, uint writeTimeout)
     {
-        handle = CreateFile(@"\\.\COM1", 0x40000000, 0, IntPtr.Zero, 3, 0, IntPtr.Zero);
+        handle = CreateFile(port, 0x40000000, 0, IntPtr.Zero, 3, 0, IntPtr.Zero);
         try
         {
             if (handle.IsInvalid) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
             Dcb state = new() { Length = checked((uint)Marshal.SizeOf<Dcb>()) };
             if (!GetCommState(handle, ref state)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
             state.Baud = 115200; state.Flags = 1; state.ByteSize = 8; state.Parity = 0; state.StopBits = 0;
-            CommTimeouts timeout = new() { WriteConstant = 5000 };
+            CommTimeouts timeout = new() { WriteConstant = writeTimeout };
             if (!SetCommState(handle, ref state) || !SetCommTimeouts(handle, ref timeout))
                 throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
         }
         catch { handle.Dispose(); throw; }
+    }
+
+    internal static void Bootstrap(int stage, int code)
+    {
+        // COM2 is diagnostic only. Its failures cannot change the original
+        // COM1 handshake, process outcome, or any acceptance/cleanup gate.
+        try
+        {
+            using SerialChannel diagnostic = new(@"\\.\COM2", 250);
+            diagnostic.Write(Encoding.ASCII.GetBytes(
+                FormattableString.Invariant($"GUEST_BOOTSTRAP_V1 {stage} {code}\n")));
+        }
+        catch { }
+    }
+
+    internal static void BootstrapFailure(Exception error)
+    {
+        Bootstrap(17, error.HResult);
+        if (error is System.ComponentModel.Win32Exception native) Bootstrap(18, native.NativeErrorCode);
     }
 
     internal void Hello(string nonce)

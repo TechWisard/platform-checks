@@ -11,6 +11,7 @@ internal sealed class WitnessInputEvidence : IDisposable
 {
     private readonly string output;
     private readonly InputObservation state;
+    private readonly KeyUpDiagnosticTrace? keyUpTrace;
     private readonly Form form;
     private readonly System.Windows.Forms.Timer timer = new() { Interval = 250 };
     private readonly Stopwatch sinceWrite = Stopwatch.StartNew();
@@ -25,6 +26,7 @@ internal sealed class WitnessInputEvidence : IDisposable
         output = Path.Combine(Path.GetDirectoryName(identityOutput)!, "witness-input.json");
         if (File.Exists(output)) throw new ExperimentFailure("input_report_already_exists");
         state = new InputObservation { Nonce = nonce, SessionId = session, IdentityDigest = digest, CharacterLimit = sendKeys ? 16 : 8 };
+        if (sendKeys) keyUpTrace = KeyUpDiagnosticTrace.TryCreate();
         form.Shown += OnShown;
         timer.Tick += OnTick;
     }
@@ -78,7 +80,11 @@ internal sealed class WitnessInputEvidence : IDisposable
         }
         else if (InputNative.ButtonMessage(id)) state.UnexpectedButtons++;
         else if (id is 0x0100 or 0x0104) state.KeyDownCount++;
-        else if (id is 0x0101 or 0x0105) state.KeyUpCount++;
+        else if (id is 0x0101 or 0x0105)
+        {
+            state.KeyUpCount++;
+            keyUpTrace?.Observe(id, state.KeyUpCount, message.WParam.ToInt64(), message.LParam.ToInt64());
+        }
         else if (id is 0x0102 or 0x0109) // WM_CHAR or actual WM_UNICHAR.
         {
             state.CharacterCount++;
@@ -164,6 +170,7 @@ internal sealed class WitnessInputEvidence : IDisposable
         else state.WindowVisible = false;
         state.Sequence++;
         writes++;
+        state.KeyUpDiagnostics = keyUpTrace?.Snapshot();
         string temporary = output + "." + Guid.NewGuid().ToString("N") + ".tmp";
         try
         {

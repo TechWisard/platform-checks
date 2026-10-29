@@ -31,6 +31,7 @@ import zipfile
 from pathlib import Path
 
 import failure_diagnostics
+import bootstrap_diagnostics
 
 HERE = Path(__file__).resolve().parent
 GIB = 1024**3
@@ -363,6 +364,13 @@ def unattend(account: str, password: str, machine: str, image_index: int, owner_
         require(len(policy_command) <= 259, "specialize_command_too_long")
         add(entry, "Path", policy_command)
         add(entry, "WillReboot", "Never")
+    marker = add(synchronous, "RunSynchronousCommand", **{"{" + WCM + "}action": "add"})
+    add(marker, "Order", 3)
+    add(marker, "Description", "Observe owned fixture specialize boundary")
+    marker_command = bootstrap_diagnostics.specialize_command()
+    require(len(marker_command) <= 259, "specialize_marker_command_too_long")
+    add(marker, "Path", marker_command)
+    add(marker, "WillReboot", "Never")
     oobe = add(root, "settings", **{"pass": "oobeSystem"})
     locale = component(oobe, "Microsoft-Windows-International-Core")
     for key, value in {"InputLocale": "0409:00000409", "SystemLocale": "en-US", "UILanguage": "en-US", "UserLocale": "en-US"}.items():
@@ -378,11 +386,7 @@ def unattend(account: str, password: str, machine: str, image_index: int, owner_
     # One short ordinary first-logon command. Start-Process inherits the current
     # fresh administrator A token; no RunAs/SYSTEM/ExecutionPolicy alteration.
     # It returns immediately so Windows can finish displaying the desktop.
-    bootstrap = ("$ErrorActionPreference='Stop'; $v=@(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=5'|"
-                 "Where-Object VolumeName -eq 'SESSIONPAYLOAD'); if($v.Count -ne 1){exit 71}; "
-                 "$r=$v[0].DeviceID+'\\'; if(!(Test-Path ($r+'guest-contract.tag'))){exit 72}; "
-                 "Start-Process -FilePath ($r+'dotnet\\dotnet.exe') -ArgumentList @(($r+'GuestSupervisor.dll'),'--media-root',$r) "
-                 "-WindowStyle Hidden")
+    bootstrap = bootstrap_diagnostics.first_logon_script()
     # FirstLogonCommands.CommandLine is limited to 1024 characters. Ordinary
     # -Command avoids UTF-16/Base64 expansion. ElementTree escapes XML syntax;
     # all fixed PowerShell literals use single quotes and contain no secrets.
@@ -907,6 +911,7 @@ def execute(args) -> int:
     qemu = tpm = None
     qmp = None
     reader = None
+    bootstrap_capture = None
     logs = []
     outcome = 1
     cleanup = False
@@ -957,6 +962,7 @@ def execute(args) -> int:
             require(tpm.poll() is None and time.monotonic() - start < 15, "owned_tpm_socket_unavailable")
             time.sleep(0.1)
         serial_path = work / "serial.out"
+        bootstrap_capture = bootstrap_diagnostics.BootstrapCapture()
         qmp_path = work / "qmp.sock"
         qemu_log = (work / "qemu.log").open("wb"); logs.append(qemu_log)
         arguments = ["qemu-system-x86_64", "-no-user-config", "-nodefaults", "-machine", "q35,smm=on,dump-guest-core=off",
@@ -973,7 +979,10 @@ def execute(args) -> int:
                      "-netdev", "user,id=nat", "-device", "e1000e,netdev=nat", "-rtc", "base=utc",
                      "-chardev", f"socket,id=chrtpm,path={tpm_socket}", "-tpmdev", "emulator,id=tpm0,chardev=chrtpm",
                      "-device", "tpm-crb,tpmdev=tpm0", "-chardev", f"file,id=serial0,path={serial_path}",
-                     "-device", "isa-serial,chardev=serial0,index=0", "-qmp", f"unix:{qmp_path},server=on,wait=off", "-S"]
+                     "-device", "isa-serial,chardev=serial0,index=0",
+                     "-chardev", "ringbuf,id=bootstrap0,size=4096",
+                     "-device", "isa-serial,chardev=bootstrap0,index=1",
+                     "-qmp", f"unix:{qmp_path},server=on,wait=off", "-S"]
         require(arguments.count("kvm") == 1 and "tcg" not in " ".join(arguments) and "hostfwd" not in " ".join(arguments), "qemu_accel_or_port_invariant")
         qemu = subprocess.Popen(arguments, stdin=subprocess.DEVNULL, stdout=qemu_log, stderr=qemu_log)
         start = time.monotonic()
@@ -1077,6 +1086,7 @@ def execute(args) -> int:
         outcome = 0 if setup_detached and successful_result(value) else 1
     finally:
         cleanup_errors = []
+        bootstrap_diagnostics.emit_terminal_summary(bootstrap_capture, qmp, emit)
         if reader is not None:
             emit("serial_startup_observation", **reader.startup_observation())
         if qmp is not None:

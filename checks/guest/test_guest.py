@@ -558,9 +558,14 @@ class HostContractTests(unittest.TestCase):
         locale = oobe.find("u:component[@name='Microsoft-Windows-International-Core']", ns)
         self.assertEqual(len(locale), 4)
         policies = root.findall("u:settings[@pass='specialize']/u:component[@name='Microsoft-Windows-Deployment']/u:RunSynchronous/u:RunSynchronousCommand/u:Path", ns)
-        self.assertEqual(len(policies), 2)
+        self.assertEqual(len(policies), 3)
+        self.assertTrue(all(len(item.text) <= 259 for item in policies))
         self.assertTrue(any("EnableFirstLogonAnimation /t REG_DWORD /d 0" in item.text for item in policies))
         self.assertTrue(any("DisablePrivacyExperience /t REG_DWORD /d 1" in item.text for item in policies))
+        marker = [item.text for item in policies if "GUEST_BOOTSTRAP_V1" in item.text]
+        self.assertEqual(len(marker), 1)
+        self.assertIn("COM2", marker[0])
+        self.assertTrue(marker[0].endswith('exit 0"'))
 
     def test_bounded_command_normal_and_single_line_overflow(self):
         normal = guest.command([sys.executable, "-c", "print('local-test')"], guest.Deadline(), 5)

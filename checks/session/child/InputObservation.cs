@@ -44,6 +44,10 @@ internal sealed class InputObservation
     public int UnexpectedButtons { get; set; }
     public int KeyDownCount { get; set; }
     public int KeyUpCount { get; set; }
+    // Optional diagnostics remain untyped at the receipt boundary: malformed
+    // metadata cannot become a new input acceptance/parsing condition.
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    public JsonElement? KeyUpDiagnostics { get; set; }
     public int CharacterCount { get; set; }
     public int CharacterLimit { get; set; } = 8;
     public int UnexpectedCharacters { get; set; }

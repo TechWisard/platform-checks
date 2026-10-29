@@ -25,6 +25,8 @@ internal static class BackgroundKeyboardExperiment
         Stopwatch elapsed = Stopwatch.StartNew();
         string path = Path.Combine(Path.GetDirectoryName(identityFile)!, "witness-input.json");
         InputObservation? latest = null;
+        string? expectedReceipt = null;
+        long? baselineSequence = null;
         long sequence = 0;
         bool complete = false;
         bool decoyDestroyed = false;
@@ -97,11 +99,13 @@ internal static class BackgroundKeyboardExperiment
             InputObservation before = Read();
             InputObservation baseline = await Wait(r => r.Sequence > before.Sequence);
             RequireBaseline(baseline);
+            baselineSequence = baseline.Sequence;
             string challenge = string.Create(8, 0, (text, _) =>
             {
                 for (int i = 0; i < text.Length; i++) text[i] = (char)('0' + RandomNumberGenerator.GetInt32(10));
             });
             string expected = baseline.ReceivedHex + challenge;
+            expectedReceipt = expected;
             evidence.Event("sendkeys_background_baseline", new { baseline_sequence = baseline.Sequence,
                 baseline_characters = baseline.CharacterCount, baseline_keys_down = baseline.KeyDownCount,
                 baseline_keys_up = baseline.KeyUpCount, expected_new_characters = 8,
@@ -137,6 +141,12 @@ internal static class BackgroundKeyboardExperiment
                 own_parent_and_decoy_ui_keyboard_messages = 0,
                 observation_scope = "own_ui_queue_plus_foreground_and_focus_events_on_parent_desktop",
                 physical_keyboard_isolation = false, background_mouse_tested = false });
+        }
+        catch
+        {
+            try { SendKeysFailureDiagnostics.Record(evidence.Event, latest, expectedReceipt, baselineSequence, sink?.Calls ?? 0); }
+            catch { } // Also protect delegate creation; rethrow the original failure.
+            throw;
         }
         finally
         {

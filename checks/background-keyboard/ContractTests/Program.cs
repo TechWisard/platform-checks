@@ -272,4 +272,146 @@ foreach(long value in new[]{0L,9L,10L}){object report=Make(16,value);Reject(fina
 foreach(string name in new[]{"LeftDownCount","LeftUpCount"}){object report=Make(16,15);Set(report,name,2);Reject(final,report,initial,"1234567801928374");}
 {object report=Make(16,15);Set(report,"MonitorCount",2);Reject(final,report,initial,"1234567801928374");}
 {object report=Make(16,15);Set(report,"PhysicalEqualsLogical",false);Reject(final,report,initial,"1234567801928374");}
+
+// Execute the actual optional witness diagnostics without a window or Windows API.
+Type keyTraceType = fixture.GetType("SessionContractExperiment.KeyUpDiagnosticTrace", true)!;
+Type failureDiagnostics = fixture.GetType("SessionContractExperiment.SendKeysFailureDiagnostics", true)!;
+MethodInfo createKeyTrace = keyTraceType.GetMethod("TryCreate", Private)!;
+MethodInfo observeKeyUp = keyTraceType.GetMethod("Observe", BindingFlags.Instance | BindingFlags.NonPublic)!;
+MethodInfo snapshotKeyUp = keyTraceType.GetMethod("Snapshot", BindingFlags.Instance | BindingFlags.NonPublic)!;
+MethodInfo recordFailure = failureDiagnostics.GetMethod("Record", Private)!;
+JsonSerializerOptions diagnosticJson = new() { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower };
+object NewKeyTrace() => Invoke(createKeyTrace)!;
+void ObserveKey(object trace, int message, int ordinal, long key, long packed) =>
+    observeKeyUp.Invoke(trace, new object[] { message, ordinal, key, packed });
+JsonElement KeySnapshot(object trace) => (JsonElement)snapshotKeyUp.Invoke(trace, null)!;
+JsonElement FailureSnapshot(object? report, string? expected, long? before, int calls)
+{
+    int records = 0; JsonElement result = default;
+    Action<string, object?> capture = (stage, details) =>
+    {
+        records++; Need(stage == "sendkeys_failure_diagnostic", "failure diagnostic event name");
+        result = JsonSerializer.SerializeToElement(details, diagnosticJson);
+    };
+    Invoke(recordFailure, capture, report, expected, before, calls);
+    Need(records == 1, "one best-effort diagnostic record");
+    return result;
+}
+{
+    object trace = NewKeyTrace();
+    ObserveKey(trace, 0x100, 1, 0x31, 0xC0020001L);
+    Need(KeySnapshot(trace).GetProperty("stored").GetInt32() == 0, "non-keyup ignored");
+    for (int digit = 0; digit < 10; digit++)
+        ObserveKey(trace, 0x101, digit + 1, 0x30 + digit, 0xC0000001L | ((digit + 2L) << 16));
+    foreach (JsonElement item in KeySnapshot(trace).GetProperty("entries").EnumerateArray())
+    {
+        Need(item.GetProperty("virtual_key").ValueKind == JsonValueKind.Null &&
+            item.GetProperty("scan_code").ValueKind == JsonValueKind.Null, "digit VK and scan redacted at source");
+        Need(item.GetProperty("key_category").GetInt32() == 1 && item.GetProperty("repeat_count").GetInt32() == 1 &&
+            item.GetProperty("previous_state").GetBoolean() && item.GetProperty("transition").GetBoolean(), "digit flags only");
+    }
+    ObserveKey(trace, 0x105, 11, 0x12, 0xFF38FFFFL);
+    JsonElement modifier = KeySnapshot(trace).GetProperty("entries")[10];
+    Need(modifier.GetProperty("virtual_key").GetInt32() == 0x12 && modifier.GetProperty("scan_code").GetInt32() == 0x38,
+        "allowlisted modifier codes preserved");
+    Need(modifier.GetProperty("system_message").GetBoolean() && modifier.GetProperty("repeat_count").GetInt32() == 65535 &&
+        modifier.GetProperty("extended").GetBoolean() && modifier.GetProperty("reserved_bits").GetInt32() == 15 &&
+        modifier.GetProperty("context").GetBoolean() && modifier.GetProperty("previous_state").GetBoolean() &&
+        modifier.GetProperty("transition").GetBoolean(), "exact bounded keyup flag projection");
+    for (int i = 11; i < 1000; i++) ObserveKey(trace, 0x101, i + 1, 0x41, 0xC01E0001L);
+    JsonElement full = KeySnapshot(trace);
+    Need(full.GetProperty("stored").GetInt32() == 32 && full.GetProperty("entries").GetArrayLength() == 32 &&
+        full.GetProperty("dropped").GetInt32() == 968, "fixed capacity with visible dropped count");
+    Need(System.Text.Encoding.UTF8.GetByteCount(full.GetRawText()) < 16000, "bounded full JSON size");
+    keyTraceType.GetField("dropped", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(trace, int.MaxValue - 1);
+    ObserveKey(trace, 0x101, 1001, 0x41, 0); ObserveKey(trace, 0x101, 1002, 0x41, 0);
+    Need(KeySnapshot(trace).GetProperty("dropped").GetInt32() == int.MaxValue, "dropped count saturates");
+    foreach (JsonElement item in full.GetProperty("entries").EnumerateArray().Skip(11))
+        Need(item.GetProperty("virtual_key").ValueKind == JsonValueKind.Null &&
+            item.GetProperty("scan_code").ValueKind == JsonValueKind.Null, "unknown and printable codes redacted");
+}
+foreach (int key in new[] { 0x10, 0x11, 0x12, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0x14, 0x90, 0x91 })
+{
+    object trace = NewKeyTrace(); ObserveKey(trace, 0x101, 1, key, 0xC02A0001L);
+    Need(KeySnapshot(trace).GetProperty("entries")[0].GetProperty("virtual_key").GetInt32() == key,
+        "explicit modifier or lock allowlist");
+}
+{
+    object trace = NewKeyTrace(); ObserveKey(trace, 0x101, 1, 0x10, 0xC0020001L);
+    JsonElement item = KeySnapshot(trace).GetProperty("entries")[0];
+    Need(item.GetProperty("virtual_key").GetInt32() == 0x10 && item.GetProperty("scan_code").ValueKind == JsonValueKind.Null,
+        "modifier VK never authorizes a printable scan at the witness");
+    object report = Make(16, 15);
+    Set(report, "KeyUpDiagnostics", JsonDocument.Parse("""{"stored":1,"dropped":0,"entries":[{"ordinal":1,"key_category":2,"virtual_key":16,"scan_code":2}]}""").RootElement.Clone());
+    JsonElement projected = FailureSnapshot(report, "1234567801928374", 10L, 1).GetProperty("key_up_entries")[0];
+    Need(projected.GetProperty("virtual_key").GetInt32() == 0x10 && projected.GetProperty("scan_code").ValueKind == JsonValueKind.Null,
+        "modifier VK never authorizes a printable scan at the parent");
+}
+foreach (long key in new[] { -1L, 0x20L, 0x41L, 0x60L, 0x69L, 0xFFL, 0x100L, long.MinValue, long.MaxValue })
+{
+    object trace = NewKeyTrace(); ObserveKey(trace, 0x101, 1, key, 0xC01E0001L);
+    JsonElement item = KeySnapshot(trace).GetProperty("entries")[0];
+    Need(item.GetProperty("virtual_key").ValueKind == JsonValueKind.Null && item.GetProperty("scan_code").ValueKind == JsonValueKind.Null,
+        "numpad and all other non-allowlisted values redacted");
+}
+{
+    JsonElement equal = FailureSnapshot(complete, "1234567801928374", 10L, 1);
+    Need(equal.GetProperty("expected_text_comparison_performed").GetBoolean() &&
+        equal.GetProperty("expected_text_equals").GetBoolean() && !equal.GetProperty("comparison_is_acceptance").GetBoolean(),
+        "fresh exact equality is diagnostic only");
+    JsonElement different = FailureSnapshot(complete, "9999999999999999", 10L, 1);
+    Need(!different.GetProperty("expected_text_equals").GetBoolean() &&
+        !different.GetRawText().Contains("9999999999999999") && !different.GetRawText().Contains("1234567801928374"),
+        "only equality boolean, no expected or received text");
+    foreach (var sample in new (object? Report, string? Expected, long? Before, int Calls)[] {
+        (null,"1234567801928374",10L,1), (complete,null,10L,1), (complete,"1234567801928374",null,1),
+        (complete,"1234567801928374",15L,1), (complete,"1234567801928374",16L,1),
+        (complete,"1234567801928374",10L,0), (complete,"1234567801928374",10L,2) })
+    {
+        JsonElement result = FailureSnapshot(sample.Report, sample.Expected, sample.Before, sample.Calls);
+        Need(!result.GetProperty("expected_text_comparison_performed").GetBoolean() &&
+            result.GetProperty("expected_text_equals").ValueKind == JsonValueKind.Null, "old or unavailable receipt is not a mismatch");
+    }
+    Invoke(recordFailure, (Action<string, object?>)((_, _) => throw new Exception("synthetic logger failure")), complete,
+        "1234567801928374", 10L, 1);
+    Need(true, "logger failure cannot replace original experiment failure");
+}
+{
+    Type inputReport = fixture.GetType("SessionContractExperiment.InputReport", true)!;
+    MethodInfo readReport = inputReport.GetMethod("Read", Private)!;
+    object receipt = Make(16, 15);
+    Set(receipt, "Nonce", "local-test-binding"); Set(receipt, "SessionId", 1U); Set(receipt, "IdentityDigest", "local-test-digest");
+    string normalJson = JsonSerializer.Serialize(receipt, reportType, diagnosticJson);
+    Need(!normalJson.Contains("key_up_diagnostics"), "ordinary absent diagnostics do not change JSON shape");
+    string path = Path.GetTempFileName();
+    try
+    {
+        foreach (string malformed in new[] { "42", "\"untrusted-text-not-to-log\"", "[]", "{}",
+            "{\"stored\":1,\"dropped\":0,\"entries\":[{\"ordinal\":\"untrusted-text-not-to-log\"}]}",
+            "{\"stored\":1,\"dropped\":0,\"entries\":[{\"ordinal\":1,\"key_category\":2,\"virtual_key\":49,\"scan_code\":2}]}" })
+        {
+            Set(receipt, "KeyUpDiagnostics", JsonDocument.Parse(malformed).RootElement.Clone());
+            File.WriteAllText(path, JsonSerializer.Serialize(receipt, reportType, diagnosticJson));
+            object parsed = Invoke(readReport, path, "local-test-binding", 1U, "local-test-digest")!;
+            Invoke(final, parsed, initial, "1234567801928374");
+            Need(true, "malformed optional metadata is never an acceptance or parsing gate");
+            JsonElement result = FailureSnapshot(parsed, "1234567801928374", 10L, 1);
+            Need(!result.GetRawText().Contains("untrusted-text-not-to-log"), "malformed strings are not logged");
+            foreach (JsonElement entry in result.GetProperty("key_up_entries").EnumerateArray())
+                Need(entry.GetProperty("virtual_key").ValueKind == JsonValueKind.Null &&
+                    entry.GetProperty("scan_code").ValueKind == JsonValueKind.Null, "untrusted category cannot unredact a digit");
+        }
+        string entries = string.Join(",", Enumerable.Repeat("{\"ordinal\":1,\"key_category\":3,\"virtual_key\":65,\"scan_code\":30}", 100));
+        Set(receipt, "KeyUpDiagnostics", JsonDocument.Parse("{\"stored\":100,\"dropped\":0,\"entries\":[" + entries + "]}").RootElement.Clone());
+        JsonElement bounded = FailureSnapshot(receipt, "1234567801928374", 10L, 1);
+        Need(bounded.GetProperty("key_up_entries").GetArrayLength() == 32 &&
+            bounded.GetProperty("key_up_metadata_truncated").GetBoolean() && bounded.GetProperty("key_up_metadata_malformed").GetBoolean(),
+            "failure projection bounds untrusted arrays too");
+        Need(System.Text.Encoding.UTF8.GetByteCount(bounded.GetRawText()) < 16000, "public failure JSON remains bounded");
+        // Metadata must not soften the existing extra-release rejection.
+        Set(receipt, "KeyUpCount", 17);
+        Reject(final, receipt, initial, "1234567801928374");
+    }
+    finally { File.Delete(path); }
+}
 Console.WriteLine(JsonSerializer.Serialize(new{schema="sendkeys-local-contracts/v1",passed=true,checks=tests,actual_compiled_harness=true,windows_api_executed=false}));
