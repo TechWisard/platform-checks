@@ -753,6 +753,7 @@ internal static class GuestSupervisor
             }
         }
         result["failures"] = failures;
+        result["connection"] = SessionConnectionEvidence.Project(value);
         return result;
     }
 }

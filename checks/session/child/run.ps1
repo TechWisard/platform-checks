@@ -5,6 +5,7 @@ param(
     [switch] $AlternateTestAccount,
     [switch] $TestDirectInput,
     [switch] $TestWindowInput,
+    [switch] $TestSendKeys,
     [switch] $NativeOleHost,
     [string] $ChildSearchHelper,
     [ValidateRange(15, 300)]
@@ -15,6 +16,10 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 if ($TestDirectInput -and $TestWindowInput) {
     throw 'TestDirectInput and TestWindowInput are mutually exclusive.'
+}
+
+if ($TestSendKeys -and (-not $TestWindowInput -or $NativeOleHost)) {
+    throw 'TestSendKeys requires the managed TestWindowInput path.'
 }
 
 if ($NativeOleHost -and -not $TestWindowInput) {
@@ -45,16 +50,17 @@ function Test-ChildRenderEligibility {
 }
 
 function Test-WindowInputReport {
-    param([string] $Json, [bool] $ChildPreparationRequested, [bool] $NativeHostRequested = $false)
+    param([string] $Json, [bool] $ChildPreparationRequested, [bool] $NativeHostRequested = $false, [bool] $SendKeysRequested = $false)
     try { $report = ConvertFrom-Json -InputObject $Json -NoEnumerate }
     catch { return $false }
     if ($null -eq $report -or $report -isnot [pscustomobject]) { return $false }
+    $expectedStatus = if ($SendKeysRequested) { 'different_account_child_frame_window_and_background_keys_verified' } else { 'different_account_child_frame_and_window_input_verified' }
     $schema = $report.PSObject.Properties['schema']
     $status = $report.PSObject.Properties['status']
     if ($null -eq $schema -or $schema.Value -isnot [string] -or
         $schema.Value -cne 'session-contract-experiment/v1' -or
         $null -eq $status -or $status.Value -isnot [string] -or
-        $status.Value -cne 'different_account_child_frame_and_window_input_verified') { return $false }
+        $status.Value -cne $expectedStatus) { return $false }
     $required = @('window_input_requested', 'window_input_verified', 'window_input_cleanup_verified',
         'window_child_received_expected_text', 'window_child_received_expected_button_sequence',
         'frame_challenge_verified', 'different_account_verified', 'child_matches_created_account_sid',
@@ -69,6 +75,11 @@ function Test-WindowInputReport {
         if (-not (Test-ExactBoolean $report $name $false)) { return $false }
     }
     if (-not (Test-ChildRenderEligibility $report $ChildPreparationRequested)) { return $false }
+    if ($SendKeysRequested) {
+        foreach ($name in @('send_keys_requested', 'send_keys_verified', 'send_keys_cleanup_verified')) {
+            if (-not (Test-ExactBoolean $report $name $true)) { return $false }
+        }
+    }
     if ($NativeHostRequested) {
         foreach ($name in @('native_ole_host_requested', 'native_host_component_verified', 'native_host_cleanup_verified')) {
             if (-not (Test-ExactBoolean $report $name $true)) { return $false }
@@ -94,6 +105,15 @@ if (Test-Path -LiteralPath $evidencePath) {
 & dotnet build $project --configuration Release --output $buildDirectory --nologo -p:ContinuousIntegrationBuild=true
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+if ($TestSendKeys) {
+    $contracts = Join-Path $PSScriptRoot '..\..\background-keyboard\ContractTests\SendKeysTests.csproj'
+    $contractOutput = Join-Path $results 'keyboard-contracts'
+    & dotnet build $contracts --configuration Release --output $contractOutput --nologo -p:ContinuousIntegrationBuild=true
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    & dotnet (Join-Path $contractOutput 'SendKeysTests.dll') (Join-Path $buildDirectory 'SessionContractExperiment.dll')
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
+
 $program = Join-Path $buildDirectory 'SessionContractExperiment.exe'
 if ($NativeOleHost) {
     & (Join-Path $PSScriptRoot '..\native-host\build.ps1') -HarnessExecutable $program
@@ -104,6 +124,7 @@ if ($AllowEnableChildSessions) { $programArgs += '--allow-enable-child-sessions'
 if ($AlternateTestAccount) { $programArgs += '--alternate-test-account' }
 if ($TestDirectInput) { $programArgs += '--test-direct-input' }
 if ($TestWindowInput) { $programArgs += '--test-window-input' }
+if ($TestSendKeys) { $programArgs += '--test-sendkeys' }
 if ($NativeOleHost) { $programArgs += '--native-ole-host' }
 if ($ChildSearchHelper) {
     if (-not $AlternateTestAccount) { throw 'Child Search preparation requires the owned alternate account.' }
@@ -161,7 +182,7 @@ if (Test-Path -LiteralPath $evidencePath) {
     }
     if ($TestWindowInput) {
         $windowContractVerified = $result -eq 0 -and
-            (Test-WindowInputReport -Json $evidenceText -ChildPreparationRequested ([bool]$ChildSearchHelper) -NativeHostRequested ([bool]$NativeOleHost))
+            (Test-WindowInputReport -Json $evidenceText -ChildPreparationRequested ([bool]$ChildSearchHelper) -NativeHostRequested ([bool]$NativeOleHost) -SendKeysRequested ([bool]$TestSendKeys))
         'window_input_runner_contract_verified=' + $windowContractVerified.ToString().ToLowerInvariant()
         # A report cannot override a nonzero process result. A zero exit alone
         # cannot replace typed frame/input/account/cleanup evidence.

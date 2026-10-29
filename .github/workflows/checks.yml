@@ -19,6 +19,8 @@ on:
       - '.github/workflows/native-events.yml'
       - 'checks/input-contract/**'
       - '.github/workflows/native-input-contract.yml'
+      - 'checks/background-keyboard/**'
+      - '.github/workflows/background-keyboard.yml'
       - 'checks/native-host-runtime/**'
       - '.github/workflows/native-host-runtime.yml'
       - 'checks/runtime/**'

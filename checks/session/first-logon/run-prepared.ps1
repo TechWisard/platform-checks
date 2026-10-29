@@ -5,10 +5,12 @@ param(
     [Parameter(Mandatory = $true)][string] $ResultsDirectory,
     [switch] $AllowDisposablePrivacyPreparation,
     [switch] $NativeOleHost,
+    [switch] $TestSendKeys,
     [ValidateRange(15, 300)][int] $TimeoutSeconds = 120
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+if ($TestSendKeys -and $NativeOleHost) { throw 'TestSendKeys requires the managed fixture.' }
 
 function Read-PolicySnapshot {
     param([Microsoft.Win32.RegistryKey] $Base, [object] $Specification)
@@ -364,6 +366,7 @@ try {
         '-File', $childRunner, '-ResultsDirectory', [System.IO.Path]::GetFullPath($ResultsDirectory),
         '-AllowEnableChildSessions', '-AlternateTestAccount', '-TestWindowInput', '-TimeoutSeconds', $TimeoutSeconds.ToString())
     if ($NativeOleHost) { $childArguments += '-NativeOleHost' }
+    if ($TestSendKeys) { $childArguments += '-TestSendKeys' }
     if ($ChildSearchPreparationProgram) {
         $childArguments += @('-ChildSearchHelper', [System.IO.Path]::GetFullPath($ChildSearchPreparationProgram))
     }

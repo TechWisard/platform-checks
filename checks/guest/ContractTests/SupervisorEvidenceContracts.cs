@@ -73,6 +73,8 @@ internal static class SupervisorEvidenceContracts
         JsonObject capped = Failed(); capped["events"] = many;
         Check(Project(capped)["failures"]!.AsArray().Count == 16);
 
+        SessionConnectionContracts.Run(Project, Check);
+
         string fixture = Path.Combine(Path.GetTempPath(), "guest-file-contract-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(fixture);
         JsonObject? lockedObservation = null;

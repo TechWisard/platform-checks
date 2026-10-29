@@ -19,12 +19,12 @@ internal sealed class WitnessInputEvidence : IDisposable
     private bool disposed;
     private int writes;
 
-    internal WitnessInputEvidence(Form form, string identityOutput, string nonce, uint session, string digest)
+    internal WitnessInputEvidence(Form form, string identityOutput, string nonce, uint session, string digest, bool sendKeys = false)
     {
         this.form = form;
         output = Path.Combine(Path.GetDirectoryName(identityOutput)!, "witness-input.json");
         if (File.Exists(output)) throw new ExperimentFailure("input_report_already_exists");
-        state = new InputObservation { Nonce = nonce, SessionId = session, IdentityDigest = digest };
+        state = new InputObservation { Nonce = nonce, SessionId = session, IdentityDigest = digest, CharacterLimit = sendKeys ? 16 : 8 };
         form.Shown += OnShown;
         timer.Tick += OnTick;
     }
@@ -86,7 +86,7 @@ internal sealed class WitnessInputEvidence : IDisposable
             int repeat = unchecked((ushort)message.LParam.ToInt64());
             if (repeat != 1) state.RepeatedCharacters++;
             if (value < 0 || value > 0x7F || !InputReport.IsAsciiHex((char)value)) state.UnexpectedCharacters++;
-            else if (state.ReceivedHex.Length >= 8) state.OverflowCharacters++;
+            else if (state.ReceivedHex.Length >= state.CharacterLimit) state.OverflowCharacters++;
             else state.ReceivedHex += (char)value;
             // Consume a handled WM_UNICHAR: DefWindowProc would post WM_CHAR,
             // incorrectly counting the same real character twice. These are

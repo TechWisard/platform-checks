@@ -45,6 +45,7 @@ internal sealed class InputObservation
     public int KeyDownCount { get; set; }
     public int KeyUpCount { get; set; }
     public int CharacterCount { get; set; }
+    public int CharacterLimit { get; set; } = 8;
     public int UnexpectedCharacters { get; set; }
     public int RepeatedCharacters { get; set; }
     public int OverflowCharacters { get; set; }
@@ -74,7 +75,8 @@ internal static class InputReport
         if (observation.Schema != "witness-input/v1" || observation.Nonce != nonce ||
             observation.SessionId != session || observation.IdentityDigest != digest || observation.Sequence <= 0)
             throw new ExperimentFailure("input_report_binding_invalid");
-        if (observation.ReceivedHex.Length > 8 || observation.ReceivedHex.Any(c => !IsAsciiHex(c)))
+        if (observation.CharacterLimit is not 8 and not 16 || observation.ReceivedHex.Length > observation.CharacterLimit ||
+            observation.ReceivedHex.Any(c => !IsAsciiHex(c)))
             throw new ExperimentFailure("input_report_character_format_invalid");
         return observation;
     }

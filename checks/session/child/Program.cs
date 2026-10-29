@@ -321,6 +321,9 @@ internal sealed class Evidence
     public bool ChildSearchForegroundUnresolved { get; set; }
     public bool ChildSearchPreparationCleanupVerified { get; set; } = true;
     public bool FrameChallengeVerified { get; set; }
+    public bool SendKeysRequested { get; set; }
+    public bool SendKeysVerified { get; set; }
+    public bool? SendKeysCleanupVerified { get; set; }
     public bool WindowInputRequested { get; set; }
     public bool WindowInputVerified { get; set; }
     public bool? WindowInputCleanupVerified { get; set; }
@@ -388,6 +391,7 @@ internal sealed class ExperimentForm : Form
     private readonly bool alternateTestAccount;
     private readonly bool testDirectInput;
     private readonly bool testWindowInput;
+    private readonly bool testSendKeys;
     private readonly string? childSearchHelper;
     private readonly TimeSpan timeout;
     private readonly Control host;
@@ -415,14 +419,16 @@ internal sealed class ExperimentForm : Form
     private bool ownTask;
     private bool closing;
     private bool preconditions;
+    private DateTimeOffset? connectionStartedUtc;
     internal int ExitCode { get; private set; } = 1;
 
-    internal ExperimentForm(Evidence evidence, bool allowEnable, TimeSpan timeout, bool alternateTestAccount, bool testDirectInput, bool testWindowInput, string? childSearchHelper, bool nativeOleHost)
+    internal ExperimentForm(Evidence evidence, bool allowEnable, TimeSpan timeout, bool alternateTestAccount, bool testDirectInput, bool testWindowInput, bool testSendKeys, string? childSearchHelper, bool nativeOleHost)
     {
         this.evidence = evidence; this.allowEnable = allowEnable; this.timeout = timeout;
         this.alternateTestAccount = alternateTestAccount;
         this.testDirectInput = testDirectInput;
         this.testWindowInput = testWindowInput;
+        this.testSendKeys = testSendKeys;
         this.childSearchHelper = childSearchHelper;
         Text = "Session contract experiment — local child session";
         OwnWindowPresentation.Configure(this);
@@ -531,7 +537,10 @@ internal sealed class ExperimentForm : Form
                 evidence.TestCredentialsApplied = true;
                 evidence.Event("owned_test_credentials_applied");
             }
+            try { evidence.Event("connection_preconnect_snapshot", ConnectionDiagnostics.Snapshot()); }
+            catch (Exception diagnosticError) { evidence.Error("connection_snapshot_unavailable", diagnosticError); }
             Stopwatch deadline = Stopwatch.StartNew();
+            connectionStartedUtc = DateTimeOffset.UtcNow;
             evidence.ConnectCalled = true;
             evidence.Event("connect_invocation_started");
             connectionEvents.Arm();
@@ -701,6 +710,14 @@ internal sealed class ExperimentForm : Form
                 nativeHost?.VerifySuccessfulWindowPath(uiMessages.KeyDown, uiMessages.KeyUp);
                 evidence.NativeHostComponentVerified = nativeHost is not null;
                 evidence.Status = "different_account_child_frame_and_window_input_verified";
+                if (testSendKeys)
+                {
+                    await BackgroundKeyboardExperiment.Run(this, host, control, evidence, witnessFile, nonce,
+                        evidence.ChildSessionId.Value, Program.IdentityDigest(nonce, expectedWitnessSid),
+                        () => { connectionEvents.ThrowIfConnectionFailed(); VerifyWitnessOwnership(evidence.ChildSessionId.Value); },
+                        timeout - deadline.Elapsed);
+                    evidence.Status = "different_account_child_frame_window_and_background_keys_verified";
+                }
             }
             if (testDirectInput)
             {
@@ -715,6 +732,11 @@ internal sealed class ExperimentForm : Form
         {
             evidence.Status = "failed";
             evidence.Error("experiment_failed", ex);
+            if (connectionStartedUtc is DateTimeOffset started)
+            {
+                try { evidence.Event("connection_failure_events", ConnectionDiagnostics.RecentEvents(started)); }
+                catch (Exception diagnosticError) { evidence.Error("connection_events_unavailable", diagnosticError); }
+            }
             ExitCode = 1;
         }
         finally
@@ -816,6 +838,7 @@ internal sealed class ExperimentForm : Form
         }
         arguments.AddRange(new[] { "--witness", session.ToString(CultureInfo.InvariantCulture), nonce, result });
         if (testDirectInput || testWindowInput) arguments.Add("--prepare-input");
+        if (testSendKeys) arguments.Add("--prepare-sendkeys");
         if (childSearchHelper is not null) arguments.Add("--prepare-child-search");
         action.Path = executable;
         action.Arguments = string.Join(" ", arguments.Select(Program.QuoteArgument));
@@ -1052,10 +1075,10 @@ internal sealed class WitnessForm : Form
         };
         FormClosed += (_, _) => { lifetime.Dispose(); diagnostics.Dispose(); shownFor.Stop(); };
     }
-    internal WitnessInputEvidence AttachInputProbe(string identityOutput, string nonce, uint session, string digest)
+    internal WitnessInputEvidence AttachInputProbe(string identityOutput, string nonce, uint session, string digest, bool sendKeys = false)
     {
         if (input is not null || IsHandleCreated) throw new ExperimentFailure("input_probe_attachment_must_precede_window_creation");
-        input = new WitnessInputEvidence(this, identityOutput, nonce, session, digest);
+        input = new WitnessInputEvidence(this, identityOutput, nonce, session, digest, sendKeys);
         return input;
     }
     protected override void WndProc(ref Message message)
@@ -1093,8 +1116,9 @@ internal static class Program
         if (args.Length >= 4 && args[0] == "--witness")
         {
             string[] options = args.Skip(4).ToArray();
-            if (options.Length > 2 || options.Distinct(StringComparer.Ordinal).Count() != options.Length ||
-                options.Any(value => value is not "--prepare-input" and not "--prepare-child-search")) return 64;
+            if (options.Length > 3 || options.Distinct(StringComparer.Ordinal).Count() != options.Length ||
+                options.Any(value => value is not "--prepare-input" and not "--prepare-child-search" and not "--prepare-sendkeys") ||
+                (options.Contains("--prepare-sendkeys", StringComparer.Ordinal) && !options.Contains("--prepare-input", StringComparer.Ordinal))) return 64;
             return RunWitness(args);
         }
         string? output = null;
@@ -1103,6 +1127,7 @@ internal static class Program
         bool alternateTestAccount = false;
         bool testDirectInput = false;
         bool testWindowInput = false;
+        bool testSendKeys = false;
         bool nativeOleHost = false;
         int timeout = 120;
         for (int i = 0; i < args.Length; i++)
@@ -1112,20 +1137,23 @@ internal static class Program
             else if (args[i] == "--alternate-test-account") alternateTestAccount = true;
             else if (args[i] == "--test-direct-input") testDirectInput = true;
             else if (args[i] == "--test-window-input") testWindowInput = true;
+            else if (args[i] == "--test-sendkeys") testSendKeys = true;
             else if (args[i] == "--native-ole-host") nativeOleHost = true;
             else if (args[i] == "--child-search-helper" && i + 1 < args.Length && childSearchHelper is null) childSearchHelper = Path.GetFullPath(args[++i]);
             else if (args[i] == "--timeout-seconds" && i + 1 < args.Length && int.TryParse(args[++i], out int value) && value is >= 15 and <= 300) timeout = value;
-            else { Console.Error.WriteLine("Usage: SessionContractExperiment --output FILE [--allow-enable-child-sessions] [--timeout-seconds 15..300] [--alternate-test-account] [--test-direct-input | --test-window-input] [--child-search-helper FILE] [--native-ole-host]"); return 64; }
+            else { Console.Error.WriteLine("Usage: SessionContractExperiment --output FILE [--allow-enable-child-sessions] [--timeout-seconds 15..300] [--alternate-test-account] [--test-direct-input | --test-window-input] [--child-search-helper FILE] [--native-ole-host] [--test-sendkeys]"); return 64; }
         }
         if ((testDirectInput || testWindowInput) && !alternateTestAccount)
         { Console.Error.WriteLine("An input experiment requires --alternate-test-account."); return 64; }
+        if (testSendKeys && (!testWindowInput || nativeOleHost))
+        { Console.Error.WriteLine("--test-sendkeys requires the managed --test-window-input path."); return 64; }
         if (nativeOleHost && !testWindowInput)
         { Console.Error.WriteLine("--native-ole-host requires the complete --test-window-input acceptance path."); return 64; }
         if (testDirectInput && testWindowInput)
         { Console.Error.WriteLine("--test-direct-input and --test-window-input are mutually exclusive."); return 64; }
         if (childSearchHelper is not null && !alternateTestAccount) { Console.Error.WriteLine("--child-search-helper requires --alternate-test-account."); return 64; }
         if (output is null || File.Exists(output)) { Console.Error.WriteLine("A new --output file is required."); return 64; }
-        Evidence evidence = new() { AlternateTestAccountRequested = alternateTestAccount, DirectInputRequested = testDirectInput, WindowInputRequested = testWindowInput, NativeOleHostRequested = nativeOleHost,
+        Evidence evidence = new() { AlternateTestAccountRequested = alternateTestAccount, DirectInputRequested = testDirectInput, WindowInputRequested = testWindowInput, NativeOleHostRequested = nativeOleHost, SendKeysRequested = testSendKeys,
             ChildSearchPreparationRequested = childSearchHelper is not null, ChildSearchPreparationCleanupVerified = childSearchHelper is null };
         int result = 1;
         using Mutex mutex = new(false, "Local\\SessionContractExperiment");
@@ -1149,7 +1177,7 @@ internal static class Program
                 Application.SetUnhandledExceptionMode(UnhandledExceptionMode.ThrowException);
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
-                using ExperimentForm form = new(evidence, allowEnable, TimeSpan.FromSeconds(timeout), alternateTestAccount, testDirectInput, testWindowInput, childSearchHelper, nativeOleHost);
+                using ExperimentForm form = new(evidence, allowEnable, TimeSpan.FromSeconds(timeout), alternateTestAccount, testDirectInput, testWindowInput, testSendKeys, childSearchHelper, nativeOleHost);
                 Application.Run(form);
                 result = form.ExitCode;
             }
@@ -1220,7 +1248,7 @@ internal static class Program
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             using WitnessForm form = new(args[2], render);
-            if (args.Contains("--prepare-input", StringComparer.Ordinal)) input = form.AttachInputProbe(output, args[2], actual, digest);
+            if (args.Contains("--prepare-input", StringComparer.Ordinal)) input = form.AttachInputProbe(output, args[2], actual, digest, args.Contains("--prepare-sendkeys", StringComparer.Ordinal));
             result = 0;
             Application.Run(form);
             if (render.UiFailed) result = 2;
