@@ -1,0 +1,56 @@
+name: Native host frame and input component
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'checks/native-host-runtime/run-request.json'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-host-runtime-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  native_host_arm64:
+    name: Native host component (windows-11-arm)
+    runs-on: windows-11-arm
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Configure independent window calibration
+        run: cmake -S . -B build -A ARM64
+      - name: Compile independent window calibration
+        run: cmake --build build --config Release --target win32_window_calibration --parallel 2
+      - name: Configure first-logon preparation helper
+        run: cmake -S checks/session/first-logon -B build/first-logon -A ARM64
+      - name: Compile first-logon preparation helper
+        run: cmake --build build/first-logon --config Release --parallel 2
+      - name: Configure owned child Search preparation helper
+        run: cmake -S checks/session/child-search -B build/child-search -A ARM64
+      - name: Compile owned child Search helper and receipt contracts
+        run: cmake --build build/child-search --config Release --target child_search_prepare child_search_receipt_tests --parallel 2
+      - name: Check bounded receipt decoder
+        run: .\build\child-search\Release\child_search_receipt_tests.exe
+      - name: Report .NET SDK
+        run: dotnet --info
+      - name: Require native host, frame, input and cleanup evidence
+        timeout-minutes: 8
+        shell: pwsh
+        env:
+          DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+          DOTNET_NOLOGO: '1'
+          DOTNET_GENERATE_ASPNET_CERTIFICATE: 'false'
+        run: |
+          & .\checks\session\first-logon\run-prepared.ps1 `
+            -PreparationProgram .\build\first-logon\Release\first_logon_prepare.exe `
+            -CalibrationProgram .\build\Release\win32_window_calibration.exe `
+            -ChildSearchPreparationProgram .\build\child-search\Release\child_search_prepare.exe `
+            -ResultsDirectory "$env:RUNNER_TEMP\native-host-runtime-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT" `
+            -AllowDisposablePrivacyPreparation -NativeOleHost -TimeoutSeconds 120
+          exit $LASTEXITCODE
