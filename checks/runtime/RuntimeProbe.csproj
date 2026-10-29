@@ -13,5 +13,6 @@
   <ItemGroup>
     <Compile Include="Program.cs" />
     <Compile Include="RunnerProcess.cs" />
+    <Compile Include="ReceiverLauncher.cs" />
   </ItemGroup>
 </Project>

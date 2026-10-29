@@ -220,6 +220,7 @@ internal static class Program
     private static async Task<int> Main(string[] args)
     {
         if (args.Length == 1 && args[0] == "--self-test") return SelfTest.Run();
+        if (args.Length == 3 && args[0] == "--launch") return ReceiverLauncher.Run(args[1], args[2]);
         string? root = null;
         var cases = new List<CaseResult>();
         bool filesRemoved = false, executionComplete = false;

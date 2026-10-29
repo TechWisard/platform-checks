@@ -7,6 +7,11 @@ $removed = $false
 $stopped = $false
 $root = $null
 $ownedRoot = $false
+$phase = 'context'
+$receiverFound = $false
+$receiverRunning = $false
+$reportFound = $false
+$reportProjected = $false
 function Read-Boolean($Value) {
     if ($Value -isnot [bool]) { throw 'boolean_type' }
     return $Value
@@ -61,6 +66,7 @@ try {
     $prefix = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\') + '\'
     if (-not $root.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) -or [IO.Path]::GetFileName($root) -notmatch '^runtime-probe-[0-9a-f]{32}$') { throw 'root' }
     $ownedRoot = $true
+    $phase = 'receipt'
     $receiptText = Read-BoundedUtf8 (Join-Path $root 'process.json') 4096
     $receipt = $receiptText | ConvertFrom-Json
     $receiptNames = @($receipt.PSObject.Properties.Name | Sort-Object)
@@ -69,23 +75,32 @@ try {
     $startTicks = Read-Integer $receipt.startUtcTicks 1 ([datetime]::MaxValue.Ticks)
     $runtime = (Get-Command dotnet -CommandType Application).Source
     if ($receipt.executable -isnot [string] -or $receipt.executable.Length -gt 1024 -or $receipt.executable -cne $runtime) { throw 'receipt_executable' }
+    $phase = 'receiver_lookup'
     $child = $null
     try { $child = [Diagnostics.Process]::GetProcessById([int]$processId) }
     catch [ArgumentException] { $child = $null }
     if ($null -ne $child) {
+        $receiverFound = $true
+        $phase = 'receiver_identity'
         # Open a handle before checking lifetime identity; access/query failures
         # remain failures and are never interpreted as proof of process absence.
         $null = $child.Handle
         if ($child.StartTime.ToUniversalTime().Ticks -ne $startTicks -or $child.Path -cne $runtime) { throw 'identity' }
+        $receiverRunning = -not $child.HasExited
+        $phase = 'receiver_wait'
         if (-not $CleanupOnly) { [void]$child.WaitForExit(1580000) }
         $child.Refresh()
         if (-not $child.HasExited) { $child.Kill(); [void]$child.WaitForExit(5000) }
         $stopped = $child.HasExited
     } else { $stopped = $true }
     if (-not $stopped) { throw 'still_running' }
+    $phase = 'report_lookup'
     $path = Join-Path $root 'result.json'
-    if (Test-Path -LiteralPath $path -PathType Leaf) {
+    $reportFound = Test-Path -LiteralPath $path -PathType Leaf
+    if ($reportFound) {
+        $phase = 'report_parse'
         $report = (Read-BoundedUtf8 $path 16384) | ConvertFrom-Json
+        $phase = 'report_validate'
         if ((Read-String $report.schema) -cne 'runtime-result/v1' -or $report.cases -isnot [System.Array] -or $report.cases.Count -gt 4) { throw 'result' }
         # Reconstruct a strict scalar whitelist. Never forward process text or arbitrary JSON fields.
         $cases = @($report.cases | ForEach-Object {
@@ -102,7 +117,10 @@ try {
         $success = Test-CaseSuccess $passed $filesRemoved $errorCode $cases
         # Emit the derived result only after the exact case implications hold.
         @{schema='runtime-result/v1'; passed=$success; stage=$stage; error=$errorCode; cases=$cases; plaintext_files_removed=$filesRemoved} | ConvertTo-Json -Depth 5 -Compress
+        $reportProjected = $true
+        $phase = 'complete'
     }
+    else { $phase = 'report_missing' }
 } catch {
     $success = $false
 } finally {
@@ -111,5 +129,6 @@ try {
         catch { $removed = $false }
     }
 }
+@{schema='runtime-observation/v1'; phase=$phase; receiver_found=$receiverFound; receiver_running_on_lookup=$receiverRunning; report_found=$reportFound; report_projected=$reportProjected} | ConvertTo-Json -Compress
 @{schema='runtime-cleanup/v1'; receiver_stopped=$stopped; work_directory_removed=$removed; passed=($stopped -and $removed)} | ConvertTo-Json -Compress
 if (-not ($success -and $stopped -and $removed)) { exit 1 }

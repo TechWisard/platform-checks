@@ -12,10 +12,16 @@ try {
     Add-Content -LiteralPath $env:GITHUB_ENV -Value ('RUNTIME_PROBE_ROOT=' + $root) -Encoding utf8NoBOM
     $program = Join-Path $PSScriptRoot 'bin/Release/net8.0/RuntimeProbe.dll'
     $runtime = (Get-Command dotnet -CommandType Application).Source
-    $arguments = '"' + $program + '" --receive "' + $root + '" ' + $request.nonce
-    $child = Start-Process -FilePath $runtime -ArgumentList $arguments -PassThru -NoNewWindow -RedirectStandardOutput (Join-Path $root 'receiver.stdout') -RedirectStandardError (Join-Path $root 'receiver.stderr')
-    $receipt = @{ schema='runtime-process/v1'; pid=$child.Id; startUtcTicks=$child.StartTime.ToUniversalTime().Ticks; executable=$runtime }
-    $receipt | ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $root 'process.json') -Encoding utf8NoBOM
+    # The native launcher inherits only explicit NUL handles. Start-Process's
+    # broad handle inheritance would retain the runner step's pipe handles.
+    & $runtime $program --launch $root $request.nonce
+    if ($LASTEXITCODE -ne 0) { throw 'receiver_launch' }
+    $receipt = Get-Content -LiteralPath (Join-Path $root 'process.json') -Raw | ConvertFrom-Json
+    if ($receipt.schema -isnot [string] -or $receipt.executable -isnot [string] -or $receipt.schema -cne 'runtime-process/v1' -or $receipt.executable -cne $runtime -or ($receipt.pid -isnot [int] -and $receipt.pid -isnot [long]) -or $receipt.pid -lt 1 -or $receipt.pid -gt 2147483647 -or $receipt.startUtcTicks -isnot [long] -or $receipt.startUtcTicks -lt 1 -or $receipt.startUtcTicks -gt [datetime]::MaxValue.Ticks) { throw 'receiver_receipt' }
+    $observed = [Diagnostics.Process]::GetProcessById([int]$receipt.pid)
+    $null = $observed.Handle
+    if ($observed.StartTime.ToUniversalTime().Ticks -ne $receipt.startUtcTicks -or $observed.Path -cne $runtime) { throw 'receiver_identity' }
+    $child = $observed
     $timer = [Diagnostics.Stopwatch]::StartNew()
     $challenge = Join-Path $root 'challenge.json'
     while (-not (Test-Path -LiteralPath $challenge -PathType Leaf)) {

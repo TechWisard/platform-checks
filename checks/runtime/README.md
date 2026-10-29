@@ -12,6 +12,16 @@ window station before generating an RSA-3072 key. It exports only the public
 SPKI. The private key stays in the receiver and is never exported, serialized,
 logged, included in an artifact, or intentionally written to a file.
 
+A native launcher starts this receiver suspended with `STARTUPINFOEX`, an
+explicit list of three NUL standard handles, and `CREATE_NO_WINDOW`. It writes
+an atomic PID, creation-time, and executable-path receipt before resuming it.
+This prevents the receiver from holding the launching workflow step's pipe
+handles open while it remains alive for the later attestation step. Ordinary
+runner tracking and inherited job membership remain in place; the launcher
+does not use process breakaway or a short-lived kill-on-close job. Receiver
+stdout and stderr go to NUL, and only the separately validated result file
+can become public output.
+
 The exact `challenge.json` bytes identify the repository and numeric repository
 ID, source commit, workflow and ref, run and attempt, tracked request nonce,
 fresh random nonce, public-key fingerprint, and 25-minute expiry. The pinned
@@ -86,6 +96,8 @@ outer wrapper validates scalar types and the four case implications again;
 even a malformed result still triggers guarded cleanup after the owned
 receiver is confirmed stopped. No artifacts, caches, dumps, screenshots,
 plaintext binaries, output text, or private keys are uploaded.
+Fixed phase strings and booleans also distinguish an absent receiver, a
+missing report, and failed report parsing without forwarding diagnostic text.
 
 ## Limits and interpretation
 
@@ -112,3 +124,5 @@ isolation, compatibility with other Windows machines, or performance limits.
 - [Official CLI verification options and certificate trust guidance](https://cli.github.com/manual/gh_attestation_verify)
 - [Sigstore verification result and certificate run URI](https://github.com/sigstore/sigstore-go/blob/main/docs/verification.md)
 - [GitHub content API size and object behavior](https://docs.github.com/en/rest/repos/contents)
+- [Runner process and stream lifetime](https://github.com/actions/runner/blob/v2.338.0/src/Runner.Sdk/ProcessInvoker.cs)
+- [PowerShell process creation and inherited handles](https://github.com/PowerShell/PowerShell/blob/v7.6.0/src/Microsoft.PowerShell.Commands.Management/commands/management/Process.cs)
