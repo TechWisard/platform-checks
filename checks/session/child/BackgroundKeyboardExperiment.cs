@@ -13,7 +13,7 @@ internal static class BackgroundKeyboardExperiment
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool IsWindow(IntPtr window);
     internal static async Task Run(Form parent, Control host, object control, Evidence evidence,
-        string identityFile, string nonce, uint session, string digest,
+        BackgroundInputConfiguration backgroundInput, string identityFile, string nonce, uint session, string digest,
         Action requireOwnership, TimeSpan remaining)
     {
         if (!evidence.SendKeysRequested || !evidence.WindowInputVerified ||
@@ -108,6 +108,8 @@ internal static class BackgroundKeyboardExperiment
                 foreground_is_owned_decoy = true, focus_is_owned_decoy = true,
                 original_rdp_host_has_focus = false, parent_cursor_unchanged = true,
                 foreground_and_focus_event_observers_installed = true });
+            Check();
+            backgroundInput.RequireEnabled();
             Check();
             sink.SendEightDigits(challenge, layout);
             Check();

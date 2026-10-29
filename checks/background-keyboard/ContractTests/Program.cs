@@ -27,6 +27,109 @@ void Reject(MethodInfo method, params object?[] parameters)
     catch (Exception ex) when (ex.GetType().FullName == "SessionContractExperiment.ExperimentFailure") { tests++; return; }
     throw new Exception("Must reject: " + method.Name);
 }
+
+Type backgroundType = fixture.GetType("SessionContractExperiment.BackgroundInputConfiguration", true)!;
+MethodInfo prepareBackground = backgroundType.GetMethod("Prepare", Private)!;
+MethodInfo checkBackground = backgroundType.GetMethod("RequireEnabled", BindingFlags.Instance | BindingFlags.NonPublic)!;
+void CheckBackground(object configuration)
+{
+    try { checkBackground.Invoke(configuration, null); }
+    catch (TargetInvocationException ex) when (ex.InnerException is not null) { throw ex.InnerException; }
+}
+void RejectBackground(Action action, string stage, int? code = null)
+{
+    try { action(); }
+    catch (Exception error) when (error.GetType().FullName == "SessionContractExperiment.ExperimentFailure")
+    {
+        const BindingFlags properties = BindingFlags.Instance | BindingFlags.NonPublic;
+        Need((string)error.GetType().GetProperty("Stage", properties)!.GetValue(error)! == stage, "background failure stage");
+        if (code is not null)
+            Need((int)error.GetType().GetProperty("Code", properties)!.GetValue(error)! == code, "background HRESULT preserved");
+        return;
+    }
+    throw new Exception("background configuration must reject");
+}
+Action<string, object?> IgnoreSettingEvent = (_, _) => { };
+{
+    int accesses = 0;
+    object? disabled = Invoke(prepareBackground, false,
+        (Func<object?>)(() => { accesses++; throw new Exception(); }),
+        (Action<int>)(_ => { accesses++; throw new Exception(); }),
+        (Action<string, object?>)((_, _) => { accesses++; throw new Exception(); }));
+    Need(disabled is null && accesses == 0, "ordinary mode never reads/writes/logs optional setting");
+}
+foreach (int initialSetting in new[] { 0, 1, -1, 2, int.MinValue, int.MaxValue })
+{
+    int reads = 0, writes = 0; object? actual = initialSetting;
+    List<(string Stage, JsonElement Data)> settingEvents = new();
+    object prepared = Invoke(prepareBackground, true,
+        (Func<object?>)(() => { reads++; return actual; }),
+        (Action<int>)(value => { writes++; Need(value == 1, "requested exact LONG 1"); actual = value; }),
+        (Action<string, object?>)((stage, details) => settingEvents.Add((stage, JsonSerializer.SerializeToElement(details)))))!;
+    Need(reads == 2 && writes == 1, "one initial read, one write, one readback");
+    Need(settingEvents.Count == 1 && settingEvents[0].Stage == "sendkeys_background_input_configuration", "preconnect configuration event");
+    JsonElement data = settingEvents[0].Data;
+    Need(data.GetProperty("initial").GetInt32() == initialSetting && data.GetProperty("requested").GetInt32() == 1 &&
+        data.GetProperty("readback").GetInt32() == 1 && data.GetProperty("before_connect").GetBoolean(), "configuration scalar evidence");
+    CheckBackground(prepared);
+    Need(reads == 3 && writes == 1, "presend recheck only reads");
+    Need(settingEvents.Count == 2 && settingEvents[1].Stage == "sendkeys_background_input_presend" &&
+        settingEvents[1].Data.GetProperty("readback").GetInt32() == 1, "presend scalar evidence");
+}
+object?[] wrongLongTypes = { null, false, true, (short)1, (ushort)1, (byte)1, 1L, 1U, 1.0, 1.0m, "1", DayOfWeek.Monday };
+foreach (object? wrong in wrongLongTypes)
+{
+    int writes = 0;
+    RejectBackground(() => Invoke(prepareBackground, true, (Func<object?>)(() => wrong), (Action<int>)(_ => writes++), IgnoreSettingEvent),
+        "sendkeys_background_input_initial_type_mismatch", unchecked((int)0x80020005));
+    Need(writes == 0, "wrong initial Automation type prevents write and input");
+    int reads = 0;
+    RejectBackground(() => Invoke(prepareBackground, true, (Func<object?>)(() => ++reads == 1 ? 0 : wrong), (Action<int>)(_ => writes++), IgnoreSettingEvent),
+        "sendkeys_background_input_readback_type_mismatch", unchecked((int)0x80020005));
+    Need(reads == 2 && writes == 1, "wrong readback type is not converted or retried");
+}
+foreach (int wrong in new[] { 0, -1, 2, int.MinValue, int.MaxValue })
+{
+    int reads = 0, writes = 0;
+    RejectBackground(() => Invoke(prepareBackground, true, (Func<object?>)(() => ++reads == 1 ? 0 : wrong), (Action<int>)(_ => writes++), IgnoreSettingEvent),
+        "sendkeys_background_input_not_enabled");
+    Need(reads == 2 && writes == 1, "non-one readback rejected without retry");
+}
+foreach (object? changed in wrongLongTypes.Concat(new object?[] { 0, -1, 2 }))
+{
+    object? actual = 0; int writes = 0, sends = 0;
+    object prepared = Invoke(prepareBackground, true, (Func<object?>)(() => actual),
+        (Action<int>)(value => { writes++; actual = value; }), IgnoreSettingEvent)!;
+    actual = changed;
+    RejectBackground(() => { CheckBackground(prepared); sends++; }, changed is int
+        ? "sendkeys_background_input_changed" : "sendkeys_background_input_presend_type_mismatch");
+    Need(writes == 1 && sends == 0, "changed setting blocks send; no second write or input fallback");
+}
+foreach (bool wrapped in new[] { false, true })
+{
+    const int failureCode = unchecked((int)0x80070005);
+    Exception failure = new COMException("synthetic failure", failureCode);
+    if (wrapped) failure = new TargetInvocationException(failure);
+    int writes = 0;
+    RejectBackground(() => Invoke(prepareBackground, true, (Func<object?>)(() => throw failure), (Action<int>)(_ => writes++), IgnoreSettingEvent),
+        "sendkeys_background_input_initial_failed", failureCode);
+    Need(writes == 0, "failed initial read stops before write");
+    int reads = 0;
+    RejectBackground(() => Invoke(prepareBackground, true, (Func<object?>)(() => { reads++; return 0; }), (Action<int>)(_ => { writes++; throw failure; }), IgnoreSettingEvent),
+        "sendkeys_background_input_set_failed", failureCode);
+    Need(reads == 1 && writes == 1, "failed setter is not retried");
+    reads = 0; writes = 0;
+    RejectBackground(() => Invoke(prepareBackground, true, (Func<object?>)(() => ++reads == 1 ? 0 : throw failure), (Action<int>)(_ => writes++), IgnoreSettingEvent),
+        "sendkeys_background_input_readback_failed", failureCode);
+    Need(reads == 2 && writes == 1, "failed verification does not repeat setting");
+    bool failRead = false; int sends = 0; object? actual = 0;
+    object prepared = Invoke(prepareBackground, true, (Func<object?>)(() => failRead ? throw failure : actual),
+        (Action<int>)(value => actual = value), IgnoreSettingEvent)!;
+    failRead = true;
+    RejectBackground(() => { CheckBackground(prepared); sends++; }, "sendkeys_background_input_presend_failed", failureCode);
+    Need(sends == 0, "failed presend read stops input");
+}
+
 for (int scan = 1; scan <= 255; scan++)
 {
     var pair = (ValueTuple<short[], int[]>)Invoke(encode, new ushort[] { (ushort)scan })!;

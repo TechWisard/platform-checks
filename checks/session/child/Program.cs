@@ -405,6 +405,7 @@ internal sealed class ExperimentForm : Form
     private string expectedWitnessSid = "";
     private object? control;
     private ExtendedSettings? extended;
+    private BackgroundInputConfiguration? backgroundInput;
     private RdpConnectionEvents? connectionEvents;
     private OwnedTestAccount? testAccount;
     private RdpPasswordControl? passwordControl;
@@ -498,6 +499,9 @@ internal sealed class ExperimentForm : Form
                 if (authenticationAfter != 1) throw new ExperimentFailure("server_authentication_requirement_not_set");
                 foreach (string property in new[] { "RedirectClipboard", "RedirectDrives", "RedirectPrinters", "RedirectPorts", "RedirectSmartCards" })
                     Dispatch.Set(advanced, property, false);
+                backgroundInput = BackgroundInputConfiguration.Prepare(evidence.SendKeysRequested,
+                    () => Dispatch.Get(advanced, "allowBackgroundInput"),
+                    value => Dispatch.Set(advanced, "allowBackgroundInput", value), evidence.Event);
             }
             finally { if (nativeHost is not null) Marshal.ReleaseComObject(advanced); }
             extended.Set("ConnectToChildSession", true);
@@ -718,7 +722,8 @@ internal sealed class ExperimentForm : Form
                 evidence.Status = "different_account_child_frame_and_window_input_verified";
                 if (testSendKeys)
                 {
-                    await BackgroundKeyboardExperiment.Run(this, host, control, evidence, witnessFile, nonce,
+                    await BackgroundKeyboardExperiment.Run(this, host, control, evidence,
+                        backgroundInput ?? throw new ExperimentFailure("sendkeys_background_input_not_prepared"), witnessFile, nonce,
                         evidence.ChildSessionId.Value, Program.IdentityDigest(nonce, expectedWitnessSid),
                         () => { connectionEvents.ThrowIfConnectionFailed(); VerifyWitnessOwnership(evidence.ChildSessionId.Value); },
                         timeout - deadline.Elapsed);
@@ -892,6 +897,7 @@ internal sealed class ExperimentForm : Form
         bool controlDisconnected = control is null;
         frameProbe.RecordFinal(evidence.Event);
         evidence.Event("cleanup_started");
+        backgroundInput = null;
         try { nativeHost?.BeginCleanup(); }
         catch (Exception ex) { evidence.Error("native_host_cleanup_start_failed", ex); cleanupFailed = true; }
         ReadWitnessRendering();

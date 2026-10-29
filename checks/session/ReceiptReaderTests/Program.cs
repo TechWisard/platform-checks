@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Reflection;
 using System.Text.Json;
@@ -96,10 +97,26 @@ try
         using (FileStream held = new(path, FileMode.Open, FileAccess.Read, FileShare.None))
         {
             verifies = 0;
-            Task<string> released = Read(path, LongBudget, () => { if (++verifies == 2) held.Dispose(); });
-            Need(!released.IsCompleted, "locked read yields to caller");
-            Need(await released == receipt, "released lock returns complete actual file");
-            Need(verifies == 3, "released lock rechecks owner after yield and after read");
+            SynchronizationContext? previous = SynchronizationContext.Current;
+            using QueuedContext context = new();
+            SynchronizationContext.SetSynchronizationContext(context);
+            try
+            {
+                int owner = Environment.CurrentManagedThreadId;
+                Task<string> released = Read(path, LongBudget, () =>
+                {
+                    Need(Environment.CurrentManagedThreadId == owner, "ownership guard stays on UI context thread");
+                    if (++verifies == 2) held.Dispose();
+                });
+                // The continuation cannot run until this test pumps it. This
+                // assertion is independent of scheduler preemption and delay.
+                Need(!released.IsCompleted, "locked read yields to caller");
+                context.RunOne();
+                Need(released.IsCompleted, "one retry finishes after releasing lock");
+                Need(released.GetAwaiter().GetResult() == receipt, "released lock returns complete actual file");
+                Need(verifies == 3, "released lock rechecks owner after yield and after read");
+            }
+            finally { SynchronizationContext.SetSynchronizationContext(previous); }
         }
 
         using (FileStream held = new(path, FileMode.Open, FileAccess.Read, FileShare.None))
@@ -140,3 +157,16 @@ catch (Exception error)
     Environment.ExitCode = 1;
 }
 finally { Directory.Delete(directory, recursive: true); }
+
+sealed class QueuedContext : SynchronizationContext, IDisposable
+{
+    private readonly BlockingCollection<(SendOrPostCallback Callback, object? State)> pending = new();
+    public override void Post(SendOrPostCallback callback, object? state) => pending.Add((callback, state));
+    internal void RunOne()
+    {
+        if (!pending.TryTake(out var work, TimeSpan.FromSeconds(5)))
+            throw new InvalidOperationException("reader continuation was not posted to its calling context");
+        work.Callback(work.State);
+    }
+    public void Dispose() => pending.Dispose();
+}

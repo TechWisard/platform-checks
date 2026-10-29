@@ -5,6 +5,18 @@ session fixture. The ordinary window experiment must first pass its unchanged
 identity, frame, pointer, keyboard, message-observer and cleanup checks. It has
 already delivered eight random decimal characters and one click to the child.
 
+Before Connect, only this opt-in mode reads the existing AdvancedSettings9
+`allowBackgroundInput` as an exact Automation LONG, writes LONG 1 and requires
+an exact LONG 1 readback. The documented property permits the client to accept
+input without focus. The experiment logs initial/requested/readback scalars
+and reads the same settings object again immediately before SendKeys, between
+its existing ownership/foreground checks. Wrong types, COM errors or changed
+values reject the attempt before input. It performs no focus change or retry
+to compensate for a failed check. Ordinary modes never access this property.
+
+This tests a documented configuration hypothesis for the previously observed
+E_FAIL; it does not identify the internal cause of that generic HRESULT.
+
 The added experiment then does the following:
 
 1. Reads the exact installed `IMsRdpClientNonScriptable::SendKeys` metadata and
@@ -36,7 +48,10 @@ status. Failed or unknown calls are never replayed.
 `ContractTests` run against the actual compiled harness before Windows use.
 They reject malformed ABI metadata, invalid array sizes/scan codes, stale or
 incorrect child receipts, wrong counts, changed UI ownership and missing
-health checks. They do not claim to execute the Windows APIs.
+health checks. They also execute the actual background-setting helper with
+controlled getters/setters, checking opt-in, exact LONG type and value,
+readback changes and failures before the send gate. They do not claim to
+execute the Windows APIs.
 
 The workflow runs only on a fixed Windows 11 ARM hosted runner, on manual
 dispatch or a change to `run-request.json`. Its credential/account scope is the
@@ -51,6 +66,7 @@ multiple physical workstations and native full-product execution are untested.
 Primary API contracts:
 
 - https://learn.microsoft.com/en-us/windows/win32/termserv/imsrdpclientnonscriptable-sendkeys
+- https://learn.microsoft.com/en-us/windows/win32/termserv/imstscadvancedsettings-allowbackgroundinput
 - https://learn.microsoft.com/en-us/windows/win32/inputdev/wm-keydown
 - https://learn.microsoft.com/en-us/windows/win32/inputdev/wm-keyup
 - https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-mapvirtualkeyexw
