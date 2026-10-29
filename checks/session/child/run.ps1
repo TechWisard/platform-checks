@@ -97,6 +97,8 @@ Write-SessionEnvironmentSnapshot
 $start = [System.Diagnostics.ProcessStartInfo]::new()
 $start.FileName = $program
 $start.UseShellExecute = $false
+# Suppress console allocation for this owned harness with redirected output.
+$start.CreateNoWindow = $true
 $start.RedirectStandardOutput = $true
 $start.RedirectStandardError = $true
 foreach ($argument in $programArgs) { $start.ArgumentList.Add($argument) }
