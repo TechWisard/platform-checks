@@ -643,7 +643,13 @@ internal sealed class ExperimentForm : Form
                     throw new ExperimentFailure("parallel_session_lost");
                 if (!witnessVerified && File.Exists(witnessFile))
                 {
-                    using JsonDocument witness = JsonDocument.Parse(File.ReadAllText(witnessFile));
+                    string identityReceipt = await WitnessReceiptReader.ReadIdentityAsync(witnessFile,
+                        () => timeout - deadline.Elapsed, () =>
+                        {
+                            connectionEvents.ThrowIfConnectionFailed();
+                            VerifyWitnessOwnership(evidence.ChildSessionId!.Value);
+                        });
+                    using JsonDocument witness = JsonDocument.Parse(identityReceipt);
                     JsonElement root = witness.RootElement;
                     if (root.GetProperty("nonce").GetString() != nonce) throw new ExperimentFailure("witness_nonce_mismatch");
                     evidence.WitnessInExpectedSession = root.GetProperty("session_id").GetUInt32() == evidence.ChildSessionId;

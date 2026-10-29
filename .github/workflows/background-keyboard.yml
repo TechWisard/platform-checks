@@ -50,6 +50,17 @@ jobs:
           exit $probeExit
       - name: Report .NET SDK
         run: dotnet --info
+      - name: Check receipt sharing retry with the actual fixture reader
+        shell: pwsh
+        run: |
+          $fixture = "$env:RUNNER_TEMP\receipt-reader-fixture"
+          $tests = "$env:RUNNER_TEMP\receipt-reader-tests"
+          dotnet build .\checks\session\child\SessionContractExperiment.csproj -c Release -o $fixture -p:UseAppHost=false
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          dotnet build .\checks\session\ReceiptReaderTests\ReceiptReaderTests.csproj -c Release -o $tests -p:UseAppHost=false
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          dotnet "$tests\ReceiptReaderTests.dll" "$fixture\SessionContractExperiment.dll"
+          exit $LASTEXITCODE
       - name: Require frame, window input, then direct keys with own decoy foreground
         timeout-minutes: 8
         shell: pwsh
