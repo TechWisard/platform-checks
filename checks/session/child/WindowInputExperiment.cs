@@ -70,7 +70,7 @@ internal static class WindowInputExperiment
                 workerMessages?.RequireHealthy();
             }
 
-            InputObservation Read()
+            InputObservation ReadObserved()
             {
                 Check();
                 InputObservation report = InputReport.Read(path, bindingNonce, childSession, identityDigest);
@@ -78,6 +78,12 @@ internal static class WindowInputExperiment
                     throw new ExperimentFailure("window_input_report_sequence_regressed");
                 lastSequence = report.Sequence;
                 latest = report;
+                return report;
+            }
+
+            InputObservation Read()
+            {
+                InputObservation report = ReadObserved();
                 RequireHealthy(report);
                 return report;
             }
@@ -96,7 +102,78 @@ internal static class WindowInputExperiment
                 }
             }
 
-            InputObservation baseline = await Wait(r => r.Shown);
+            async Task<InputObservation> WaitForStartupReadiness()
+            {
+                // The witness writes once in Shown, then at five-second idle
+                // intervals. Observe later reports before deciding that the
+                // initial absence of own foreground is persistent. This phase
+                // creates no emitter and never requests focus or sends input.
+                Stopwatch readiness = Stopwatch.StartNew();
+                InputObservation? observed = null;
+                long firstSequence = 0;
+                long lastUnreadySequence = 0;
+                int distinctReports = 0;
+                bool ready = false;
+                try
+                {
+                    while (true)
+                    {
+                        Check();
+                        if (readiness.Elapsed >= TimeSpan.FromSeconds(12))
+                            throw new ExperimentFailure("window_input_startup_readiness_timeout");
+                        if (File.Exists(path))
+                        {
+                            InputObservation report = ReadObserved();
+                            if (observed is null)
+                            {
+                                firstSequence = report.Sequence;
+                                distinctReports = 1;
+                            }
+                            else if (report.Sequence > observed.Sequence) distinctReports++;
+                            observed = report;
+                            bool foregroundReady = StartupForegroundReady(report);
+                            if (!foregroundReady) lastUnreadySequence = report.Sequence;
+                            if (foregroundReady && report.Sequence > lastUnreadySequence)
+                            {
+                                // Full original health is required now and for
+                                // the strictly newer baseline below. No relaxed
+                                // startup observation can authorize an event.
+                                RequireHealthy(report);
+                                ready = true;
+                                return report;
+                            }
+                        }
+                        await Task.Delay(60);
+                    }
+                }
+                finally
+                {
+                    evidence.Event("window_input_startup_readiness", new
+                    {
+                        ready_observation_accepted = ready,
+                        elapsed_ms = readiness.ElapsedMilliseconds,
+                        maximum_wait_ms = 12000,
+                        existing_total_budget_ms = (long)budget.TotalMilliseconds,
+                        distinct_reports = distinctReports,
+                        first_sequence = firstSequence,
+                        last_sequence = observed?.Sequence,
+                        last_unready_sequence = lastUnreadySequence,
+                        newer_sequence_observed = observed is not null && observed.Sequence > firstSequence,
+                        shown = observed?.Shown,
+                        closed = observed?.Closed,
+                        window_visible = observed?.WindowVisible,
+                        foreground_own = observed?.ForegroundOwn,
+                        focus_own = observed?.FocusOwn,
+                        desktop_input_query_succeeded = observed?.DesktopInputQuerySucceeded,
+                        desktop_receives_input = observed?.DesktopReceivesInput,
+                        only_missing_foreground_may_wait = true,
+                        newer_strict_baseline_still_required = true,
+                        input_submissions_started = false
+                    });
+                }
+            }
+
+            InputObservation baseline = await WaitForStartupReadiness();
             long baselineSequence = baseline.Sequence;
             baseline = await Wait(r => r.Sequence > baselineSequence);
             if (baseline.CharacterCount != 0 || baseline.ReceivedHex.Length != 0 ||
@@ -320,6 +397,22 @@ internal static class WindowInputExperiment
             direct_input_channel_tested = false,
             physical_device_isolation = false
         });
+    }
+
+    private static bool StartupForegroundReady(InputObservation value)
+    {
+        if (value.FailureStage is not null) throw new ExperimentFailure(value.FailureStage, value.FailureHresult);
+        if (value.Closed || !value.Shown || !value.WindowVisible || !value.FocusOwn ||
+            !value.DesktopInputQuerySucceeded || !value.DesktopReceivesInput)
+            throw new ExperimentFailure("window_input_witness_ui_not_ready");
+        if (value.UnexpectedCharacters != 0 || value.RepeatedCharacters != 0 || value.OverflowCharacters != 0 ||
+            value.UnexpectedButtons != 0 || value.SystemCharacters != 0)
+            throw new ExperimentFailure("window_input_witness_unexpected_message");
+        if (value.CharacterCount != 0 || value.ReceivedHex.Length != 0 ||
+            value.LeftDownCount != 0 || value.LeftUpCount != 0 ||
+            value.KeyDownCount != 0 || value.KeyUpCount != 0)
+            throw new ExperimentFailure("window_input_witness_baseline_not_empty");
+        return value.ForegroundOwn;
     }
 
     private static void RequireQueuedMessageSequence(WindowMessageObservation parent,

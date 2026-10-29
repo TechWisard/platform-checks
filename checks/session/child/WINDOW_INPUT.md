@@ -79,6 +79,23 @@ failure. With no worker thread, the original UI-only counts remain required.
 The input budget is at most 25 seconds of the already remaining session-test
 budget. Fewer than 12 remaining seconds reject the test before injection.
 
+Before the baseline, an observation-only startup phase may wait up to 12 seconds
+within that same total budget for the child's own foreground flag. The witness
+publishes its initial state in `Shown` and uses a five-second idle heartbeat,
+so its first report alone cannot distinguish delayed readiness from a persistent
+background window. Every observed report must still have the expected identity,
+session and monotonic sequence, no failure or keyboard/button input, and all original visibility,
+focus and input-desktop conditions. A missing foreground flag is the only health
+condition allowed to wait. Parent ownership and worker-observer health remain
+strict on every check. The phase records one bounded summary of sequence progress
+and the last readiness flags, without window handles or input text.
+
+No emitter exists during this wait. A fully healthy observation must be followed
+by a strictly newer fully healthy empty baseline before the original geometry
+and input sequence begins. After startup, any loss of foreground retains the
+original immediate failure. The wait requests no new focus, activation or input;
+it cannot make a permanently background witness ready.
+
 Each `SendInput` return count is recorded. Only a returned count of one creates
 an owned pending-down receipt for a two-event pair; zero creates no receipt,
 and two means both events were accepted. An exceptional interop call has no
