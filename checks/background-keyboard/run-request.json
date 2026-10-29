@@ -1,0 +1,6 @@
+{
+  "schema": "background-keyboard-request/v1",
+  "attempt": 1,
+  "scope": "owned-decoy-direct-keyboard",
+  "reviewed_source_commit": "863213d5dc02a8888b5b6e248cda551655ea267b"
+}
