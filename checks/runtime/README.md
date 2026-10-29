@@ -99,6 +99,23 @@ plaintext binaries, output text, or private keys are uploaded.
 Fixed phase strings and booleans also distinguish an absent receiver, a
 missing report, and failed report parsing without forwarding diagnostic text.
 
+Payload cleanup removes only the two fixed executable paths and their empty
+directory, with no recursive deletion or attribute changes. It retries only
+Windows sharing and lock violations (`0x80070020` and `0x80070021`) within one
+five-second retry budget, with at most 50 retries. Access-denied, nonempty
+directory, unknown I/O, and reparse-point failures remain failures. Final
+absence of the directory and both known files is mandatory. A cleanup failure
+does not overwrite an earlier case failure.
+
+The result includes fixed numeric cleanup diagnostics: `operation`,
+`file_index`, `hresult`, `attempts`, and `retries`. Operation 0 means no observed
+error; 1 inspects the directory, 2 inspects a file, 3 deletes a file, 4 removes
+the empty directory, and 5 verifies absence. File index 0 means the directory,
+1 the console fixture, and 2 the window fixture. The last failed operation and
+HRESULT remain visible even if a permitted retry succeeds. No path, filename
+from an input, or exception text is forwarded. The outer wrapper validates
+these numeric fields and accepts retry success only for the two allowed codes.
+
 ## Limits and interpretation
 
 Each executable is at most 3 MiB, plaintext at most 10 MiB, and envelope at
@@ -126,3 +143,5 @@ isolation, compatibility with other Windows machines, or performance limits.
 - [GitHub content API size and object behavior](https://docs.github.com/en/rest/repos/contents)
 - [Runner process and stream lifetime](https://github.com/actions/runner/blob/v2.338.0/src/Runner.Sdk/ProcessInvoker.cs)
 - [PowerShell process creation and inherited handles](https://github.com/PowerShell/PowerShell/blob/v7.6.0/src/Microsoft.PowerShell.Commands.Management/commands/management/Process.cs)
+- [Windows file closing and deletion](https://learn.microsoft.com/en-us/windows/win32/fileio/closing-and-deleting-files)
+- [Windows sharing and lock error codes](https://learn.microsoft.com/en-us/windows/win32/debug/system-error-codes--0-499-)

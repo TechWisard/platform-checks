@@ -223,6 +223,7 @@ internal static class Program
         if (args.Length == 3 && args[0] == "--launch") return ReceiverLauncher.Run(args[1], args[2]);
         string? root = null;
         var cases = new List<CaseResult>();
+        var cleanup = new CleanupResult();
         bool filesRemoved = false, executionComplete = false;
         int error = 0;
         try
@@ -301,19 +302,11 @@ internal static class Program
                 finally
                 {
                     stage = executionComplete ? "cleanup" : stage;
-                    // This exact fresh directory contains only our two files; never traverse another tree.
-                    foreach (string name in new[] { "console.exe", "window.exe" })
-                    {
-                        string path = Path.Combine(directory, name);
-                        if (File.Exists(path))
-                        {
-                            Wire.Need((File.GetAttributes(path) & FileAttributes.ReparsePoint) == 0, 320);
-                            File.Delete(path);
-                        }
-                    }
-                    Directory.Delete(directory, false);
-                    filesRemoved = !Directory.Exists(directory);
+                    // Never replace a case's original exception with a cleanup
+                    // exception. The fixed cleanup diagnostics retain both facts.
+                    filesRemoved = PayloadCleanup.TryRemove(directory, cleanup);
                 }
+                Wire.Need(filesRemoved, 321);
             }
         }
         catch (ProbeFailure failure) { error = failure.Code; }
@@ -324,7 +317,7 @@ internal static class Program
         catch (TaskCanceledException) { error = 405; }
         catch (Exception) { error = 499; }
         bool passed = executionComplete && filesRemoved && cases.Count == 4 && cases.All(item => item.passed) && error == 0;
-        var report = new { schema = "runtime-result/v1", passed, stage, error, cases, plaintext_files_removed = filesRemoved };
+        var report = new { schema = "runtime-result/v1", passed, stage, error, cases, cleanup, plaintext_files_removed = filesRemoved };
         byte[] reportBytes = JsonSerializer.SerializeToUtf8Bytes(report);
         if (root is not null)
         {
@@ -412,6 +405,7 @@ internal static class SelfTest
             cipher[0] ^= 1; record["ciphertext"] = Convert.ToBase64String(cipher); record["extra"] = "x";
             Reject(() => Wire.Decrypt(JsonSerializer.SerializeToUtf8Bytes(record), challenge, rsa));
             CryptographicOperations.ZeroMemory(aesKey);
+            CleanupSelfTests.Run(Check, Reject);
             Console.WriteLine(JsonSerializer.Serialize(new { schema = "runtime-local-tests/v1", passed = true, assertions }));
             return 0;
         }

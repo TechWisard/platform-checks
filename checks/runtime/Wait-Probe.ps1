@@ -50,6 +50,24 @@ function Test-CaseSuccess([bool]$ReportedPass, [bool]$FilesRemoved, [long]$Error
     }
     return $valid
 }
+function Read-Cleanup($Value) {
+    if ($Value -isnot [pscustomobject] -or (@($Value.PSObject.Properties.Name | Sort-Object) -join ',') -cne 'attempts,file_index,hresult,operation,retries') { throw 'cleanup_fields' }
+    $result = @{operation=(Read-Integer $Value.operation 0 5); file_index=(Read-Integer $Value.file_index 0 2); hresult=(Read-Integer $Value.hresult -2147483648 2147483647); attempts=(Read-Integer $Value.attempts 0 64); retries=(Read-Integer $Value.retries 0 50)}
+    if ($result.retries -gt 0 -and $result.retries -ge $result.attempts) { throw 'cleanup_counts' }
+    if ($result.operation -eq 0) {
+        if ($result.file_index -ne 0 -or $result.hresult -ne 0 -or $result.retries -ne 0) { throw 'cleanup_empty' }
+    } else {
+        if ($result.attempts -eq 0 -or $result.hresult -eq 0) { throw 'cleanup_error' }
+        if ($result.operation -in @(2,3)) { if ($result.file_index -notin @(1,2)) { throw 'cleanup_index' } }
+        elseif ($result.file_index -ne 0) { throw 'cleanup_index' }
+    }
+    return $result
+}
+function Test-CleanupSuccess($Value) {
+    if ($Value.attempts -eq 0) { return $false }
+    if ($Value.hresult -eq 0) { return $Value.operation -eq 0 -and $Value.file_index -eq 0 -and $Value.retries -eq 0 }
+    return $Value.retries -gt 0 -and $Value.hresult -in @(-2147024864L,-2147024863L)
+}
 function Remove-OwnedTree([string]$Directory) {
     $item = Get-Item -LiteralPath $Directory -Force
     if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'reparse' }
@@ -114,9 +132,10 @@ try {
         $passed = Read-Boolean $report.passed
         $filesRemoved = Read-Boolean $report.plaintext_files_removed
         $errorCode = Read-Integer $report.error -2147483648 2147483647
-        $success = Test-CaseSuccess $passed $filesRemoved $errorCode $cases
+        $cleanupEvidence = Read-Cleanup $report.cleanup
+        $success = (Test-CaseSuccess $passed $filesRemoved $errorCode $cases) -and (Test-CleanupSuccess $cleanupEvidence)
         # Emit the derived result only after the exact case implications hold.
-        @{schema='runtime-result/v1'; passed=$success; stage=$stage; error=$errorCode; cases=$cases; plaintext_files_removed=$filesRemoved} | ConvertTo-Json -Depth 5 -Compress
+        @{schema='runtime-result/v1'; passed=$success; stage=$stage; error=$errorCode; cases=$cases; cleanup=$cleanupEvidence; plaintext_files_removed=$filesRemoved} | ConvertTo-Json -Depth 5 -Compress
         $reportProjected = $true
         $phase = 'complete'
     }
