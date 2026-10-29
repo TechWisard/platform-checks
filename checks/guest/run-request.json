@@ -1,5 +1,6 @@
 {
   "schema": "windows-guest-run-request/v1",
-  "request_id": "w11-ltsc-x64-20261029-returned-status-window",
-  "previous_execution_commit": "23dd22cb4a29f508086e3b7da46358d3bd87f980"
+  "request_id": "w11-ltsc-x64-20261029-nullable-evidence-owned-cleanup",
+  "previous_execution_commit": "dadc1a8b012bdb3a3107f487c95d00e761b39b63",
+  "reviewed_source_commit": "e1e7dd31929d91412b7c299a4ec87e987a263d70"
 }
