@@ -69,32 +69,54 @@ thread-specific `WH_GETMESSAGE` hook in the same process, counts only messages
 removed from that queue, and reads only the message's window and type. It never
 reads key values, changes a message or stops the hook chain. An opened thread
 handle pins the original worker identity and must remain live for input and
-receipt-bound release checks. Success requires exactly eight key-down and
-eight key-up messages and one left-button down/up pair across the two distinct
-threads, with no outside-target, system-key, other-button, overflow or observer
-failure. With no worker thread, the original UI-only counts remain required.
+receipt-bound release checks. Immediately before the first test event, the
+parent captures an immutable baseline of both queues without resetting either
+observer. Two idle worker snapshots must have identical complete input counters;
+the UI snapshot is taken synchronously on its own thread between them. The
+snapshot attempt lasts at most one second within the existing input budget.
+Each total must equal the sum of its captured categories. Text, system-key,
+other-button, outside-target, overflow and error observations reject a baseline.
+Down/up counts must balance; the emitter separately rechecks actual queue and
+asynchronous pressed state before any submission. Balanced pre-emission pairs
+are reported with their unknown origin, never labelled as test input.
+
+Success requires increments of exactly eight key-down and eight key-up messages
+and one left-button down/up pair from that immutable baseline across the two
+distinct threads. Every counter must be monotonic; any new outside-target,
+system-key, other-button, overflow or observer failure rejects the result. The
+same delta checks run again after observer shutdown. With no worker thread,
+only the actual UI counts participate. Raw absolute observations and the
+baseline are preserved in the report.
 
 ## Failure and cleanup
 
 The input budget is at most 25 seconds of the already remaining session-test
 budget. Fewer than 12 remaining seconds reject the test before injection.
 
-Before the baseline, an observation-only startup phase may wait up to 12 seconds
-within that same total budget for the child's own foreground flag. The witness
-publishes its initial state in `Shown` and uses a five-second idle heartbeat,
-so its first report alone cannot distinguish delayed readiness from a persistent
-background window. Every observed report must still have the expected identity,
-session and monotonic sequence, no failure or keyboard/button input, and all original visibility,
-focus and input-desktop conditions. A missing foreground flag is the only health
-condition allowed to wait. Parent ownership and worker-observer health remain
-strict on every check. The phase records one bounded summary of sequence progress
-and the last readiness flags, without window handles or input text.
+Before input, an observation-only phase requires two fresh empty child reports
+within at most 12 seconds of the same total budget. The witness publishes its
+initial state in `Shown` and then uses a five-second idle heartbeat. Reports
+must bind the expected nonce, session and identity and have monotonic sequence
+numbers, no failure or keyboard/button input, and the original visibility,
+focus and input-desktop conditions. Only the child's own foreground flag may
+be absent before the planned pointer and click. The parent's exact foreground,
+focus, ownership and worker-observer guards remain strict throughout.
 
-No emitter exists during this wait. A fully healthy observation must be followed
-by a strictly newer fully healthy empty baseline before the original geometry
-and input sequence begins. After startup, any loss of foreground retains the
-original immediate failure. The wait requests no new focus, activation or input;
-it cannot make a permanently background witness ready.
+The existing single cursor move must produce a fresh child `WM_MOUSEMOVE` at
+the exact mapped point with `MoveHitOwnRoot=true`, unchanged geometry and zero
+keyboard/button counts. Only this independent receipt authorizes the existing
+single click at that same point. It serves as ordinary activation of the proven
+visible witness; no extra click, key, focus request, foreign-window action or
+queue attachment is added. A stale pre-click report may remain visible while
+the click is pending. Every hard failure, other missing UI condition, unexpected
+input, keyboard/text count or invalid button count still rejects immediately.
+
+Before any keyboard pair, a fresh report must contain exactly one ordered
+button down/up pair at that point and the full original own-foreground and focus
+health. If the click does not establish this, the test times out without sending
+keyboard input. All subsequent reads use the original strict health predicate,
+including immediate rejection of foreground loss. Exact child text, key counts,
+point/order checks, quiet interval and fresh final heartbeat are unchanged.
 
 Each `SendInput` return count is recorded. Only a returned count of one creates
 an owned pending-down receipt for a two-event pair; zero creates no receipt,
@@ -119,7 +141,7 @@ delegate and inert state remain rooted until this disposable process exits
 because a callback may already be entering when unhook returns. Observing idle
 callbacks does not establish that no later inert callback can enter.
 
-Combined actual message counts are checked again after observer shutdown.
+Combined actual message deltas are checked again after observer shutdown.
 `window_input_cleanup_verified` includes both input-release and observer
 cleanup results; neither result alone permits success.
 

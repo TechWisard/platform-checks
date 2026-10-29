@@ -31,6 +31,7 @@ internal static class WindowInputExperiment
         WindowInputEmitter? emitter = null;
         WindowMessageObservation? messages = null;
         WindowInputThreadObservation? workerMessages = null;
+        QueueBaseline? queueBaseline = null;
         InputPoint? cursorBefore = null;
         InputPoint? cursorAfter = null;
         bool complete = false;
@@ -102,16 +103,30 @@ internal static class WindowInputExperiment
                 }
             }
 
-            async Task<InputObservation> WaitForStartupReadiness()
+            async Task<InputObservation> WaitBeforeKeyboard(Func<InputObservation, bool> predicate,
+                bool clickSubmitted)
             {
-                // The witness writes once in Shown, then at five-second idle
-                // intervals. Observe later reports before deciding that the
-                // initial absence of own foreground is persistent. This phase
-                // creates no emitter and never requests focus or sends input.
+                while (true)
+                {
+                    Check();
+                    if (File.Exists(path))
+                    {
+                        InputObservation report = ReadObserved();
+                        RequireBeforeKeyboard(report, clickSubmitted);
+                        if (predicate(report)) return report;
+                    }
+                    await Task.Delay(60);
+                }
+            }
+
+            async Task<InputObservation> WaitForPointerBaseline()
+            {
+                // A normal click on the proven visible witness may activate it.
+                // First require two fresh empty reports. Only child foreground
+                // may be absent; no emitter or new focus request exists here.
                 Stopwatch readiness = Stopwatch.StartNew();
                 InputObservation? observed = null;
                 long firstSequence = 0;
-                long lastUnreadySequence = 0;
                 int distinctReports = 0;
                 bool ready = false;
                 try
@@ -120,7 +135,7 @@ internal static class WindowInputExperiment
                     {
                         Check();
                         if (readiness.Elapsed >= TimeSpan.FromSeconds(12))
-                            throw new ExperimentFailure("window_input_startup_readiness_timeout");
+                            throw new ExperimentFailure("window_input_pointer_baseline_timeout");
                         if (File.Exists(path))
                         {
                             InputObservation report = ReadObserved();
@@ -131,14 +146,9 @@ internal static class WindowInputExperiment
                             }
                             else if (report.Sequence > observed.Sequence) distinctReports++;
                             observed = report;
-                            bool foregroundReady = StartupForegroundReady(report);
-                            if (!foregroundReady) lastUnreadySequence = report.Sequence;
-                            if (foregroundReady && report.Sequence > lastUnreadySequence)
+                            RequireBeforeKeyboard(report, clickSubmitted: false);
+                            if (report.Sequence > firstSequence)
                             {
-                                // Full original health is required now and for
-                                // the strictly newer baseline below. No relaxed
-                                // startup observation can authorize an event.
-                                RequireHealthy(report);
                                 ready = true;
                                 return report;
                             }
@@ -148,7 +158,7 @@ internal static class WindowInputExperiment
                 }
                 finally
                 {
-                    evidence.Event("window_input_startup_readiness", new
+                    evidence.Event("window_input_pointer_baseline", new
                     {
                         ready_observation_accepted = ready,
                         elapsed_ms = readiness.ElapsedMilliseconds,
@@ -157,7 +167,6 @@ internal static class WindowInputExperiment
                         distinct_reports = distinctReports,
                         first_sequence = firstSequence,
                         last_sequence = observed?.Sequence,
-                        last_unready_sequence = lastUnreadySequence,
                         newer_sequence_observed = observed is not null && observed.Sequence > firstSequence,
                         shown = observed?.Shown,
                         closed = observed?.Closed,
@@ -166,20 +175,14 @@ internal static class WindowInputExperiment
                         focus_own = observed?.FocusOwn,
                         desktop_input_query_succeeded = observed?.DesktopInputQuerySucceeded,
                         desktop_receives_input = observed?.DesktopReceivesInput,
-                        only_missing_foreground_may_wait = true,
-                        newer_strict_baseline_still_required = true,
+                        only_child_foreground_may_be_absent = true,
+                        strict_foreground_required_after_click_before_keyboard = true,
                         input_submissions_started = false
                     });
                 }
             }
 
-            InputObservation baseline = await WaitForStartupReadiness();
-            long baselineSequence = baseline.Sequence;
-            baseline = await Wait(r => r.Sequence > baselineSequence);
-            if (baseline.CharacterCount != 0 || baseline.ReceivedHex.Length != 0 ||
-                baseline.LeftDownCount != 0 || baseline.LeftUpCount != 0 ||
-                baseline.KeyDownCount != 0 || baseline.KeyUpCount != 0)
-                throw new ExperimentFailure("window_input_witness_baseline_not_empty");
+            InputObservation baseline = await WaitForPointerBaseline();
 
             InputRectangle desktop = baseline.VirtualScreen;
             if (baseline.MonitorCount != 1 || desktop.X != 0 || desktop.Y != 0 ||
@@ -230,9 +233,42 @@ internal static class WindowInputExperiment
                 physical_device_isolation = false
             });
 
-            Check();
+            // Do not label pre-emission queue traffic as our test input. Capture
+            // an immutable stable baseline without resetting either observer.
+            // The UI filter cannot run within this synchronous snapshot; two
+            // idle worker snapshots must have identical complete counters.
+            Stopwatch snapshotBudget = Stopwatch.StartNew();
+            while (true)
+            {
+                Check();
+                InputObservation beforeEmission = ReadObserved();
+                RequireBeforeKeyboard(beforeEmission, clickSubmitted: false);
+                RequireGeometry(beforeEmission, baseline);
+                WindowInputThreadObservation.Observation? first = workerMessages?.Snapshot;
+                QueueCounts ui = ReadUiCounts(messages);
+                WindowInputThreadObservation.Observation? second = workerMessages?.Snapshot;
+                if (TryQueueBaseline(ui, first, second, out QueueBaseline captured))
+                {
+                    queueBaseline = captured;
+                    break;
+                }
+                if (snapshotBudget.Elapsed >= TimeSpan.FromSeconds(1))
+                    throw new ExperimentFailure("window_input_queue_baseline_not_stable");
+                await Task.Delay(10);
+            }
+            evidence.Event("window_input_queue_baseline", new
+            {
+                ui = queueBaseline.Value.Ui,
+                worker = queueBaseline.Value.Worker,
+                counters_reset = false,
+                worker_snapshots_idle_and_equal = true,
+                origin_of_preexisting_messages_known = false,
+                actual_held_input_rechecked_before_each_submission = true
+            });
             emitter.Move(parentPoint);
-            InputObservation moved = await Wait(r => r.MoveSequence > baseline.MoveSequence && r.Sequence > baseline.Sequence);
+            InputObservation moved = await WaitBeforeKeyboard(
+                r => r.MoveSequence > baseline.MoveSequence && r.Sequence > baseline.Sequence,
+                clickSubmitted: false);
             RequireGeometry(moved, baseline);
             if (moved.MovePoint != childPoint || !moved.MoveHitOwnRoot ||
                 moved.CharacterCount != 0 || moved.LeftDownCount != 0 || moved.LeftUpCount != 0 ||
@@ -242,7 +278,12 @@ internal static class WindowInputExperiment
 
             Check();
             emitter.LeftClick(parentPoint);
-            InputObservation clicked = await Wait(r => r.LeftDownCount == 1 && r.LeftUpCount == 1);
+            // A stale pre-click report may still describe background state.
+            // Only the existing click is allowed. Require its fresh actual
+            // receipt and full foreground/focus health before any keyboard.
+            InputObservation clicked = await WaitBeforeKeyboard(
+                r => ClickReceiptReady(r, moved.Sequence), clickSubmitted: true);
+            RequireHealthy(clicked);
             RequireGeometry(clicked, baseline);
             if (clicked.LeftDownPoint != childPoint || clicked.LeftUpPoint != childPoint ||
                 clicked.LeftDownSequence <= moved.MoveSequence || clicked.LeftUpSequence <= clicked.LeftDownSequence ||
@@ -287,7 +328,7 @@ internal static class WindowInputExperiment
             RequireFinal(final);
             Check();
             emitter.RequireReleased();
-            RequireQueuedMessageSequence(messages, workerMessages);
+            RequireQueuedMessageSequence(messages, workerMessages, queueBaseline.Value);
             evidence.WindowChildReceivedExpectedText = true;
             complete = true;
         }
@@ -319,7 +360,8 @@ internal static class WindowInputExperiment
             ExperimentFailure? finalObservationError = null;
             if (complete && evidence.WindowInputCleanupVerified == true)
             {
-                try { RequireQueuedMessageSequence(messages!, workerMessages); }
+                try { RequireQueuedMessageSequence(messages!, workerMessages,
+                    queueBaseline ?? throw new ExperimentFailure("window_input_queue_baseline_missing")); }
                 catch (ExperimentFailure error) { complete = false; finalObservationError = error; }
             }
             messages?.Dispose();
@@ -392,14 +434,14 @@ internal static class WindowInputExperiment
         {
             characters = 8, key_down = 8, key_up = 8, left_down = 1, left_up = 1,
             scope = "standard_parent_window_input_to_distinct_child_witness",
-            message_observation = "exact_combined_counts_over_distinct_owned_ui_and_optional_focus_threads",
+            message_observation = "exact_combined_deltas_from_immutable_owned_queue_baseline",
             native_viewer_tested = false,
             direct_input_channel_tested = false,
             physical_device_isolation = false
         });
     }
 
-    private static bool StartupForegroundReady(InputObservation value)
+    private static void RequireBeforeKeyboard(InputObservation value, bool clickSubmitted)
     {
         if (value.FailureStage is not null) throw new ExperimentFailure(value.FailureStage, value.FailureHresult);
         if (value.Closed || !value.Shown || !value.WindowVisible || !value.FocusOwn ||
@@ -409,27 +451,110 @@ internal static class WindowInputExperiment
             value.UnexpectedButtons != 0 || value.SystemCharacters != 0)
             throw new ExperimentFailure("window_input_witness_unexpected_message");
         if (value.CharacterCount != 0 || value.ReceivedHex.Length != 0 ||
-            value.LeftDownCount != 0 || value.LeftUpCount != 0 ||
             value.KeyDownCount != 0 || value.KeyUpCount != 0)
             throw new ExperimentFailure("window_input_witness_baseline_not_empty");
-        return value.ForegroundOwn;
+        if (value.LeftDownCount < 0 || value.LeftUpCount < 0 ||
+            value.LeftDownCount > (clickSubmitted ? 1 : 0) ||
+            value.LeftUpCount > value.LeftDownCount)
+            throw new ExperimentFailure("window_input_witness_button_baseline_invalid");
+    }
+
+    private static bool ClickReceiptReady(InputObservation value, long movedSequence) =>
+        value.Sequence > movedSequence && value.LeftDownCount == 1 &&
+        value.LeftUpCount == 1 && value.ForegroundOwn;
+
+    private readonly record struct QueueCounts(int KeyDown, int KeyUp, int Characters,
+        int LeftDown, int LeftUp, int OtherButtons, int SystemKeys, int OutsideTargetInput,
+        int Total, bool Overflow, bool Failure);
+
+    private readonly record struct QueueBaseline(QueueCounts Ui, QueueCounts? Worker);
+
+    private static QueueCounts ReadUiCounts(WindowMessageObservation value) => new(
+        value.KeyDown, value.KeyUp, value.Characters, value.LeftDown, value.LeftUp,
+        value.OtherButtons, value.SystemKeys, value.OutsideTargetInput, value.Total,
+        value.Overflow, false);
+
+    private static QueueCounts ReadWorkerCounts(WindowInputThreadObservation.Observation value) => new(
+        value.KeyDown, value.KeyUp, value.Characters, value.LeftDown, value.LeftUp,
+        value.OtherButtons, value.SystemKeys, value.OutsideTargetInput, value.Total,
+        value.Overflow, value.Failure || value.FailureStage != 0 || value.FailureCode != 0 ||
+            value.InstallError != 0 || value.UnhookError != 0);
+
+    private static void RequireCounterHealth(QueueCounts value, bool baseline)
+    {
+        if (value.Overflow || value.Failure || value.OutsideTargetInput != 0 ||
+            value.OtherButtons != 0 || value.SystemKeys != 0 ||
+            value.KeyDown < 0 || value.KeyUp < 0 || value.Characters < 0 ||
+            value.LeftDown < 0 || value.LeftUp < 0 || value.Total is < 0 or > 128 ||
+            (long)value.Total != (long)value.KeyDown + value.KeyUp + value.Characters +
+                value.LeftDown + value.LeftUp + value.OtherButtons + value.SystemKeys ||
+            (baseline && value.Characters != 0))
+            throw new ExperimentFailure("window_input_owned_message_observation_failed");
+    }
+
+    private static bool Balanced(QueueCounts value) =>
+        value.KeyDown == value.KeyUp && value.LeftDown == value.LeftUp;
+
+    private static bool TryQueueBaseline(QueueCounts ui,
+        WindowInputThreadObservation.Observation? first,
+        WindowInputThreadObservation.Observation? second, out QueueBaseline baseline)
+    {
+        baseline = default;
+        RequireCounterHealth(ui, baseline: true);
+        if (first.HasValue != second.HasValue)
+            throw new ExperimentFailure("window_input_queue_observer_changed");
+        QueueCounts? worker = null;
+        if (first is { } before && second is { } after)
+        {
+            QueueCounts initial = ReadWorkerCounts(before), final = ReadWorkerCounts(after);
+            // A non-idle read can be between Total and its category increment;
+            // retry that snapshot instead of accepting an incoherent baseline.
+            if (before.ActiveCallbacks != 0 || before.ActiveRecorders != 0 ||
+                after.ActiveCallbacks != 0 || after.ActiveRecorders != 0 || initial != final)
+                return false;
+            RequireCounterHealth(initial, baseline: true);
+            RequireCounterHealth(final, baseline: true);
+            if (!before.Installed || !after.Installed || before.Retired || after.Retired ||
+                !before.ThreadPinned || !after.ThreadPinned || before.ThreadHandleReleased || after.ThreadHandleReleased)
+                throw new ExperimentFailure("window_input_queue_observer_changed");
+            if (!Balanced(final)) return false;
+            worker = final;
+        }
+        if (!Balanced(ui)) return false;
+        baseline = new(ui, worker);
+        return true;
+    }
+
+    private static void RequireQueueDeltas(QueueCounts ui, QueueCounts? worker, QueueBaseline baseline)
+    {
+        if (worker.HasValue != baseline.Worker.HasValue)
+            throw new ExperimentFailure("window_input_queue_observer_changed");
+        RequireCounterHealth(baseline.Ui, baseline: true);
+        RequireCounterHealth(ui, baseline: false);
+        QueueCounts zero = default;
+        QueueCounts currentWorker = worker ?? zero, initialWorker = baseline.Worker ?? zero;
+        RequireCounterHealth(initialWorker, baseline: true);
+        RequireCounterHealth(currentWorker, baseline: false);
+        if (!Balanced(baseline.Ui) || !Balanced(initialWorker))
+            throw new ExperimentFailure("window_input_queue_baseline_invalid");
+        static bool Regressed(QueueCounts value, QueueCounts initial) =>
+            value.KeyDown < initial.KeyDown || value.KeyUp < initial.KeyUp ||
+            value.Characters < initial.Characters || value.LeftDown < initial.LeftDown ||
+            value.LeftUp < initial.LeftUp || value.Total < initial.Total;
+        if (Regressed(ui, baseline.Ui) || Regressed(currentWorker, initialWorker))
+            throw new ExperimentFailure("window_input_queue_counter_regressed");
+        if (ui.KeyDown - baseline.Ui.KeyDown + currentWorker.KeyDown - initialWorker.KeyDown != 8 ||
+            ui.KeyUp - baseline.Ui.KeyUp + currentWorker.KeyUp - initialWorker.KeyUp != 8 ||
+            ui.LeftDown - baseline.Ui.LeftDown + currentWorker.LeftDown - initialWorker.LeftDown != 1 ||
+            ui.LeftUp - baseline.Ui.LeftUp + currentWorker.LeftUp - initialWorker.LeftUp != 1)
+            throw new ExperimentFailure("window_input_owned_threads_message_sequence_mismatch");
     }
 
     private static void RequireQueuedMessageSequence(WindowMessageObservation parent,
-        WindowInputThreadObservation? worker)
+        WindowInputThreadObservation? worker, QueueBaseline baseline)
     {
         WindowInputThreadObservation.Observation? secondary = worker?.Snapshot;
-        if (parent.Overflow || parent.OutsideTargetInput != 0 ||
-            secondary is { Overflow: true } or { Failure: true } ||
-            (secondary?.OutsideTargetInput ?? 0) != 0)
-            throw new ExperimentFailure("window_input_owned_message_observation_failed");
-        if (parent.KeyDown + (secondary?.KeyDown ?? 0) != 8 ||
-            parent.KeyUp + (secondary?.KeyUp ?? 0) != 8 ||
-            parent.LeftDown + (secondary?.LeftDown ?? 0) != 1 ||
-            parent.LeftUp + (secondary?.LeftUp ?? 0) != 1 ||
-            parent.SystemKeys + (secondary?.SystemKeys ?? 0) != 0 ||
-            parent.OtherButtons + (secondary?.OtherButtons ?? 0) != 0)
-            throw new ExperimentFailure("window_input_owned_threads_message_sequence_mismatch");
+        RequireQueueDeltas(ReadUiCounts(parent), secondary is { } value ? ReadWorkerCounts(value) : null, baseline);
     }
 
     private static void RequireGeometry(InputObservation current, InputObservation baseline)
@@ -996,6 +1121,7 @@ internal sealed class WindowMessageObservation : IMessageFilter, IDisposable
     private readonly IntPtr target;
     private bool attached = true;
     private int total;
+    internal int Total => total;
     internal int KeyDown { get; private set; }
     internal int KeyUp { get; private set; }
     internal int Characters { get; private set; }
