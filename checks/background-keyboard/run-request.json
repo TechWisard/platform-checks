@@ -1,7 +1,7 @@
 {
   "schema": "background-keyboard-request/v1",
-  "attempt": 4,
-  "scope": "owned-decoy-direct-keyboard-with-first-failed-target-guard",
-  "reviewed_source_commit": "4bc02565786093e9db652f4a29ffdf2e7c197ddc",
-  "previous_run_id": 40884512297
+  "attempt": 5,
+  "scope": "owned-decoy-direct-keyboard-with-bounded-keyup-diagnostics",
+  "reviewed_source_commit": "cd4e7d11f08337ac9445c08af1cf416ec50738f7",
+  "previous_run_id": 40888464448
 }

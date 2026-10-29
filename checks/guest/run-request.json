@@ -1,6 +1,6 @@
 {
   "schema": "windows-guest-run-request/v1",
-  "request_id": "w11-ltsc-x64-20261029-connection-diagnostics",
-  "previous_execution_commit": "b974abef808af11b6a0e32ef16bd2da18f6639bb",
-  "reviewed_source_commit": "863213d5dc02a8888b5b6e248cda551655ea267b"
+  "request_id": "w11-ltsc-x64-20261029-bootstrap-diagnostics-10",
+  "previous_execution_commit": "cfbbd271a6068b0195519e9ecc2ba8d71bc064b2",
+  "reviewed_source_commit": "cd4e7d11f08337ac9445c08af1cf416ec50738f7"
 }
