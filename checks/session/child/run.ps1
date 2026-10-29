@@ -5,6 +5,7 @@ param(
     [switch] $AlternateTestAccount,
     [switch] $TestDirectInput,
     [switch] $TestWindowInput,
+    [switch] $NativeOleHost,
     [string] $ChildSearchHelper,
     [ValidateRange(15, 300)]
     [int] $TimeoutSeconds = 120
@@ -14,6 +15,10 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 if ($TestDirectInput -and $TestWindowInput) {
     throw 'TestDirectInput and TestWindowInput are mutually exclusive.'
+}
+
+if ($NativeOleHost -and -not $TestWindowInput) {
+    throw 'NativeOleHost requires the complete TestWindowInput acceptance path.'
 }
 
 function Test-ExactBoolean {
@@ -40,7 +45,7 @@ function Test-ChildRenderEligibility {
 }
 
 function Test-WindowInputReport {
-    param([string] $Json, [bool] $ChildPreparationRequested)
+    param([string] $Json, [bool] $ChildPreparationRequested, [bool] $NativeHostRequested = $false)
     try { $report = ConvertFrom-Json -InputObject $Json -NoEnumerate }
     catch { return $false }
     if ($null -eq $report -or $report -isnot [pscustomobject]) { return $false }
@@ -64,6 +69,14 @@ function Test-WindowInputReport {
         if (-not (Test-ExactBoolean $report $name $false)) { return $false }
     }
     if (-not (Test-ChildRenderEligibility $report $ChildPreparationRequested)) { return $false }
+    if ($NativeHostRequested) {
+        foreach ($name in @('native_ole_host_requested', 'native_host_component_verified', 'native_host_cleanup_verified')) {
+            if (-not (Test-ExactBoolean $report $name $true)) { return $false }
+        }
+        foreach ($name in @('full_native_viewer_executed', 'full_native_binding_executed')) {
+            if (-not (Test-ExactBoolean $report $name $false)) { return $false }
+        }
+    }
     return $true
 }
 
@@ -82,11 +95,16 @@ if (Test-Path -LiteralPath $evidencePath) {
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 $program = Join-Path $buildDirectory 'SessionContractExperiment.exe'
+if ($NativeOleHost) {
+    & (Join-Path $PSScriptRoot '..\native-host\build.ps1') -HarnessExecutable $program
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
 $programArgs = @('--output', $evidencePath, '--timeout-seconds', $TimeoutSeconds.ToString())
 if ($AllowEnableChildSessions) { $programArgs += '--allow-enable-child-sessions' }
 if ($AlternateTestAccount) { $programArgs += '--alternate-test-account' }
 if ($TestDirectInput) { $programArgs += '--test-direct-input' }
 if ($TestWindowInput) { $programArgs += '--test-window-input' }
+if ($NativeOleHost) { $programArgs += '--native-ole-host' }
 if ($ChildSearchHelper) {
     if (-not $AlternateTestAccount) { throw 'Child Search preparation requires the owned alternate account.' }
     $programArgs += @('--child-search-helper', [System.IO.Path]::GetFullPath($ChildSearchHelper))
@@ -143,7 +161,7 @@ if (Test-Path -LiteralPath $evidencePath) {
     }
     if ($TestWindowInput) {
         $windowContractVerified = $result -eq 0 -and
-            (Test-WindowInputReport -Json $evidenceText -ChildPreparationRequested ([bool]$ChildSearchHelper))
+            (Test-WindowInputReport -Json $evidenceText -ChildPreparationRequested ([bool]$ChildSearchHelper) -NativeHostRequested ([bool]$NativeOleHost))
         'window_input_runner_contract_verified=' + $windowContractVerified.ToString().ToLowerInvariant()
         # A report cannot override a nonzero process result. A zero exit alone
         # cannot replace typed frame/input/account/cleanup evidence.

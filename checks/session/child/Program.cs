@@ -265,12 +265,21 @@ internal sealed class RdpHost : AxHost
 
 internal static class Dispatch
 {
-    internal static object? Get(object target, string member) => target.GetType().InvokeMember(
-        member, BindingFlags.GetProperty, null, target, null, CultureInfo.InvariantCulture);
-    internal static void Set(object target, string member, object value) => target.GetType().InvokeMember(
-        member, BindingFlags.SetProperty, null, target, new[] { value }, CultureInfo.InvariantCulture);
-    internal static object? Call(object target, string member, params object[] arguments) => target.GetType().InvokeMember(
-        member, BindingFlags.InvokeMethod, null, target, arguments, CultureInfo.InvariantCulture);
+    internal static object? Get(object target, string member)
+    {
+        using NativeOleHost.ProtocolCall call = NativeOleHost.EnterProtocolCall();
+        return target.GetType().InvokeMember(member, BindingFlags.GetProperty, null, target, null, CultureInfo.InvariantCulture);
+    }
+    internal static void Set(object target, string member, object value)
+    {
+        using NativeOleHost.ProtocolCall call = NativeOleHost.EnterProtocolCall();
+        target.GetType().InvokeMember(member, BindingFlags.SetProperty, null, target, new[] { value }, CultureInfo.InvariantCulture);
+    }
+    internal static object? Call(object target, string member, params object[] arguments)
+    {
+        using NativeOleHost.ProtocolCall call = NativeOleHost.EnterProtocolCall();
+        return target.GetType().InvokeMember(member, BindingFlags.InvokeMethod, null, target, arguments, CultureInfo.InvariantCulture);
+    }
 }
 
 internal sealed class Evidence
@@ -325,6 +334,11 @@ internal sealed class Evidence
     public bool? ParentCursorUnchanged { get; set; }
     public bool PhysicalInputIsolationVerified { get; set; }
     public bool NativeMultiseatVerified { get; set; }
+    public bool NativeOleHostRequested { get; set; }
+    public bool NativeHostComponentVerified { get; set; }
+    public bool NativeHostCleanupVerified { get; set; }
+    public bool FullNativeViewerExecuted { get; set; }
+    public bool FullNativeBindingExecuted { get; set; }
     public bool ChildRemoved { get; set; }
     public bool EnableStateRestored { get; set; }
     public bool TaskRemoved { get; set; } = true;
@@ -376,7 +390,8 @@ internal sealed class ExperimentForm : Form
     private readonly bool testWindowInput;
     private readonly string? childSearchHelper;
     private readonly TimeSpan timeout;
-    private readonly RdpHost host = new() { Dock = DockStyle.Fill };
+    private readonly Control host;
+    private readonly NativeOleHost? nativeHost;
     private readonly FrameProbe frameProbe = new();
     private readonly string nonce = Convert.ToHexString(RandomNumberGenerator.GetBytes(24));
     private readonly string work = Path.Combine(Path.GetTempPath(), "session-contract-" + Guid.NewGuid().ToString("N"));
@@ -402,7 +417,7 @@ internal sealed class ExperimentForm : Form
     private bool preconditions;
     internal int ExitCode { get; private set; } = 1;
 
-    internal ExperimentForm(Evidence evidence, bool allowEnable, TimeSpan timeout, bool alternateTestAccount, bool testDirectInput, bool testWindowInput, string? childSearchHelper)
+    internal ExperimentForm(Evidence evidence, bool allowEnable, TimeSpan timeout, bool alternateTestAccount, bool testDirectInput, bool testWindowInput, string? childSearchHelper, bool nativeOleHost)
     {
         this.evidence = evidence; this.allowEnable = allowEnable; this.timeout = timeout;
         this.alternateTestAccount = alternateTestAccount;
@@ -412,6 +427,8 @@ internal sealed class ExperimentForm : Form
         Text = "Session contract experiment — local child session";
         OwnWindowPresentation.Configure(this);
         MaximizeBox = false;
+        host = nativeOleHost ? new NativeOleHost(evidence.Event) { Dock = DockStyle.Fill } : new RdpHost() { Dock = DockStyle.Fill };
+        nativeHost = host as NativeOleHost;
         Controls.Add(host);
         Shown += async (_, _) => await RunExperiment();
         FormClosing += (_, args) => { if (!closing) args.Cancel = true; };
@@ -450,7 +467,7 @@ internal sealed class ExperimentForm : Form
                 Native.Require(Native.WTSEnableChildSessions(true), "WTSEnableChildSessions_enable");
                 evidence.EnableChanged = true;
             }
-            control = host.ControlObject;
+            control = nativeHost is not null ? nativeHost.ControlObject : ((RdpHost)host).ControlObject;
             connectionEvents = new RdpConnectionEvents(control, evidence.Event);
             extended = new ExtendedSettings(control, evidence.Event);
             evidence.Event("extended_settings_typelib_verified", new { put_slot = extended.PutSlot, get_slot = extended.GetSlot });
@@ -459,20 +476,24 @@ internal sealed class ExperimentForm : Form
             Dispatch.Set(control, "DesktopHeight", 768);
             Dispatch.Set(control, "ColorDepth", 32);
             object advanced = Dispatch.Get(control, "AdvancedSettings9") ?? throw new ExperimentFailure("advanced_settings_missing");
-            bool credSspBefore = Convert.ToBoolean(Dispatch.Get(advanced, "EnableCredSspSupport"), CultureInfo.InvariantCulture);
-            Dispatch.Set(advanced, "EnableCredSspSupport", true);
-            bool credSspAfter = Convert.ToBoolean(Dispatch.Get(advanced, "EnableCredSspSupport"), CultureInfo.InvariantCulture);
-            evidence.Event("connection_credssp", new { before = credSspBefore, after = credSspAfter });
-            if (!credSspAfter) throw new ExperimentFailure("connection_credssp_not_enabled");
-            int authenticationBefore = Convert.ToInt32(Dispatch.Get(advanced, "AuthenticationLevel"), CultureInfo.InvariantCulture);
-            // Require server authentication. Value 1 fails instead of asking the
-            // unattended host to continue after an authentication failure.
-            Dispatch.Set(advanced, "AuthenticationLevel", 1);
-            int authenticationAfter = Convert.ToInt32(Dispatch.Get(advanced, "AuthenticationLevel"), CultureInfo.InvariantCulture);
-            evidence.Event("server_authentication_required", new { before = authenticationBefore, after = authenticationAfter });
-            if (authenticationAfter != 1) throw new ExperimentFailure("server_authentication_requirement_not_set");
-            foreach (string property in new[] { "RedirectClipboard", "RedirectDrives", "RedirectPrinters", "RedirectPorts", "RedirectSmartCards" })
-                Dispatch.Set(advanced, property, false);
+            try
+            {
+                bool credSspBefore = Convert.ToBoolean(Dispatch.Get(advanced, "EnableCredSspSupport"), CultureInfo.InvariantCulture);
+                Dispatch.Set(advanced, "EnableCredSspSupport", true);
+                bool credSspAfter = Convert.ToBoolean(Dispatch.Get(advanced, "EnableCredSspSupport"), CultureInfo.InvariantCulture);
+                evidence.Event("connection_credssp", new { before = credSspBefore, after = credSspAfter });
+                if (!credSspAfter) throw new ExperimentFailure("connection_credssp_not_enabled");
+                int authenticationBefore = Convert.ToInt32(Dispatch.Get(advanced, "AuthenticationLevel"), CultureInfo.InvariantCulture);
+                // Require server authentication. Value 1 fails instead of asking the
+                // unattended host to continue after an authentication failure.
+                Dispatch.Set(advanced, "AuthenticationLevel", 1);
+                int authenticationAfter = Convert.ToInt32(Dispatch.Get(advanced, "AuthenticationLevel"), CultureInfo.InvariantCulture);
+                evidence.Event("server_authentication_required", new { before = authenticationBefore, after = authenticationAfter });
+                if (authenticationAfter != 1) throw new ExperimentFailure("server_authentication_requirement_not_set");
+                foreach (string property in new[] { "RedirectClipboard", "RedirectDrives", "RedirectPrinters", "RedirectPorts", "RedirectSmartCards" })
+                    Dispatch.Set(advanced, property, false);
+            }
+            finally { if (nativeHost is not null) Marshal.ReleaseComObject(advanced); }
             extended.Set("ConnectToChildSession", true);
             if (extended.Get("ConnectToChildSession") is not bool selected || !selected)
                 throw new ExperimentFailure("child_session_property_not_set");
@@ -673,10 +694,12 @@ internal sealed class ExperimentForm : Form
                 connectionEvents.ThrowIfConnectionFailed();
                 VerifyWitnessOwnership(evidence.ChildSessionId.Value);
                 transitionTarget.Require(requireFocus: false);
-                await WindowInputExperiment.Run(this, host, control, evidence, witnessFile, nonce,
+                var uiMessages = await WindowInputExperiment.Run(this, host, control, evidence, witnessFile, nonce,
                     evidence.ChildSessionId!.Value, Program.IdentityDigest(nonce, expectedWitnessSid),
                     () => { connectionEvents.ThrowIfConnectionFailed(); VerifyWitnessOwnership(evidence.ChildSessionId!.Value); },
                     timeout - deadline.Elapsed);
+                nativeHost?.VerifySuccessfulWindowPath(uiMessages.KeyDown, uiMessages.KeyUp);
+                evidence.NativeHostComponentVerified = nativeHost is not null;
                 evidence.Status = "different_account_child_frame_and_window_input_verified";
             }
             if (testDirectInput)
@@ -840,6 +863,8 @@ internal sealed class ExperimentForm : Form
         bool controlDisconnected = control is null;
         frameProbe.RecordFinal(evidence.Event);
         evidence.Event("cleanup_started");
+        try { nativeHost?.BeginCleanup(); }
+        catch (Exception ex) { evidence.Error("native_host_cleanup_start_failed", ex); cleanupFailed = true; }
         ReadWitnessRendering();
         try { connectionEvents?.BeginCleanup(); }
         catch (Exception ex) { evidence.Error("event_cleanup_start_failed", ex); cleanupFailed = true; }
@@ -969,6 +994,15 @@ internal sealed class ExperimentForm : Form
         try { connectionEvents?.Dispose(); }
         catch (Exception ex) { evidence.Error("event_cleanup_failed", ex); cleanupFailed = true; }
         extended?.Dispose();
+        if (nativeHost is not null)
+        {
+            try
+            {
+                control = null; // No managed alias is used after the adapter releases its unique RCW.
+                evidence.NativeHostCleanupVerified = nativeHost.CloseDisconnected(controlDisconnected);
+            }
+            catch (Exception ex) { evidence.Error("native_host_cleanup_failed", ex); cleanupFailed = true; }
+        }
         try { if (Directory.Exists(work)) Directory.Delete(work, true); }
         catch (Exception ex) { evidence.Error("temporary_files_cleanup_failed", ex); cleanupFailed = true; }
         if (cleanupFailed) { evidence.Status = "cleanup_failed"; ExitCode = 1; }
@@ -1069,6 +1103,7 @@ internal static class Program
         bool alternateTestAccount = false;
         bool testDirectInput = false;
         bool testWindowInput = false;
+        bool nativeOleHost = false;
         int timeout = 120;
         for (int i = 0; i < args.Length; i++)
         {
@@ -1077,17 +1112,20 @@ internal static class Program
             else if (args[i] == "--alternate-test-account") alternateTestAccount = true;
             else if (args[i] == "--test-direct-input") testDirectInput = true;
             else if (args[i] == "--test-window-input") testWindowInput = true;
+            else if (args[i] == "--native-ole-host") nativeOleHost = true;
             else if (args[i] == "--child-search-helper" && i + 1 < args.Length && childSearchHelper is null) childSearchHelper = Path.GetFullPath(args[++i]);
             else if (args[i] == "--timeout-seconds" && i + 1 < args.Length && int.TryParse(args[++i], out int value) && value is >= 15 and <= 300) timeout = value;
-            else { Console.Error.WriteLine("Usage: SessionContractExperiment --output FILE [--allow-enable-child-sessions] [--timeout-seconds 15..300] [--alternate-test-account] [--test-direct-input | --test-window-input] [--child-search-helper FILE]"); return 64; }
+            else { Console.Error.WriteLine("Usage: SessionContractExperiment --output FILE [--allow-enable-child-sessions] [--timeout-seconds 15..300] [--alternate-test-account] [--test-direct-input | --test-window-input] [--child-search-helper FILE] [--native-ole-host]"); return 64; }
         }
         if ((testDirectInput || testWindowInput) && !alternateTestAccount)
         { Console.Error.WriteLine("An input experiment requires --alternate-test-account."); return 64; }
+        if (nativeOleHost && !testWindowInput)
+        { Console.Error.WriteLine("--native-ole-host requires the complete --test-window-input acceptance path."); return 64; }
         if (testDirectInput && testWindowInput)
         { Console.Error.WriteLine("--test-direct-input and --test-window-input are mutually exclusive."); return 64; }
         if (childSearchHelper is not null && !alternateTestAccount) { Console.Error.WriteLine("--child-search-helper requires --alternate-test-account."); return 64; }
         if (output is null || File.Exists(output)) { Console.Error.WriteLine("A new --output file is required."); return 64; }
-        Evidence evidence = new() { AlternateTestAccountRequested = alternateTestAccount, DirectInputRequested = testDirectInput, WindowInputRequested = testWindowInput,
+        Evidence evidence = new() { AlternateTestAccountRequested = alternateTestAccount, DirectInputRequested = testDirectInput, WindowInputRequested = testWindowInput, NativeOleHostRequested = nativeOleHost,
             ChildSearchPreparationRequested = childSearchHelper is not null, ChildSearchPreparationCleanupVerified = childSearchHelper is null };
         int result = 1;
         using Mutex mutex = new(false, "Local\\SessionContractExperiment");
@@ -1111,7 +1149,7 @@ internal static class Program
                 Application.SetUnhandledExceptionMode(UnhandledExceptionMode.ThrowException);
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
-                using ExperimentForm form = new(evidence, allowEnable, TimeSpan.FromSeconds(timeout), alternateTestAccount, testDirectInput, testWindowInput, childSearchHelper);
+                using ExperimentForm form = new(evidence, allowEnable, TimeSpan.FromSeconds(timeout), alternateTestAccount, testDirectInput, testWindowInput, childSearchHelper, nativeOleHost);
                 Application.Run(form);
                 result = form.ExitCode;
             }

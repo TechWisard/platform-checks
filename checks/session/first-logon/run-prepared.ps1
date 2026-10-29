@@ -4,6 +4,7 @@ param(
     [string] $ChildSearchPreparationProgram,
     [Parameter(Mandatory = $true)][string] $ResultsDirectory,
     [switch] $AllowDisposablePrivacyPreparation,
+    [switch] $NativeOleHost,
     [ValidateRange(15, 300)][int] $TimeoutSeconds = 120
 )
 $ErrorActionPreference = 'Stop'
@@ -362,6 +363,7 @@ try {
     $childArguments = @('-NoLogo', '-NoProfile', '-NonInteractive',
         '-File', $childRunner, '-ResultsDirectory', [System.IO.Path]::GetFullPath($ResultsDirectory),
         '-AllowEnableChildSessions', '-AlternateTestAccount', '-TestWindowInput', '-TimeoutSeconds', $TimeoutSeconds.ToString())
+    if ($NativeOleHost) { $childArguments += '-NativeOleHost' }
     if ($ChildSearchPreparationProgram) {
         $childArguments += @('-ChildSearchHelper', [System.IO.Path]::GetFullPath($ChildSearchPreparationProgram))
     }

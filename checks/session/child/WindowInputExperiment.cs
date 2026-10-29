@@ -10,7 +10,7 @@ namespace SessionContractExperiment;
 // physical-device isolation evidence.
 internal static class WindowInputExperiment
 {
-    internal static async Task Run(Form parent, RdpHost host, object control, Evidence evidence,
+    internal static async Task<(int KeyDown, int KeyUp)> Run(Form parent, Control host, object control, Evidence evidence,
         string witnessIdentityFile, string bindingNonce, uint childSession, string identityDigest,
         Action requireOwnership, TimeSpan remaining)
     {
@@ -32,6 +32,7 @@ internal static class WindowInputExperiment
         WindowMessageObservation? messages = null;
         WindowInputThreadObservation? workerMessages = null;
         QueueBaseline? queueBaseline = null;
+        (int KeyDown, int KeyUp)? uiKeyDeltas = null;
         InputPoint? cursorBefore = null;
         InputPoint? cursorAfter = null;
         bool complete = false;
@@ -44,7 +45,7 @@ internal static class WindowInputExperiment
             // after verifying our Form already owns the foreground. No queue
             // is explicitly attached; no foreign window is activated.
             target.SelectOwnFocusOnce();
-            messages = new WindowMessageObservation(parent.Handle, target.Window);
+            messages = new WindowMessageObservation(parent.Handle, target.Window, host as NativeOleHost);
             if (target.FocusThread != target.UiThread)
             {
                 workerMessages = new WindowInputThreadObservation(parent.Handle, target.Window,
@@ -63,6 +64,7 @@ internal static class WindowInputExperiment
 
             void Check()
             {
+                (host as NativeOleHost)?.ThrowIfCallbackFailed();
                 if (elapsed.Elapsed >= budget)
                     throw new ExperimentFailure("window_input_timeout");
                 RequireTarget();
@@ -360,7 +362,7 @@ internal static class WindowInputExperiment
             ExperimentFailure? finalObservationError = null;
             if (complete && evidence.WindowInputCleanupVerified == true)
             {
-                try { RequireQueuedMessageSequence(messages!, workerMessages,
+                try { uiKeyDeltas = RequireQueuedMessageSequence(messages!, workerMessages,
                     queueBaseline ?? throw new ExperimentFailure("window_input_queue_baseline_missing")); }
                 catch (ExperimentFailure error) { complete = false; finalObservationError = error; }
             }
@@ -439,6 +441,10 @@ internal static class WindowInputExperiment
             direct_input_channel_tested = false,
             physical_device_isolation = false
         });
+        // Return the immutable-baseline UI deltas captured by the exact
+        // combined-thread gate after input release and worker Stop succeeded.
+        // Absolute worker counts never become UI translation evidence.
+        return uiKeyDeltas ?? throw new ExperimentFailure("window_input_ui_delta_receipt_missing");
     }
 
     private static void RequireBeforeKeyboard(InputObservation value, bool clickSubmitted)
@@ -525,7 +531,7 @@ internal static class WindowInputExperiment
         return true;
     }
 
-    private static void RequireQueueDeltas(QueueCounts ui, QueueCounts? worker, QueueBaseline baseline)
+    private static (int KeyDown, int KeyUp) RequireQueueDeltas(QueueCounts ui, QueueCounts? worker, QueueBaseline baseline)
     {
         if (worker.HasValue != baseline.Worker.HasValue)
             throw new ExperimentFailure("window_input_queue_observer_changed");
@@ -548,13 +554,14 @@ internal static class WindowInputExperiment
             ui.LeftDown - baseline.Ui.LeftDown + currentWorker.LeftDown - initialWorker.LeftDown != 1 ||
             ui.LeftUp - baseline.Ui.LeftUp + currentWorker.LeftUp - initialWorker.LeftUp != 1)
             throw new ExperimentFailure("window_input_owned_threads_message_sequence_mismatch");
+        return (ui.KeyDown - baseline.Ui.KeyDown, ui.KeyUp - baseline.Ui.KeyUp);
     }
 
-    private static void RequireQueuedMessageSequence(WindowMessageObservation parent,
+    private static (int KeyDown, int KeyUp) RequireQueuedMessageSequence(WindowMessageObservation parent,
         WindowInputThreadObservation? worker, QueueBaseline baseline)
     {
         WindowInputThreadObservation.Observation? secondary = worker?.Snapshot;
-        RequireQueueDeltas(ReadUiCounts(parent), secondary is { } value ? ReadWorkerCounts(value) : null, baseline);
+        return RequireQueueDeltas(ReadUiCounts(parent), secondary is { } value ? ReadWorkerCounts(value) : null, baseline);
     }
 
     private static void RequireGeometry(InputObservation current, InputObservation baseline)
@@ -585,7 +592,7 @@ internal sealed class WindowInputTarget
     private enum ValidationPhase { Constructor, BeforeFocus, AfterFocus, Runtime, Point }
 
     private readonly Form parent;
-    private readonly RdpHost host;
+    private readonly Control host;
     private readonly object control;
     private readonly Action<string, object?> record;
     private readonly IOleInPlaceObject oleWindow;
@@ -606,7 +613,7 @@ internal sealed class WindowInputTarget
     internal InputRectangle ClientRectangle { get; }
     internal Rectangle Desktop { get; }
 
-    internal WindowInputTarget(Form parent, RdpHost host, object control, Action<string, object?> record)
+    internal WindowInputTarget(Form parent, Control host, object control, Action<string, object?> record)
     {
         this.parent = parent;
         this.host = host;
@@ -622,7 +629,7 @@ internal sealed class WindowInputTarget
         parentWindow = parent.Handle;
         hostWindow = host.Handle;
         oleWindow = control as IOleInPlaceObject ?? throw new ExperimentFailure("window_input_ole_window_unavailable");
-        int result = oleWindow.GetWindow(out IntPtr window);
+        int result = QueryWindow(out IntPtr window);
         if (result != 0 || window == IntPtr.Zero)
             throw new ExperimentFailure("window_input_ole_window_query_failed", result);
         Window = window;
@@ -651,9 +658,19 @@ internal sealed class WindowInputTarget
             throw new ExperimentFailure("window_input_parent_geometry_not_supported");
         object advanced = Dispatch.Get(control, "AdvancedSettings9") ??
             throw new ExperimentFailure("window_input_advanced_settings_unavailable");
-        if (Dispatch.Get(advanced, "SmartSizing") is not bool smartSizing || smartSizing)
-            throw new ExperimentFailure("window_input_smart_sizing_not_supported");
+        try
+        {
+            if (Dispatch.Get(advanced, "SmartSizing") is not bool smartSizing || smartSizing)
+                throw new ExperimentFailure("window_input_smart_sizing_not_supported");
+        }
+        finally { if (host is NativeOleHost) Marshal.ReleaseComObject(advanced); }
         Require(requireFocus: false, ValidationPhase.Constructor);
+    }
+
+    private int QueryWindow(out IntPtr window)
+    {
+        using NativeOleHost.ProtocolCall call = NativeOleHost.EnterProtocolCall();
+        return oleWindow.GetWindow(out window);
     }
 
     internal void SelectOwnFocusOnce()
@@ -661,7 +678,8 @@ internal sealed class WindowInputTarget
         if (focusSelected) throw new ExperimentFailure("window_input_focus_request_repeated");
         Require(requireFocus: false, ValidationPhase.BeforeFocus);
         focusSelected = true;
-        WindowInputNative.SetFocus(Window);
+        if (host is NativeOleHost nativeHost) nativeHost.FocusHostedControl();
+        else WindowInputNative.SetFocus(Window);
         Require(requireFocus: true, ValidationPhase.AfterFocus);
     }
 
@@ -680,7 +698,7 @@ internal sealed class WindowInputTarget
         RequireOwnThread(parentWindow, OwnerRole.Parent, phase);
         RequireOwnThread(hostWindow, OwnerRole.Host, phase);
         RequireOwnThread(Window, OwnerRole.Control, phase);
-        int result = oleWindow.GetWindow(out IntPtr actual);
+        int result = QueryWindow(out IntPtr actual);
         if (result != 0 || actual != Window)
             throw new ExperimentFailure("window_input_control_window_changed", result);
         if (Convert.ToInt32(Dispatch.Get(control, "Connected"), CultureInfo.InvariantCulture) != 1)
@@ -1119,6 +1137,7 @@ internal sealed class WindowMessageObservation : IMessageFilter, IDisposable
 {
     private readonly IntPtr parent;
     private readonly IntPtr target;
+    private readonly NativeOleHost? nativeHost;
     private bool attached = true;
     private int total;
     internal int Total => total;
@@ -1132,10 +1151,11 @@ internal sealed class WindowMessageObservation : IMessageFilter, IDisposable
     internal int OutsideTargetInput { get; private set; }
     internal bool Overflow { get; private set; }
 
-    internal WindowMessageObservation(IntPtr parent, IntPtr target)
+    internal WindowMessageObservation(IntPtr parent, IntPtr target, NativeOleHost? nativeHost)
     {
         this.parent = parent;
         this.target = target;
+        this.nativeHost = nativeHost;
         Application.AddMessageFilter(this);
     }
 
@@ -1157,7 +1177,9 @@ internal sealed class WindowMessageObservation : IMessageFilter, IDisposable
                 if (InputNative.ButtonMessage(message.Msg)) OtherButtons++;
                 break;
         }
-        return false;
+        // Count the original queued message above before native translation
+        // can consume it. The managed default remains an observing-only filter.
+        return nativeHost?.TranslateAfterObservation(ref message) ?? false;
     }
 
     public void Dispose()
