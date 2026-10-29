@@ -130,6 +130,58 @@ foreach (bool wrapped in new[] { false, true })
     Need(sends == 0, "failed presend read stops input");
 }
 
+Type guardTraceType = fixture.GetType("SessionContractExperiment.WindowTargetGuardTrace", true)!;
+Type guardPredicateType = fixture.GetType("SessionContractExperiment.WindowTargetPredicate", true)!;
+const BindingFlags GuardMembers = BindingFlags.Instance | BindingFlags.NonPublic;
+MethodInfo traceFailed = guardTraceType.GetMethod("Failed", GuardMembers)!;
+MethodInfo traceRecord = guardTraceType.GetMethod("Record", GuardMembers)!;
+string[] operandNames = { "owner_thread_matches", "parent_alive", "host_alive", "parent_handle_created",
+    "host_handle_created", "parent_handle_matches", "host_handle_matches", "invoke_not_required",
+    "host_inside_parent", "control_is_not_parent", "control_inside_host", "parent_visible",
+    "control_visible", "control_enabled", "parent_not_iconic", "parent_foreground_matches" };
+for (int firstFailure = 1; firstFailure <= 16; firstFailure++)
+{
+    object trace = Activator.CreateInstance(guardTraceType)!;
+    for (int predicate = 1; predicate <= 16; predicate++)
+        if ((bool)traceFailed.Invoke(trace, new object[] { predicate == firstFailure || predicate == 16,
+            Enum.ToObject(guardPredicateType, predicate) })!) break;
+    int logged = 0; JsonElement snapshot = default;
+    Action<string, object?> observer = (stage, details) =>
+    {
+        logged++; Need(stage == "window_input_target_guard_failure", "guard event name");
+        snapshot = JsonSerializer.SerializeToElement(details);
+    };
+    traceRecord.Invoke(trace, new object[] { observer, 3 });
+    Need(logged == 1, "one diagnostic for rejected guard");
+    Need(snapshot.GetProperty("first_failed_predicate_id").GetInt32() == firstFailure &&
+        snapshot.GetProperty("checked_mask").GetUInt32() == (1U << firstFailure) - 1U, "actual first failure and prefix mask");
+    Need(snapshot.GetProperty("validation_phase_id").GetInt32() == 3 &&
+        snapshot.GetProperty("original_guard_code").GetInt32() == 0 &&
+        !snapshot.GetProperty("native_error_code_captured").GetBoolean(), "guard code is not a sampled native error");
+    Need(snapshot.GetProperty("focus_observation").GetString() == "not_reached" &&
+        snapshot.GetProperty("geometry_observation").GetString() == "not_reached", "later groups are unobserved");
+    JsonElement operands = snapshot.GetProperty("operands");
+    for (int predicate = 1; predicate <= 16; predicate++)
+    {
+        JsonElement value = operands.GetProperty(operandNames[predicate - 1]);
+        Need(predicate > firstFailure ? value.ValueKind == JsonValueKind.Null :
+            value.ValueKind == (predicate == firstFailure ? JsonValueKind.False : JsonValueKind.True), "exact observed operand or null");
+    }
+    Action<string, object?> failedObserver = (_, _) => throw new InvalidOperationException("synthetic logger failure");
+    traceRecord.Invoke(trace, new object[] { failedObserver, 3 });
+    Need(true, "diagnostic failure contained");
+}
+{
+    object trace = Activator.CreateInstance(guardTraceType)!;
+    for (int predicate = 1; predicate <= 16; predicate++)
+        Need(!(bool)traceFailed.Invoke(trace, new object[] { false, Enum.ToObject(guardPredicateType, predicate) })!, "passing predicate remains false in OR guard");
+    int logged = 0;
+    Action<string, object?> observer = (_, _) => logged++;
+    traceRecord.Invoke(trace, new object[] { observer, 3 });
+    Need(logged == 0, "successful guard does not log even if Record is requested");
+    Need((uint)guardTraceType.GetProperty("CheckedMask", GuardMembers)!.GetValue(trace)! == 65535U, "successful trace evaluated all original operands");
+}
+
 for (int scan = 1; scan <= 255; scan++)
 {
     var pair = (ValueTuple<short[], int[]>)Invoke(encode, new ushort[] { (ushort)scan })!;

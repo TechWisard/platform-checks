@@ -17,6 +17,15 @@ to compensate for a failed check. Ordinary modes never access this property.
 This tests a documented configuration hypothesis for the previously observed
 E_FAIL; it does not identify the internal cause of that generic HRESULT.
 
+If the ordinary window path fails its initial parent-target guard, diagnostic
+evidence identifies the first actual failed predicate and the checked mask in
+the original short-circuit order. Later operands are null; focus and geometry
+checks that have not run are explicitly marked not reached. Recording uses the
+already evaluated booleans and adds no window queries, activation or input.
+The original failure stage/code remains unchanged if diagnostic recording fails.
+The job budget is 15 minutes; the actual experiment step retains its 8-minute
+limit and all per-stage deadlines and cleanup gates.
+
 The added experiment then does the following:
 
 1. Reads the exact installed `IMsRdpClientNonScriptable::SendKeys` metadata and

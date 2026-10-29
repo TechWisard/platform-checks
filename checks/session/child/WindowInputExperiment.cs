@@ -687,14 +687,27 @@ internal sealed class WindowInputTarget
 
     private void Require(bool requireFocus, ValidationPhase phase)
     {
-        if (InputNative.GetCurrentThreadId() != thread || parent.IsDisposed || host.IsDisposed ||
-            !parent.IsHandleCreated || !host.IsHandleCreated || parent.Handle != parentWindow || host.Handle != hostWindow ||
-            parent.InvokeRequired || !InputNative.IsChild(parentWindow, hostWindow) ||
-            Window == parentWindow || !Own(Window, hostWindow) ||
-            !InputNative.IsWindowVisible(parentWindow) || !InputNative.IsWindowVisible(Window) ||
-            !WindowInputNative.IsWindowEnabled(Window) || WindowInputNative.IsIconic(parentWindow) ||
-            InputNative.GetForegroundWindow() != parentWindow)
+        WindowTargetGuardTrace trace = new();
+        if (trace.Failed(InputNative.GetCurrentThreadId() != thread, WindowTargetPredicate.OwnerThread) ||
+            trace.Failed(parent.IsDisposed, WindowTargetPredicate.ParentAlive) ||
+            trace.Failed(host.IsDisposed, WindowTargetPredicate.HostAlive) ||
+            trace.Failed(!parent.IsHandleCreated, WindowTargetPredicate.ParentHandleCreated) ||
+            trace.Failed(!host.IsHandleCreated, WindowTargetPredicate.HostHandleCreated) ||
+            trace.Failed(parent.Handle != parentWindow, WindowTargetPredicate.ParentHandleMatches) ||
+            trace.Failed(host.Handle != hostWindow, WindowTargetPredicate.HostHandleMatches) ||
+            trace.Failed(parent.InvokeRequired, WindowTargetPredicate.InvokeNotRequired) ||
+            trace.Failed(!InputNative.IsChild(parentWindow, hostWindow), WindowTargetPredicate.HostInsideParent) ||
+            trace.Failed(Window == parentWindow, WindowTargetPredicate.ControlIsNotParent) ||
+            trace.Failed(!Own(Window, hostWindow), WindowTargetPredicate.ControlInsideHost) ||
+            trace.Failed(!InputNative.IsWindowVisible(parentWindow), WindowTargetPredicate.ParentVisible) ||
+            trace.Failed(!InputNative.IsWindowVisible(Window), WindowTargetPredicate.ControlVisible) ||
+            trace.Failed(!WindowInputNative.IsWindowEnabled(Window), WindowTargetPredicate.ControlEnabled) ||
+            trace.Failed(WindowInputNative.IsIconic(parentWindow), WindowTargetPredicate.ParentNotIconic) ||
+            trace.Failed(InputNative.GetForegroundWindow() != parentWindow, WindowTargetPredicate.ParentForeground))
+        {
+            trace.Record(record, (int)phase);
             throw new ExperimentFailure("window_input_target_ownership_or_foreground_changed");
+        }
         RequireOwnThread(parentWindow, OwnerRole.Parent, phase);
         RequireOwnThread(hostWindow, OwnerRole.Host, phase);
         RequireOwnThread(Window, OwnerRole.Control, phase);
