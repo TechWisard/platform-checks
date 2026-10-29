@@ -1,0 +1,41 @@
+name: Toolchain fixture export
+on:
+  push:
+    branches: [toolchain-fixture-20261030]
+    paths: [.github/workflows/toolchain-fixture-20261030.yml]
+permissions:
+  contents: read
+jobs:
+  export:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Fetch pinned public compiler
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p compiler runtime
+          curl --fail --location --retry 3 -o compiler/llvm-mingw.tar.xz https://github.com/mstorsjo/llvm-mingw/releases/download/20261020/llvm-mingw-20261020-ucrt-ubuntu-22.04-x86_64.tar.xz
+          echo '55064b60b991a1e1e8090b8c2f84e82b22cfe5903d12c159d65064cf5e8ae335  compiler/llvm-mingw.tar.xz' | sha256sum -c -
+          sha256sum compiler/* > compiler/SHA256SUMS.txt
+      - name: Export compiler
+        uses: actions/upload-artifact@v4
+        with:
+          name: compiler-fixture
+          path: compiler/
+          retention-days: 1
+          compression-level: 0
+      - name: Fetch Debian runtime packages
+        shell: bash
+        run: |
+          set -euxo pipefail
+          docker run --rm -v "$PWD/runtime:/out" debian:trixie-slim sh -ec 'apt-get update; apt-get --download-only -y --no-install-recommends -o Dir::Cache::archives=/out install wine64 xvfb xauth fonts-liberation libgl1-mesa-dri; cd /out; sha256sum *.deb > SHA256SUMS.txt'
+      - name: Export runtime
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-fixture
+          path: |
+            runtime/*.deb
+            runtime/SHA256SUMS.txt
+          retention-days: 1
+          compression-level: 0
