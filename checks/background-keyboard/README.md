@@ -61,8 +61,11 @@ context/previous/transition flags. Digit and all other printable or unknown
 virtual-key and scan codes are redacted. Only the explicit modifier/lock
 allowlist retains codes, and a scan is retained only for an explicitly allowed
 VK/scan pair. The parent reapplies both allowlists before logging.
-Category values are 0 (other redacted), 1 (digit redacted), 2 (modifier) and
-3 (lock). The optional JSON has no role in receipt parsing or acceptance, and
+Category values are 0 (other redacted), 1 (digit redacted), 2 (modifier),
+3 (lock), 4 (VK_PACKET), 5 (VK_PROCESSKEY), 6 (zero) and 7 (0xFF). The four new
+fixed classes retain neither VK nor scan values. In particular, a packet scan
+can encode character data and is always redacted. The optional metadata shape
+has no role in receipt acceptance, and
 malformed diagnostics are reported best effort without replacing the failure.
 Ordinary modes do not collect this metadata or add it to their reports.
 
@@ -71,6 +74,11 @@ Comparison is eligible only after one send attempt and a nonce-bound report
 newer than the accepted baseline; otherwise it is not performed. Neither the
 expected nor received text is logged. This comparison does not imply acceptance:
 all original counts, flags, UI guards, quiet interval and cleanup gates remain.
+The failure event includes existing character/error counters, received length,
+aggregate decimal/hex-letter counts and a fixed difference class/count. Its
+comparison inspects at most 16 stored characters and emits no character values,
+positions, text prefixes, hashes or nonce. These scalars distinguish invalid
+characters discarded by the witness from a same-length valid-hex mismatch.
 The metadata describes observed messages; it does not attribute their source
 or prove which operation caused an extra release. Diagnostic collection adds
 no input, focus changes, window queries, retries or replay.

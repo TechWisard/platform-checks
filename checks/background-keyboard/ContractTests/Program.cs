@@ -414,4 +414,79 @@ foreach (long key in new[] { -1L, 0x20L, 0x41L, 0x60L, 0x69L, 0xFFL, 0x100L, lon
     }
     finally { File.Delete(path); }
 }
+
+foreach (var special in new (long Key, int Category)[] { (0xE7,4), (0xE5,5), (0,6), (0xFF,7) })
+{
+    object trace = NewKeyTrace();
+    // Packet scan bits could contain character data; classify without retaining them.
+    ObserveKey(trace, 0x101, 1, special.Key, 0xC0310001L);
+    JsonElement raw = KeySnapshot(trace);
+    JsonElement item = raw.GetProperty("entries")[0];
+    Need(item.GetProperty("key_category").GetInt32() == special.Category &&
+        item.GetProperty("virtual_key").ValueKind == JsonValueKind.Null && item.GetProperty("scan_code").ValueKind == JsonValueKind.Null,
+        "fixed nonprinting class retains no VK or scan payload");
+    object report = Make(16, 15); Set(report, "KeyUpDiagnostics", raw);
+    JsonElement projected = FailureSnapshot(report, "1234567801928374", 10L, 1).GetProperty("key_up_entries")[0];
+    Need(projected.GetProperty("key_category").GetInt32() == special.Category &&
+        projected.GetProperty("virtual_key").ValueKind == JsonValueKind.Null && projected.GetProperty("scan_code").ValueKind == JsonValueKind.Null,
+        "fixed class survives safe parent projection without payload");
+    // A forged class cannot authorize the code or scan of a printable key.
+    Set(report, "KeyUpDiagnostics", JsonSerializer.SerializeToElement(new { stored=1, dropped=0,
+        entries=new[] { new { ordinal=1, key_category=special.Category, virtual_key=49, scan_code=2 } } }));
+    projected = FailureSnapshot(report, "1234567801928374", 10L, 1).GetProperty("key_up_entries")[0];
+    Need(projected.GetProperty("key_category").GetInt32() == 1 &&
+        projected.GetProperty("virtual_key").ValueKind == JsonValueKind.Null && projected.GetProperty("scan_code").ValueKind == JsonValueKind.Null,
+        "known raw digit is still redacted even with a forged fixed class");
+}
+foreach (int category in new[] { 0, 2, 3, 8, 100, 255 })
+{
+    object report = Make(16,15);
+    Set(report,"KeyUpDiagnostics",JsonSerializer.SerializeToElement(new { stored=1,dropped=0,
+        entries=new[] { new { ordinal=1,key_category=category,scan_code=49 } } }));
+    JsonElement item=FailureSnapshot(report,"1234567801928374",10L,1).GetProperty("key_up_entries")[0];
+    Need(item.GetProperty("key_category").GetInt32()==0 && item.GetProperty("virtual_key").ValueKind==JsonValueKind.Null &&
+        item.GetProperty("scan_code").ValueKind==JsonValueKind.Null,"unknown serialized categories cannot retain character payload");
+}
+{
+    const string expectedText="1234567801928374";
+    object report=Make(16,15);
+    JsonElement counters=FailureSnapshot(report,expectedText,10L,1).GetProperty("receipt_counters");
+    Need(counters.GetProperty("characters").GetInt32()==16 && counters.GetProperty("keys_down").GetInt32()==16 &&
+        counters.GetProperty("keys_up").GetInt32()==16 && counters.GetProperty("received_hex_length").GetInt32()==16,
+        "diagnostic copies existing counts and stored receipt length");
+    Need(counters.GetProperty("decimal_digit_count").GetInt32()==16 && counters.GetProperty("hex_letter_count").GetInt32()==0 &&
+        counters.GetProperty("difference_class").GetString()=="equal" && counters.GetProperty("differing_or_missing_positions").GetInt32()==0,
+        "exact receipt remains an aggregate diagnostic");
+    Set(report,"KeyUpCount",17);
+    counters=FailureSnapshot(report,expectedText,10L,1).GetProperty("receipt_counters");
+    Need(counters.GetProperty("keys_up").GetInt32()==17 && counters.GetProperty("difference_class").GetString()=="equal",
+        "text equality cannot hide an extra release");
+    Reject(final,report,initial,expectedText);
+    Set(report,"ReceivedHex","12345678"); Set(report,"UnexpectedCharacters",8);
+    counters=FailureSnapshot(report,expectedText,10L,1).GetProperty("receipt_counters");
+    Need(counters.GetProperty("characters").GetInt32()==16 && counters.GetProperty("received_hex_length").GetInt32()==8 &&
+        counters.GetProperty("unexpected_characters").GetInt32()==8 && counters.GetProperty("decimal_digit_count").GetInt32()==8 &&
+        counters.GetProperty("difference_class").GetString()=="received_shorter" && counters.GetProperty("differing_or_missing_positions").GetInt32()==8,
+        "discarded invalid characters distinguished from stored receipt");
+    Set(report,"ReceivedHex","12345678ABCDEFAB"); Set(report,"UnexpectedCharacters",0);
+    counters=FailureSnapshot(report,expectedText,10L,1).GetProperty("receipt_counters");
+    Need(counters.GetProperty("received_hex_length").GetInt32()==16 && counters.GetProperty("decimal_digit_count").GetInt32()==8 &&
+        counters.GetProperty("hex_letter_count").GetInt32()==8 && counters.GetProperty("unexpected_characters").GetInt32()==0 &&
+        counters.GetProperty("difference_class").GetString()=="same_length_mismatch" && counters.GetProperty("differing_or_missing_positions").GetInt32()==8,
+        "valid hex letters distinguished without printing their values");
+    Need(!counters.GetRawText().Contains(expectedText) && !counters.GetRawText().Contains("ABCDEFAB"),"counter JSON contains neither expected nor received text");
+    Set(report,"RepeatedCharacters",2); Set(report,"OverflowCharacters",3); Set(report,"SystemCharacters",4);
+    counters=FailureSnapshot(report,expectedText,10L,1).GetProperty("receipt_counters");
+    Need(counters.GetProperty("repeated_characters").GetInt32()==2 && counters.GetProperty("overflow_characters").GetInt32()==3 &&
+        counters.GetProperty("system_characters").GetInt32()==4,"existing error counters preserved as diagnostics");
+    counters=FailureSnapshot(report,expectedText,10L,0).GetProperty("receipt_counters");
+    Need(counters.GetProperty("difference_class").ValueKind==JsonValueKind.Null &&
+        counters.GetProperty("differing_or_missing_positions").ValueKind==JsonValueKind.Null,"comparison summary respects original eligibility");
+    Set(report,"ReceivedHex",new string('A',1024));
+    counters=FailureSnapshot(report,expectedText,10L,1).GetProperty("receipt_counters");
+    Need(counters.GetProperty("inspected_characters").GetInt32()==16 && counters.GetProperty("hex_letter_count").GetInt32()==16 &&
+        counters.GetProperty("difference_class").ValueKind==JsonValueKind.Null &&
+        counters.GetProperty("differing_or_missing_positions").ValueKind==JsonValueKind.Null && counters.GetRawText().Length<1024,
+        "malformed in-memory receipt cannot expand comparison or JSON output");
+}
 Console.WriteLine(JsonSerializer.Serialize(new{schema="sendkeys-local-contracts/v1",passed=true,checks=tests,actual_compiled_harness=true,windows_api_executed=false}));
