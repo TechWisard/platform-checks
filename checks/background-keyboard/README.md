@@ -79,6 +79,18 @@ aggregate decimal/hex-letter counts and a fixed difference class/count. Its
 comparison inspects at most 16 stored characters and emits no character values,
 positions, text prefixes, hashes or nonce. These scalars distinguish invalid
 characters discarded by the witness from a same-length valid-hex mismatch.
+For this opt-in witness, the existing invalid-character branch also counts two
+rejection classes: ASCII nonhex values, and values outside the ASCII range
+0..127. The original predicate and UnexpectedCharacters update run first.
+The diagnostic keeps only two aggregate counts for the first 32 rejected
+messages, independently of the key-up buffer, then a saturating dropped count.
+It retains no character values, order, positions or control-key identities.
+These optional nested counts use the existing untyped sidecar; the parent
+validates their shape and bounds only while recording a failure. Missing or
+malformed metadata cannot change receipt parsing, acceptance or the original
+failure. A nonzero dropped count means the two classes cover only the first
+32 rejected messages. This classification distinguishes the existing rejection
+reasons; it does not identify the producer or encoding of a character message.
 The metadata describes observed messages; it does not attribute their source
 or prove which operation caused an extra release. Diagnostic collection adds
 no input, focus changes, window queries, retries or replay.

@@ -745,6 +745,14 @@ internal sealed class ExperimentForm : Form
             evidence.Error("experiment_failed", ex);
             if (connectionStartedUtc is DateTimeOffset started)
             {
+                // This is after the failed attempt/boundary, before Cleanup;
+                // it is not a service state sampled at the COM callback time.
+                try { evidence.Event("connection_postfailure_services", ConnectionDiagnostics.ServicesSnapshot()); }
+                catch (Exception diagnosticError)
+                {
+                    try { evidence.Error("connection_services_unavailable", diagnosticError); }
+                    catch (Exception) { } // diagnostic logging must not replace the original failure
+                }
                 try { evidence.Event("connection_failure_events", ConnectionDiagnostics.RecentEvents(started)); }
                 catch (Exception diagnosticError) { evidence.Error("connection_events_unavailable", diagnosticError); }
             }

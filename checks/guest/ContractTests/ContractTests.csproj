@@ -8,6 +8,7 @@
     <UseAppHost>false</UseAppHost>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="../../session/child/ConnectionEventWindow.cs" Link="ConnectionEventWindow.cs" />
     <Compile Include="../GuestSupervisor/OperationWatchdog.cs" Link="OperationWatchdog.cs" />
     <Compile Include="../GuestSupervisor/ActivationObservation.cs" Link="ActivationObservation.cs" />
     <Compile Include="../GuestSupervisor/LicensingSnapshot.cs" Link="LicensingSnapshot.cs" />

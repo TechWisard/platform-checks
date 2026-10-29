@@ -11,6 +11,11 @@ on disk is not substituted for a loaded module.
 Service IDs 1 and 2 are `TermService` and `UmRdpService`. Only
 `SERVICE_QUERY_STATUS` is requested. State and service exit codes are observed,
 without starting/stopping services, emitting process IDs or changing policies.
+After an experiment fails having begun `Connect`, a second services-only
+snapshot is recorded as `connection_postfailure_services`, before cleanup and
+the event-log queries. This is a sample after the failed attempt/boundary, not
+the service state at the COM callback. Individual query failures remain numeric;
+handled observation/logging exceptions cannot replace the original failure.
 
 Registry IDs preserve this fixed order:
 
@@ -56,12 +61,32 @@ account name, SID, machine name, address, credential or path is emitted.
 Records are attributed to the time window only; an unrelated concurrent event
 cannot be labelled as the cause of this connection's failure.
 
+Guest10 retained eight informational records from channel 4 and hit its limit.
+After all five original channel reads, an optional `earlier_warning_error`
+selection uses only the remaining part of that same three-second budget. It
+applies only when channel 4 was available, capped, and its eight retained records
+all have level 4 and valid UTC timestamps inside the original query window.
+It reads channel 4 once more, restricted to levels 1/2/3 and timestamps from the
+same original start through the oldest retained timestamp, inclusive. At most
+eight additional numeric records are retained; a ninth marks the separate
+limit. No query interval is widened and Security's original read keeps its
+position and budget priority. Availability is 0 queried, 2 numeric query error,
+or 3 insufficient remaining iteration budget; `through_utc` identifies the
+cutoff. Native event API calls still have the external deadline limitation above.
+
+The original five channel payloads are preserved if the optional read fails.
+The supervisor independently rejects malformed optional data, emits only the
+fixed `earlier_warning_error_rejected=true` marker, and preserves the valid
+original channels. Optional records require level 1/2/3, a UTC timestamp no
+later than the validated cutoff, and the same closed numeric code allowlist.
+
 The guest supervisor preserves this data under `test.connection`, independently
 of its existing failure projection and all success/cleanup gates. It also keeps
 the ordered connection lifecycle, including legitimate null-code RDP events,
 the authentication before/after values and original session/enable flags. All
-names and value shapes are explicitly checked. There is one runtime snapshot
-and one event-log observation, at most 32 selected lifecycle records, and a
+names and value shapes are explicitly checked. There is at most one pre-connect
+snapshot, one post-failure services snapshot and one event-log observation,
+at most 32 selected lifecycle records, and a
 24 KiB encoded-event budget. Malformed records are counted and omitted; overflow
 sets `events_truncated`. The original numeric failure is retained separately.
 Queued RDP timestamps are **drain times**, not callback or network timings.

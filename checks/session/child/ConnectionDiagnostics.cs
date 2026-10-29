@@ -5,6 +5,7 @@ using System.Diagnostics.Eventing.Reader;
 using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Xml;
 
@@ -99,6 +100,9 @@ internal static class ConnectionDiagnostics
         return result;
     }
 
+    internal static JsonObject ServicesSnapshot() => new() {
+        ["services"] = new JsonArray(Service(1, "TermService"), Service(2, "UmRdpService")) };
+
     private static JsonObject Service(int id, string name)
     {
         JsonObject result = new() { ["id"] = id, ["state"] = null, ["win32_exit_code"] = null,
@@ -156,6 +160,44 @@ internal static class ConnectionDiagnostics
             }
             catch (Exception ex) { channel["availability"] = 2; channel["error"] = ErrorCode(ex); }
         }
+        // Preserve all five original reads, including Security, before using
+        // any remaining part of their same three-second collection budget.
+        try
+        {
+            DateTimeOffset? cutoff = ConnectionEventWindow.EarlierWarningErrorCutoff(
+                JsonSerializer.SerializeToElement(channels[3]), started, end);
+            if (cutoff is DateTimeOffset through)
+            {
+                JsonArray events = new();
+                JsonObject extra = new() { ["id"] = 4, ["through_utc"] = through.ToString("O", CultureInfo.InvariantCulture),
+                    ["availability"] = 0, ["error"] = null, ["limit_reached"] = false, ["events"] = events };
+                result["earlier_warning_error"] = extra;
+                if (budget.Elapsed > TimeSpan.FromSeconds(3)) extra["availability"] = 3;
+                else
+                {
+                    try
+                    {
+                        string throughText = through.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'", CultureInfo.InvariantCulture);
+                        string filter = "*[System[(Level=1 or Level=2 or Level=3) and TimeCreated[@SystemTime >= '" +
+                            startText + "' and @SystemTime <= '" + throughText + "']]]";
+                        using EventLogReader reader = new(new EventLogQuery(Channels[3], PathType.LogName, filter) { ReverseDirection = true });
+                        for (int count = 0; count <= 8; count++)
+                        {
+                            if (budget.Elapsed > TimeSpan.FromSeconds(3)) { extra["availability"] = 3; break; }
+                            using EventRecord? record = reader.ReadEvent(TimeSpan.FromMilliseconds(100));
+                            if (record is null) break;
+                            if (count == 8) { extra["limit_reached"] = true; break; }
+                            JsonObject item = new() { ["event_id"] = record.Id, ["version"] = record.Version,
+                                ["level"] = record.Level, ["codes"] = NumericCodes(record) };
+                            if (record.TimeCreated is DateTime time) item["utc"] = time.ToUniversalTime().ToString("O", CultureInfo.InvariantCulture);
+                            events.Add(item);
+                        }
+                    }
+                    catch (Exception ex) { extra["availability"] = 2; extra["error"] = ErrorCode(ex); }
+                }
+            }
+        }
+        catch (Exception) { } // supplemental diagnostics must preserve the five original channels
         return result;
     }
 

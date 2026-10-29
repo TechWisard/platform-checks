@@ -91,7 +91,11 @@ internal sealed class WitnessInputEvidence : IDisposable
             long value = message.WParam.ToInt64();
             int repeat = unchecked((ushort)message.LParam.ToInt64());
             if (repeat != 1) state.RepeatedCharacters++;
-            if (value < 0 || value > 0x7F || !InputReport.IsAsciiHex((char)value)) state.UnexpectedCharacters++;
+            if (value < 0 || value > 0x7F || !InputReport.IsAsciiHex((char)value))
+            {
+                state.UnexpectedCharacters++;
+                keyUpTrace?.ObserveRejectedCharacter(value);
+            }
             else if (state.ReceivedHex.Length >= state.CharacterLimit) state.OverflowCharacters++;
             else state.ReceivedHex += (char)value;
             // Consume a handled WM_UNICHAR: DefWindowProc would post WM_CHAR,

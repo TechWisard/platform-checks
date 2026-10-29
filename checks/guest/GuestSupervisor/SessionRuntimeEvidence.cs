@@ -44,8 +44,17 @@ internal static class SessionRuntimeEvidence
             entries.Add(entry);
         }
         result["registry"] = entries;
+        JsonObject? serviceSnapshot = Services(input);
+        if (serviceSnapshot is null) return null;
+        result["services"] = serviceSnapshot["services"]!.DeepClone();
+        return result;
+    }
+
+    internal static JsonObject? Services(JsonElement input)
+    {
+        JsonObject result = new();
         if (!Array(input, "services", 2, out JsonElement services) || services.GetArrayLength() != 2) return null;
-        JsonArray serviceEntries = new(); index = 0;
+        JsonArray serviceEntries = new(); int index = 0;
         foreach (JsonElement item in services.EnumerateArray())
         {
             JsonObject entry = new(); index++;
@@ -69,7 +78,6 @@ internal static class SessionRuntimeEvidence
         JsonObject result = new() { ["attribution"] = "time_window_only" };
         if (!Number(input, result, "events_per_channel_limit", 8, 8)) return null;
         JsonArray selected = new(); int index = 0;
-        string[] names = { "error_code", "hresult", "status", "substatus", "reason", "reason_code", "previous_state", "new_state", "state_event", "logon_type" };
         foreach (JsonElement channel in channels.EnumerateArray())
         {
             JsonObject output = new(); index++;
@@ -80,27 +88,74 @@ internal static class SessionRuntimeEvidence
             JsonArray records = new();
             foreach (JsonElement item in events.EnumerateArray())
             {
-                JsonObject record = new();
-                if (item.ValueKind != JsonValueKind.Object || !Number(item, record, "event_id", 0, 65535) ||
-                    !Number(item, record, "version", 0, 255, true) || !Number(item, record, "level", 0, 255, true) ||
-                    !item.TryGetProperty("codes", out JsonElement codes) || codes.ValueKind != JsonValueKind.Object) return null;
-                JsonObject codeValues = new();
-                foreach (JsonProperty code in codes.EnumerateObject())
-                    if (!names.Contains(code.Name, StringComparer.Ordinal) || !Number(codes, codeValues, code.Name, 0, uint.MaxValue)) return null;
-                record["codes"] = codeValues;
-                if (item.TryGetProperty("utc", out JsonElement utc))
-                {
-                    if (utc.ValueKind != JsonValueKind.String || utc.GetString() is not string text || text.Length > 33 ||
-                        !DateTimeOffset.TryParseExact(text, new[] { "O", "yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'" }, CultureInfo.InvariantCulture,
-                            DateTimeStyles.AssumeUniversal, out DateTimeOffset stamp) || stamp.Offset != TimeSpan.Zero) return null;
-                    record["utc"] = stamp.ToString("O", CultureInfo.InvariantCulture);
-                }
+                JsonObject? record = Event(item);
+                if (record is null) return null;
                 records.Add(record);
             }
             output["events"] = records; selected.Add(output);
         }
         result["channels"] = selected;
+        if (input.TryGetProperty("earlier_warning_error", out JsonElement earlier))
+        {
+            JsonObject? extra = EarlierWarningError(earlier, selected[3]!.AsObject());
+            if (extra is null) result["earlier_warning_error_rejected"] = true;
+            else result["earlier_warning_error"] = extra;
+        }
         return result;
+    }
+
+    private static JsonObject? EarlierWarningError(JsonElement earlier, JsonObject recent)
+    {
+        JsonArray recentEvents = recent["events"]!.AsArray();
+        if (recent["availability"]!.GetValue<long>() != 0 || !recent["limit_reached"]!.GetValue<bool>() ||
+            recentEvents.Count != 8 || recentEvents.Any(x => x?["level"]?.GetValue<long>() != 4 || x?["utc"] is null)) return null;
+        DateTimeOffset oldest = recentEvents.Min(x => DateTimeOffset.ParseExact(x!["utc"]!.GetValue<string>(), "O", CultureInfo.InvariantCulture));
+        JsonObject extra = new();
+        if (earlier.ValueKind != JsonValueKind.Object || !Number(earlier, extra, "id", 4, 4) ||
+            !Number(earlier, extra, "availability", 0, 3) || !Number(earlier, extra, "error", int.MinValue, int.MaxValue, true) ||
+            !Boolean(earlier, extra, "limit_reached") || !Array(earlier, "events", 8, out JsonElement extraEvents) ||
+            !Utc(earlier, "through_utc", out DateTimeOffset through) || through != oldest ||
+            extra["availability"]!.GetValue<long>() == 1 ||
+            (extra["availability"]!.GetValue<long>() == 2) != (extra["error"] is not null)) return null;
+        extra["through_utc"] = through.ToString("O", CultureInfo.InvariantCulture);
+        JsonArray selectedEarlier = new();
+        foreach (JsonElement item in extraEvents.EnumerateArray())
+        {
+            JsonObject? record = Event(item);
+            if (record is null || record["level"]?.GetValue<long>() is not (>= 1 and <= 3) ||
+                !Utc(item, "utc", out DateTimeOffset stamp) || stamp > through) return null;
+            selectedEarlier.Add(record);
+        }
+        extra["events"] = selectedEarlier;
+        return extra;
+    }
+
+    private static JsonObject? Event(JsonElement item)
+    {
+        string[] names = { "error_code", "hresult", "status", "substatus", "reason", "reason_code", "previous_state", "new_state", "state_event", "logon_type" };
+        JsonObject record = new();
+        if (item.ValueKind != JsonValueKind.Object || !Number(item, record, "event_id", 0, 65535) ||
+            !Number(item, record, "version", 0, 255, true) || !Number(item, record, "level", 0, 255, true) ||
+            !item.TryGetProperty("codes", out JsonElement codes) || codes.ValueKind != JsonValueKind.Object) return null;
+        JsonObject codeValues = new();
+        foreach (JsonProperty code in codes.EnumerateObject())
+            if (!names.Contains(code.Name, StringComparer.Ordinal) || !Number(codes, codeValues, code.Name, 0, uint.MaxValue)) return null;
+        record["codes"] = codeValues;
+        if (item.TryGetProperty("utc", out _))
+        {
+            if (!Utc(item, "utc", out DateTimeOffset stamp)) return null;
+            record["utc"] = stamp.ToString("O", CultureInfo.InvariantCulture);
+        }
+        return record;
+    }
+
+    private static bool Utc(JsonElement input, string name, out DateTimeOffset stamp)
+    {
+        stamp = default;
+        return input.TryGetProperty(name, out JsonElement utc) && utc.ValueKind == JsonValueKind.String &&
+            utc.GetString() is string text && text.Length <= 33 &&
+            DateTimeOffset.TryParseExact(text, new[] { "O", "yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'" }, CultureInfo.InvariantCulture,
+                DateTimeStyles.AssumeUniversal, out stamp) && stamp.Offset == TimeSpan.Zero;
     }
 
     private static bool Array(JsonElement input, string field, int max, out JsonElement value) =>

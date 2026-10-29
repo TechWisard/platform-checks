@@ -1,4 +1,7 @@
+using System.Globalization;
+using System.Text.Json;
 using System.Text.Json.Nodes;
+using SessionContractExperiment;
 
 internal static class SessionConnectionContracts
 {
@@ -86,5 +89,87 @@ internal static class SessionConnectionContracts
             x => x["channels"]![0]!["availability"] = 2,
             x => { for (int i = 0; i < 9; i++) x["channels"]![0]!["events"]!.AsArray().Add(new JsonObject()); } })
         { JsonObject bad = logs.DeepClone().AsObject(); corrupt(bad); check(Logs(bad)["events"]!.AsArray().Count == 0); }
+
+        // Preserve the strict nullable pre-input cleanup receipt while adding
+        // a separate services-only observation after the failed attempt.
+        JsonObject serviceDetails = new() { ["services"] = services.DeepClone(), ["private_text"] = "must_not_leave" };
+        JsonObject serviceEvent = Event("connection_postfailure_services", serviceDetails);
+        projected = project(Input(serviceEvent.DeepClone(), serviceEvent.DeepClone()));
+        connection = projected["connection"]!.AsObject();
+        check(connection["events"]!.AsArray().Count == 1 && connection["rejected_event_count"]!.GetValue<int>() == 1);
+        check(projected["window_input_cleanup_verified"] is null && !connection.ToJsonString().Contains("must_not_leave", StringComparison.Ordinal));
+        JsonObject failedService = serviceDetails.DeepClone().AsObject();
+        foreach (string field in new[] { "state", "win32_exit_code", "service_exit_code" }) failedService["services"]![0]![field] = null;
+        failedService["services"]![0]!["error"] = 5;
+        check(project(Input(Event("connection_postfailure_services", failedService)))["connection"]!["events"]!.AsArray().Count == 1);
+        foreach (Action<JsonObject> corrupt in new Action<JsonObject>[] {
+            x => x["services"]![0]!["id"] = 2, x => x["services"]![0]!["state"] = 0,
+            x => x["services"]![0]!["win32_exit_code"] = "private", x => x["services"]![0]!["error"] = 5,
+            x => x["services"]!.AsArray().Add(new JsonObject()) })
+        {
+            JsonObject bad = serviceDetails.DeepClone().AsObject(); corrupt(bad);
+            check(project(Input(Event("connection_postfailure_services", bad)))["connection"]!["events"]!.AsArray().Count == 0);
+        }
+        check(project(Input(Event("connection_services_unavailable", new() { ["code"] = -2147467259,
+            ["message"] = "must_not_leave" })))["connection"]!["events"]!.AsArray().Count == 1);
+
+        // Guest10-shaped informational flood: the oldest retained timestamp,
+        // not array position or an expanded interval, bounds the extra read.
+        DateTimeOffset began = DateTimeOffset.Parse("2026-10-29T16:03:18.8781423+00:00", CultureInfo.InvariantCulture);
+        DateTimeOffset oldest = DateTimeOffset.Parse("2026-10-29T16:03:21.2249748+00:00", CultureInfo.InvariantCulture);
+        DateTimeOffset ended = DateTimeOffset.Parse("2026-10-29T16:03:23.2325485+00:00", CultureInfo.InvariantCulture);
+        JsonObject saturated = logs.DeepClone().AsObject();
+        JsonObject channel4 = saturated["channels"]![3]!.AsObject();
+        channel4["limit_reached"] = true;
+        JsonArray flood = new();
+        for (int i = 7; i >= 0; i--) flood.Add(new JsonObject { ["event_id"] = 20523, ["version"] = 0,
+            ["level"] = 4, ["codes"] = new JsonObject(), ["utc"] = oldest.AddMilliseconds(i).ToString("O") });
+        channel4["events"] = flood;
+        DateTimeOffset? Cutoff(JsonObject value) => ConnectionEventWindow.EarlierWarningErrorCutoff(JsonSerializer.SerializeToElement(value), began, ended);
+        check(Cutoff(channel4) == oldest);
+        foreach (Action<JsonObject> corrupt in new Action<JsonObject>[] {
+            x => x["id"] = 3, x => x["availability"] = 3, x => x["limit_reached"] = false,
+            x => x["events"]!.AsArray().RemoveAt(0), x => x["events"]!.AsArray().Add(new JsonObject()),
+            x => x["events"]![0]!["level"] = 2, x => x["events"]![0]!["level"] = null,
+            x => x["events"]![0]!.AsObject().Remove("utc"), x => x["events"]![0]!["utc"] = "private",
+            x => x["events"]![0]!["utc"] = began.AddTicks(-1).ToString("O"),
+            x => x["events"]![0]!["utc"] = ended.AddTicks(1).ToString("O"),
+            x => x["events"]![0]!["utc"] = oldest.ToOffset(TimeSpan.FromHours(1)).ToString("O") })
+        { JsonObject bad = channel4.DeepClone().AsObject(); corrupt(bad); check(Cutoff(bad) is null); }
+        check(ConnectionEventWindow.EarlierWarningErrorCutoff(JsonSerializer.SerializeToElement(channel4), ended, began) is null);
+
+        JsonObject earlier = new() { ["id"] = 4, ["through_utc"] = oldest.ToString("O"), ["availability"] = 0,
+            ["error"] = null, ["limit_reached"] = false, ["private_text"] = "must_not_leave",
+            ["events"] = new JsonArray(new JsonObject { ["event_id"] = 1041, ["version"] = 0, ["level"] = 2,
+                ["codes"] = new JsonObject { ["error_code"] = 2147942405L }, ["utc"] = began.AddSeconds(1).ToString("O"),
+                ["event_text"] = "must_not_leave" }) };
+        saturated["earlier_warning_error"] = earlier;
+        JsonObject details = Logs(saturated.DeepClone().AsObject())["events"]![0]!["details"]!.AsObject();
+        check(details["channels"]![3]!["events"]!.AsArray().Count == 8 && details["channels"]![4]!["events"]!.AsArray().Count == 1);
+        check(details["earlier_warning_error"]!["events"]![0]!["codes"]!["error_code"]!.GetValue<long>() == 2147942405L);
+        check(!details.ToJsonString().Contains("must_not_leave", StringComparison.Ordinal));
+        string originalChannels = details["channels"]!.ToJsonString();
+        foreach (Action<JsonObject> corrupt in new Action<JsonObject>[] {
+            x => x["id"] = 1, x => x["through_utc"] = oldest.AddTicks(1).ToString("O"),
+            x => x["events"]![0]!["level"] = 4, x => x["events"]![0]!["level"] = 0,
+            x => x["events"]![0]!["utc"] = oldest.AddTicks(1).ToString("O"),
+            x => x["events"]![0]!.AsObject().Remove("utc"),
+            x => x["events"]![0]!["codes"]!["user_name"] = "must_not_leave",
+            x => x["events"]![0]!["codes"]!["error_code"] = "must_not_leave",
+            x => x["availability"] = 2, x => x["availability"] = 1,
+            x => { for (int i = 0; i < 8; i++) x["events"]!.AsArray().Add(x["events"]![0]!.DeepClone()); } })
+        {
+            JsonObject bad = saturated.DeepClone().AsObject(); corrupt(bad["earlier_warning_error"]!.AsObject());
+            JsonObject kept = Logs(bad)["events"]![0]!["details"]!.AsObject();
+            check(kept["earlier_warning_error"] is null && kept["earlier_warning_error_rejected"]!.GetValue<bool>());
+            check(kept["channels"]!.ToJsonString() == originalChannels && !kept.ToJsonString().Contains("must_not_leave", StringComparison.Ordinal));
+        }
+        foreach (int unavailable in new[] { 2, 3 })
+        {
+            JsonObject skipped = saturated.DeepClone().AsObject(); JsonObject extra = skipped["earlier_warning_error"]!.AsObject();
+            extra["availability"] = unavailable; extra["error"] = unavailable == 2 ? 5 : null; extra["events"] = new JsonArray();
+            JsonObject kept = Logs(skipped)["events"]![0]!["details"]!.AsObject();
+            check(kept["earlier_warning_error"]!["availability"]!.GetValue<long>() == unavailable && kept["channels"]!.ToJsonString() == originalChannels);
+        }
     }
 }

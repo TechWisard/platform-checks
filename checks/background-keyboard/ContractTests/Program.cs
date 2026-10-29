@@ -489,4 +489,94 @@ foreach (int category in new[] { 0, 2, 3, 8, 100, 255 })
         counters.GetProperty("differing_or_missing_positions").ValueKind==JsonValueKind.Null && counters.GetRawText().Length<1024,
         "malformed in-memory receipt cannot expand comparison or JSON output");
 }
+// Rejected characters are classified only after the original witness branch
+// rejects them. No character value is retained by the diagnostic helper.
+MethodInfo observeRejectedCharacter = keyTraceType.GetMethod("ObserveRejectedCharacter", BindingFlags.Instance | BindingFlags.NonPublic)!;
+void ObserveRejected(object trace, long value) => observeRejectedCharacter.Invoke(trace, new object[] { value });
+JsonElement RejectedCounts(object trace) => KeySnapshot(trace).GetProperty("rejected_character_classes");
+foreach (long value in Enumerable.Range(0, 128).Where(v => !char.IsAsciiHexDigit((char)v)).Select(v => (long)v)
+    .Concat(new[] { -1L, long.MinValue, 0x80L, 0xFFL, 0x100L, 0xD800L, 0xFFFFL, 0x10000L, 0x10FFFFL, long.MaxValue }))
+{
+    object trace = NewKeyTrace(); ObserveRejected(trace, value);
+    JsonElement counts = RejectedCounts(trace);
+    bool ascii = value is >= 0 and <= 0x7F;
+    Need(counts.GetProperty("ascii_nonhex").GetInt32() == (ascii ? 1 : 0) &&
+        counts.GetProperty("outside_ascii_range").GetInt32() == (ascii ? 0 : 1) &&
+        counts.GetProperty("dropped").GetInt32() == 0, "actual rejected-character helper partitions scalar boundaries");
+    Need(counts.EnumerateObject().Select(p => p.Name).OrderBy(n => n).SequenceEqual(
+        new[] { "ascii_nonhex", "capacity", "dropped", "outside_ascii_range" }), "only fixed aggregate fields retained");
+}
+{
+    object trace = NewKeyTrace();
+    for (int i = 0; i < 32; i++) ObserveKey(trace, 0x101, i + 1, 0x31, 0xC0020001L);
+    for (int i = 0; i < 40; i++) ObserveRejected(trace, i % 2 == 0 ? 0x1B : 0x80);
+    JsonElement counts = RejectedCounts(trace);
+    Need(counts.GetProperty("capacity").GetInt32() == 32 && counts.GetProperty("ascii_nonhex").GetInt32() == 16 &&
+        counts.GetProperty("outside_ascii_range").GetInt32() == 16 && counts.GetProperty("dropped").GetInt32() == 8,
+        "rejected-character counts have their own cap, independently of full key-up buffer");
+    keyTraceType.GetField("rejectedDropped", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(trace, int.MaxValue - 1);
+    ObserveRejected(trace, 0x1B); ObserveRejected(trace, 0x80); ObserveRejected(trace, -1);
+    Need(RejectedCounts(trace).GetProperty("dropped").GetInt32() == int.MaxValue, "rejected dropped count saturates without wrap");
+    Need(KeySnapshot(trace).GetProperty("stored").GetInt32() == 32 && KeySnapshot(trace).GetProperty("dropped").GetInt32() == 0,
+        "rejected characters do not alter key-up counters");
+    object receipt = Make(16, 15); Set(receipt, "KeyUpDiagnostics", KeySnapshot(trace));
+    JsonElement safe = FailureSnapshot(receipt, "1234567801928374", 10L, 1).GetProperty("rejected_character_metadata");
+    Need(safe.GetProperty("available").GetBoolean() && !safe.GetProperty("malformed").GetBoolean() &&
+        safe.GetProperty("ascii_nonhex").GetInt32() == 16 && safe.GetProperty("outside_ascii_range").GetInt32() == 16 &&
+        safe.GetProperty("dropped").GetInt32() == int.MaxValue, "parent projects validated bounded aggregates only");
+    Need(safe.GetRawText().Length < 256, "aggregate JSON remains fixed and small at counter limits");
+    Invoke(final, receipt, initial, "1234567801928374");
+    Need(true, "diagnostic counts do not become a new receipt gate");
+    Set(receipt, "UnexpectedCharacters", 8); Set(receipt, "KeyUpCount", 17);
+    Reject(final, receipt, initial, "1234567801928374");
+    Invoke(recordFailure, (Action<string, object?>)((_, _) => throw new Exception("synthetic logger failure")),
+        receipt, "1234567801928374", 10L, 1);
+    Need(true, "new aggregate cannot replace original failure if logger throws");
+}
+{
+    Type inputReport = fixture.GetType("SessionContractExperiment.InputReport", true)!;
+    MethodInfo readReport = inputReport.GetMethod("Read", Private)!;
+    object receipt = Make(16, 15);
+    Set(receipt, "Nonce", "local-test-binding"); Set(receipt, "SessionId", 1U); Set(receipt, "IdentityDigest", "local-test-digest");
+    JsonElement absent = FailureSnapshot(receipt, "1234567801928374", 10L, 1).GetProperty("rejected_character_metadata");
+    Need(!absent.GetProperty("available").GetBoolean() && !absent.GetProperty("malformed").GetBoolean() &&
+        absent.GetProperty("ascii_nonhex").ValueKind == JsonValueKind.Null, "ordinary absent metadata has no invented counts");
+    Set(receipt, "KeyUpDiagnostics", JsonDocument.Parse("""{"stored":0,"dropped":0,"entries":[]}""").RootElement.Clone());
+    absent = FailureSnapshot(receipt, "1234567801928374", 10L, 1).GetProperty("rejected_character_metadata");
+    Need(!absent.GetProperty("available").GetBoolean() && !absent.GetProperty("malformed").GetBoolean(),
+        "older optional sidecar remains available to core receipt parsing");
+    string path = Path.GetTempFileName();
+    try
+    {
+        foreach (string malformed in new[] { "null", "42", "true", "[]", "\"untrusted-text-not-to-log\"", "{}",
+            """{"capacity":32,"ascii_nonhex":"untrusted-text-not-to-log","outside_ascii_range":0,"dropped":0}""",
+            """{"capacity":32,"ascii_nonhex":0,"outside_ascii_range":true,"dropped":0}""",
+            """{"capacity":31,"ascii_nonhex":0,"outside_ascii_range":0,"dropped":0}""",
+            """{"capacity":32,"ascii_nonhex":-1,"outside_ascii_range":0,"dropped":0}""",
+            """{"capacity":32,"ascii_nonhex":0,"outside_ascii_range":33,"dropped":0}""",
+            """{"capacity":32,"ascii_nonhex":16,"outside_ascii_range":17,"dropped":0}""",
+            """{"capacity":32,"ascii_nonhex":1,"outside_ascii_range":0,"dropped":1}""",
+            """{"capacity":32,"ascii_nonhex":32,"outside_ascii_range":0,"dropped":-1}""",
+            """{"capacity":32,"ascii_nonhex":0,"outside_ascii_range":2147483648,"dropped":0}""",
+            """{"capacity":32,"ascii_nonhex":2147483647,"outside_ascii_range":2147483647,"dropped":0}""" })
+        {
+            Set(receipt, "KeyUpDiagnostics", JsonDocument.Parse(
+                "{\"stored\":0,\"dropped\":0,\"entries\":[],\"rejected_character_classes\":" + malformed + "}").RootElement.Clone());
+            File.WriteAllText(path, JsonSerializer.Serialize(receipt, reportType, diagnosticJson));
+            object parsed = Invoke(readReport, path, "local-test-binding", 1U, "local-test-digest")!;
+            Invoke(final, parsed, initial, "1234567801928374");
+            Need(true, "malformed rejected-character metadata leaves core parsing and acceptance unchanged");
+            JsonElement details = FailureSnapshot(parsed, "1234567801928374", 10L, 1);
+            JsonElement safe = details.GetProperty("rejected_character_metadata");
+            Need(safe.GetProperty("available").GetBoolean() && safe.GetProperty("malformed").GetBoolean() &&
+                safe.GetProperty("ascii_nonhex").ValueKind == JsonValueKind.Null &&
+                safe.GetProperty("outside_ascii_range").ValueKind == JsonValueKind.Null &&
+                safe.GetProperty("dropped").ValueKind == JsonValueKind.Null,
+                "parent discards malformed count values without using them as evidence");
+            Need(!details.GetRawText().Contains("untrusted-text-not-to-log") && safe.GetRawText().Length < 256,
+                "malformed nested JSON is neither copied nor allowed to grow output");
+        }
+    }
+    finally { File.Delete(path); }
+}
 Console.WriteLine(JsonSerializer.Serialize(new{schema="sendkeys-local-contracts/v1",passed=true,checks=tests,actual_compiled_harness=true,windows_api_executed=false}));

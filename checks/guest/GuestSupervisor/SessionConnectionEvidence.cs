@@ -26,7 +26,8 @@ internal static class SessionConnectionEvidence
         "credential_prompt_disabled", "shared_framebuffer_requested", "optional_shared_framebuffer_request_failed",
         "owned_test_credentials_applied", "connect_invocation_started", "connect_called", "rdp_connection_event",
         "rdp_extended_disconnect", "rdp_extended_disconnect_query_failed", "experiment_failed",
-        "connection_preconnect_snapshot", "connection_failure_events", "connection_snapshot_unavailable", "connection_events_unavailable" };
+        "connection_preconnect_snapshot", "connection_postfailure_services", "connection_services_unavailable",
+        "connection_failure_events", "connection_snapshot_unavailable", "connection_events_unavailable" };
 
     internal static JsonObject Project(JsonElement value)
     {
@@ -53,7 +54,7 @@ internal static class SessionConnectionEvidence
                 if (item.ValueKind != JsonValueKind.Object || !Text(item, "stage", out string stage) || !Stages.Contains(stage)) continue;
                 JsonObject? details = Details(stage, item);
                 if (details is null) { rejected = Math.Min(rejected + 1, 1048576); continue; }
-                if (stage is "connection_preconnect_snapshot" or "connection_failure_events" && !runtimeStages.Add(stage))
+                if (stage is "connection_preconnect_snapshot" or "connection_postfailure_services" or "connection_failure_events" && !runtimeStages.Add(stage))
                 { rejected = Math.Min(rejected + 1, 1048576); continue; }
                 if (selected.Count == MaximumEvents) { truncated = true; continue; }
                 JsonObject observation = new() { ["stage"] = stage, ["details"] = details };
@@ -86,6 +87,7 @@ internal static class SessionConnectionEvidence
         switch (stage)
         {
             case "connection_preconnect_snapshot": return SessionRuntimeEvidence.Snapshot(input);
+            case "connection_postfailure_services": return SessionRuntimeEvidence.Services(input);
             case "connection_failure_events": return SessionRuntimeEvidence.Events(input);
             case "extended_settings_typelib_verified":
                 return Number(input, result, "put_slot", 0, 64) && Number(input, result, "get_slot", 0, 64) ? result : null;

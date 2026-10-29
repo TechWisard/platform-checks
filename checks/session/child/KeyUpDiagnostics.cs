@@ -7,8 +7,10 @@ namespace SessionContractExperiment;
 internal sealed class KeyUpDiagnosticTrace
 {
     internal const int Capacity = 32;
+    internal const int RejectedCharacterCapacity = 32;
     private readonly KeyUpDiagnosticEntry[] entries = new KeyUpDiagnosticEntry[Capacity];
     private int stored, dropped;
+    private int rejectedAsciiNonhex, rejectedOutsideAsciiRange, rejectedDropped;
 
     internal static KeyUpDiagnosticTrace? TryCreate()
     {
@@ -42,13 +44,38 @@ internal sealed class KeyUpDiagnosticTrace
         catch { } // A diagnostic cannot throw into the witness's WndProc.
     }
 
+    // Called only after the existing rejection predicate and counter update.
+    // Keep counts only, independently of the key-up buffer; retain no values.
+    internal void ObserveRejectedCharacter(long value)
+    {
+        try
+        {
+            if (rejectedAsciiNonhex + rejectedOutsideAsciiRange == RejectedCharacterCapacity)
+            {
+                if (rejectedDropped < int.MaxValue) rejectedDropped++;
+                return;
+            }
+            if (value is >= 0 and <= 0x7F) rejectedAsciiNonhex++;
+            else rejectedOutsideAsciiRange++;
+        }
+        catch { } // Preserve the original character handling, even on diagnostic failure.
+    }
+
     internal JsonElement? Snapshot()
     {
         try
         {
             KeyUpDiagnosticEntry[] captured = new KeyUpDiagnosticEntry[stored];
             Array.Copy(entries, captured, stored);
-            return JsonSerializer.SerializeToElement(new { stored, dropped, entries = captured }, InputReport.Options);
+            return JsonSerializer.SerializeToElement(new
+            {
+                stored, dropped, entries = captured,
+                rejected_character_classes = new
+                {
+                    capacity = RejectedCharacterCapacity, ascii_nonhex = rejectedAsciiNonhex,
+                    outside_ascii_range = rejectedOutsideAsciiRange, dropped = rejectedDropped
+                }
+            }, InputReport.Options);
         }
         catch { return null; }
     }
@@ -148,12 +175,45 @@ internal static class SendKeysFailureDiagnostics
                 expected_text_equals = eligible ? (bool?)(latest!.ReceivedHex == expected) : null,
                 comparison_is_acceptance = false,
                 receipt_counters = ReceiptCounters(latest, expected, eligible),
+                rejected_character_metadata = RejectedCharacterCounts(latest?.KeyUpDiagnostics),
                 key_up_metadata_available = available, key_up_metadata_malformed = malformed,
                 key_up_metadata_truncated = truncated, key_up_metadata_capacity = KeyUpDiagnosticTrace.Capacity,
                 key_up_stored = stored, key_up_dropped = dropped, key_up_entries = entries
             });
         }
         catch { } // Preserve the original experiment failure, including logger failures.
+    }
+
+    private static object RejectedCharacterCounts(JsonElement? raw)
+    {
+        bool available = false, malformed = false;
+        int? ascii = null, outside = null, dropped = null;
+        try
+        {
+            if (raw is JsonElement container)
+            {
+                if (container.ValueKind != JsonValueKind.Object) malformed = true;
+                else if (container.TryGetProperty("rejected_character_classes", out JsonElement counts))
+                {
+                    available = true;
+                    int capacity = counts.GetProperty("capacity").GetInt32();
+                    int observedAscii = counts.GetProperty("ascii_nonhex").GetInt32();
+                    int observedOutside = counts.GetProperty("outside_ascii_range").GetInt32();
+                    int observedDropped = counts.GetProperty("dropped").GetInt32();
+                    if (capacity != KeyUpDiagnosticTrace.RejectedCharacterCapacity ||
+                        observedAscii < 0 || observedAscii > capacity || observedOutside < 0 || observedOutside > capacity ||
+                        observedAscii + observedOutside > capacity || observedDropped < 0 ||
+                        (observedDropped != 0 && observedAscii + observedOutside != capacity)) malformed = true;
+                    else { ascii = observedAscii; outside = observedOutside; dropped = observedDropped; }
+                }
+            }
+        }
+        catch { malformed = true; }
+        return new
+        {
+            available, malformed, capacity = KeyUpDiagnosticTrace.RejectedCharacterCapacity,
+            ascii_nonhex = ascii, outside_ascii_range = outside, dropped
+        };
     }
 
     private static object? ReceiptCounters(InputObservation? latest, string? expected, bool eligible)
