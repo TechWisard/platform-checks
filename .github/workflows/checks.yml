@@ -21,6 +21,8 @@ on:
       - '.github/workflows/native-input-contract.yml'
       - 'checks/native-host-runtime/**'
       - '.github/workflows/native-host-runtime.yml'
+      - 'checks/runtime/**'
+      - '.github/workflows/runtime-probe.yml'
   pull_request:
   workflow_dispatch:
 
