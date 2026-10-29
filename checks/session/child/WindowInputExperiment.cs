@@ -30,6 +30,7 @@ internal static class WindowInputExperiment
         WindowInputTarget? target = null;
         WindowInputEmitter? emitter = null;
         WindowMessageObservation? messages = null;
+        WindowInputThreadObservation? workerMessages = null;
         InputPoint? cursorBefore = null;
         InputPoint? cursorAfter = null;
         bool complete = false;
@@ -39,18 +40,24 @@ internal static class WindowInputExperiment
             requireOwnership();
             target = new WindowInputTarget(parent, host, control, evidence.Event);
             // This is a single request to the actual COM object's own window,
-            // after verifying our Form already owns the foreground. No other
-            // thread's queue or foreign window is attached or activated.
+            // after verifying our Form already owns the foreground. No queue
+            // is explicitly attached; no foreign window is activated.
             target.SelectOwnFocusOnce();
             messages = new WindowMessageObservation(parent.Handle, target.Window);
+            if (target.FocusThread != target.UiThread)
+            {
+                workerMessages = new WindowInputThreadObservation(parent.Handle, target.Window,
+                    target.FocusWindow, target.UiThread, target.FocusThread, target.OwnerProcess);
+                workerMessages.RequireHealthy();
+                target.Require();
+            }
             cursorBefore = WindowInputNative.Cursor();
 
             void RequireTarget()
             {
                 requireOwnership();
                 target.Require();
-                if (messages.Overflow || messages.OutsideTargetInput != 0)
-                    throw new ExperimentFailure("window_input_left_own_control");
+                workerMessages?.RequireBinding();
             }
 
             void Check()
@@ -58,6 +65,9 @@ internal static class WindowInputExperiment
                 if (elapsed.Elapsed >= budget)
                     throw new ExperimentFailure("window_input_timeout");
                 RequireTarget();
+                if (messages.Overflow || messages.OutsideTargetInput != 0)
+                    throw new ExperimentFailure("window_input_left_own_control");
+                workerMessages?.RequireHealthy();
             }
 
             InputObservation Read()
@@ -126,7 +136,7 @@ internal static class WindowInputExperiment
                 for (int i = 0; i < text.Length; i++)
                     text[i] = (char)('0' + RandomNumberGenerator.GetInt32(10));
             });
-            emitter = new WindowInputEmitter(target, RequireTarget);
+            emitter = new WindowInputEmitter(target, RequireTarget, Check);
             ushort[] scans = expectedText.Select(target.DigitScanCode).ToArray();
             evidence.Event("window_input_ready", new
             {
@@ -135,6 +145,9 @@ internal static class WindowInputExperiment
                 child_desktop = desktop,
                 target_window_from_com = true,
                 focus_inside_own_control = true,
+                focus_owner_pinned = true,
+                focus_thread_is_ui_thread = target.FocusThread == target.UiThread,
+                worker_message_observer_installed = workerMessages is not null,
                 keyboard_mode = "layout_checked_digit_scancodes",
                 global_input_queue = true,
                 physical_device_isolation = false
@@ -197,9 +210,7 @@ internal static class WindowInputExperiment
             RequireFinal(final);
             Check();
             emitter.RequireReleased();
-            if (messages.KeyDown != 8 || messages.KeyUp != 8 || messages.LeftDown != 1 || messages.LeftUp != 1 ||
-                messages.SystemKeys != 0 || messages.OtherButtons != 0)
-                throw new ExperimentFailure("window_input_parent_message_sequence_mismatch");
+            RequireQueuedMessageSequence(messages, workerMessages);
             evidence.WindowChildReceivedExpectedText = true;
             complete = true;
         }
@@ -208,7 +219,34 @@ internal static class WindowInputExperiment
             // At most one own keyboard release and one own button release. A
             // changed target makes cleanup unverified; it does not authorize an
             // event aimed at a foreign foreground window or cursor location.
-            evidence.WindowInputCleanupVerified = emitter is null || await emitter.ReleasePending(evidence.Event);
+            bool inputCleanup = emitter is null;
+            bool observerCleanup = workerMessages is null;
+            Exception? cleanupError = null;
+            evidence.WindowInputCleanupVerified = false;
+            try
+            {
+                if (emitter is not null) inputCleanup = await emitter.ReleasePending(evidence.Event);
+            }
+            catch (Exception error) { cleanupError = error; }
+            finally
+            {
+                // Stop the observer even if input cleanup or its logger failed.
+                // Its health gate never authorizes or blocks an owned UP receipt.
+                if (workerMessages is not null)
+                {
+                    try { observerCleanup = await workerMessages.StopAsync(); }
+                    catch (Exception error) { cleanupError ??= error; }
+                }
+                evidence.WindowInputCleanupVerified = inputCleanup && observerCleanup;
+            }
+            ExperimentFailure? finalObservationError = null;
+            if (complete && evidence.WindowInputCleanupVerified == true)
+            {
+                try { RequireQueuedMessageSequence(messages!, workerMessages); }
+                catch (ExperimentFailure error) { complete = false; finalObservationError = error; }
+            }
+            messages?.Dispose();
+            if (cleanupError is not null) evidence.Error("window_input_cleanup_exception", cleanupError);
             if (emitter is not null)
             {
                 evidence.Event("window_input_submission", new
@@ -222,7 +260,7 @@ internal static class WindowInputExperiment
                     pending_key = emitter.KeyPending,
                     pending_button = emitter.ButtonPending,
                     submission_unknown = emitter.SubmissionUnknown,
-                    cleanup_verified = evidence.WindowInputCleanupVerified
+                    cleanup_verified = inputCleanup
                 });
             }
             if (InputNative.GetCursorPos(out InputNative.Point cursor)) cursorAfter = cursor.Value;
@@ -235,10 +273,21 @@ internal static class WindowInputExperiment
                     messages.SystemKeys, messages.OutsideTargetInput, messages.Overflow,
                     cursor_before = cursorBefore,
                     cursor_after = cursorAfter,
-                    parent_input_messages_expected = true,
+                    complete_sequence_expected_on_ui_thread = workerMessages is null,
+                    distinct_worker_thread_observed = workerMessages is not null,
                     observation_scope = "own_ui_thread_actual_control_window_and_descendants"
                 });
-                messages.Dispose();
+            }
+            if (workerMessages is not null)
+            {
+                evidence.Event("window_input_worker_observation", new
+                {
+                    observation = workerMessages.Snapshot,
+                    cleanup_verified = observerCleanup,
+                    observation_scope = "removed_queue_messages_of_exact_owned_focus_worker_thread",
+                    ui_thread_counted_separately = true,
+                    thread_input_attach_called = false
+                });
             }
             if (latest is not null)
             {
@@ -257,18 +306,37 @@ internal static class WindowInputExperiment
                 });
             }
             evidence.WindowInputVerified = complete && evidence.WindowInputCleanupVerified == true;
+            if (finalObservationError is not null) throw finalObservationError;
             if (complete && evidence.WindowInputCleanupVerified != true)
-                throw new ExperimentFailure("window_input_release_cleanup_unverified");
+                throw new ExperimentFailure("window_input_release_or_observer_cleanup_unverified");
         }
 
         evidence.Event("window_input_verified", new
         {
             characters = 8, key_down = 8, key_up = 8, left_down = 1, left_up = 1,
             scope = "standard_parent_window_input_to_distinct_child_witness",
+            message_observation = "exact_combined_counts_over_distinct_owned_ui_and_optional_focus_threads",
             native_viewer_tested = false,
             direct_input_channel_tested = false,
             physical_device_isolation = false
         });
+    }
+
+    private static void RequireQueuedMessageSequence(WindowMessageObservation parent,
+        WindowInputThreadObservation? worker)
+    {
+        WindowInputThreadObservation.Observation? secondary = worker?.Snapshot;
+        if (parent.Overflow || parent.OutsideTargetInput != 0 ||
+            secondary is { Overflow: true } or { Failure: true } ||
+            (secondary?.OutsideTargetInput ?? 0) != 0)
+            throw new ExperimentFailure("window_input_owned_message_observation_failed");
+        if (parent.KeyDown + (secondary?.KeyDown ?? 0) != 8 ||
+            parent.KeyUp + (secondary?.KeyUp ?? 0) != 8 ||
+            parent.LeftDown + (secondary?.LeftDown ?? 0) != 1 ||
+            parent.LeftUp + (secondary?.LeftUp ?? 0) != 1 ||
+            parent.SystemKeys + (secondary?.SystemKeys ?? 0) != 0 ||
+            parent.OtherButtons + (secondary?.OtherButtons ?? 0) != 0)
+            throw new ExperimentFailure("window_input_owned_threads_message_sequence_mismatch");
     }
 
     private static void RequireGeometry(InputObservation current, InputObservation baseline)
@@ -308,9 +376,15 @@ internal sealed class WindowInputTarget
     private readonly IntPtr parentWindow;
     private readonly IntPtr hostWindow;
     private readonly IntPtr layout;
+    private readonly uint guiThreadInfoSize;
     private bool focusSelected;
     private bool ownerFailureRecorded;
+    private bool focusStateRecorded;
     internal IntPtr Window { get; }
+    internal IntPtr FocusWindow { get; private set; }
+    internal uint FocusThread { get; private set; }
+    internal uint UiThread => thread;
+    internal uint OwnerProcess => process;
     internal InputRectangle ClientRectangle { get; }
     internal Rectangle Desktop { get; }
 
@@ -320,6 +394,11 @@ internal sealed class WindowInputTarget
         this.host = host;
         this.control = control;
         this.record = record;
+        guiThreadInfoSize = checked((uint)Marshal.SizeOf<WindowInputNative.GuiThreadInfo>());
+        if (guiThreadInfoSize != (IntPtr.Size == 8 ? 72 : 48) ||
+            Marshal.OffsetOf<WindowInputNative.GuiThreadInfo>(nameof(WindowInputNative.GuiThreadInfo.Focus)).ToInt32() !=
+                (IntPtr.Size == 8 ? 16 : 12))
+            throw new ExperimentFailure("window_input_sdk_gui_thread_layout_invalid");
         if (parent.IsDisposed || host.IsDisposed || !parent.IsHandleCreated || !host.IsHandleCreated)
             throw new ExperimentFailure("window_input_parent_not_ready");
         parentWindow = parent.Handle;
@@ -392,7 +471,16 @@ internal sealed class WindowInputTarget
         {
             IntPtr focus = InputNative.GetFocus();
             if (!Own(focus, Window)) throw new ExperimentFailure("window_input_focus_left_own_control");
-            RequireOwnThread(focus, OwnerRole.Focus, phase);
+            if (FocusWindow == IntPtr.Zero)
+            {
+                if (!focusSelected || phase != ValidationPhase.AfterFocus)
+                    throw new ExperimentFailure("window_input_focus_owner_not_pinned");
+                PinFocusOwner(focus);
+            }
+            if (focus != FocusWindow)
+                throw new ExperimentFailure("window_input_pinned_focus_window_changed");
+            RequireOwnerThread(focus, FocusThread, OwnerRole.Focus, phase);
+            RequireFocusAgreement();
         }
         if (NativeRectangle() != ClientRectangle ||
             InputRectangle.From(host.RectangleToScreen(host.ClientRectangle)) != ClientRectangle ||
@@ -414,7 +502,10 @@ internal sealed class WindowInputTarget
             throw new ExperimentFailure("window_input_point_outside_control");
         IntPtr hit = InputNative.WindowFromPoint(new InputNative.Point(point.X, point.Y));
         if (!Own(hit, Window)) throw new ExperimentFailure("window_input_point_not_over_control");
-        RequireOwnThread(hit, OwnerRole.PointHit, ValidationPhase.Point);
+        if (hit == FocusWindow)
+            RequireOwnerThread(hit, FocusThread, OwnerRole.PointHit, ValidationPhase.Point);
+        else
+            RequireOwnThread(hit, OwnerRole.PointHit, ValidationPhase.Point);
         if (requireCursor && WindowInputNative.Cursor() != point)
             throw new ExperimentFailure("window_input_parent_cursor_changed");
     }
@@ -448,17 +539,114 @@ internal sealed class WindowInputTarget
     }
 
     private void RequireOwnThread(IntPtr window, OwnerRole role, ValidationPhase phase)
+        => RequireOwnerThread(window, thread, role, phase);
+
+    private void RequireOwnerThread(IntPtr window, uint expectedThread, OwnerRole role, ValidationPhase phase)
     {
         uint actualThread = WindowInputNative.GetWindowThreadProcessId(window, out uint actualProcess);
-        if (actualThread != thread || actualProcess != process)
+        if (actualThread != expectedThread || actualProcess != process)
         {
             int? queryError = actualThread == 0 ? Marshal.GetLastPInvokeError() : null;
-            RecordOwnerFailure(window, actualThread, actualProcess, queryError, role, phase);
+            RecordOwnerFailure(window, actualThread, actualProcess, expectedThread, queryError, role, phase);
             throw new ExperimentFailure("window_input_target_thread_or_process_changed");
         }
     }
 
-    private void RecordOwnerFailure(IntPtr window, uint actualThread, uint actualProcess, int? queryError,
+    private void PinFocusOwner(IntPtr focus)
+    {
+        uint ownerThread = WindowInputNative.GetWindowThreadProcessId(focus, out uint ownerProcess);
+        if (ownerThread == 0)
+            throw new ExperimentFailure("window_input_focus_owner_query_failed", Marshal.GetLastPInvokeError());
+        if (ownerProcess != process)
+            throw new ExperimentFailure("window_input_focus_process_not_own");
+
+        // A native control can own its focused descendant on another thread.
+        // Pin that exact HWND and owner once, after our single focus request.
+        // Later focus or owner changes fail; this test never calls AttachThreadInput.
+        FocusWindow = focus;
+        FocusThread = ownerThread;
+        RequireFocusAgreement();
+        record("window_input_focus_owner_pinned", new
+        {
+            focus_window_is_control = focus == Window,
+            focus_inside_control = Own(focus, Window),
+            focus_process_is_own = true,
+            focus_thread_is_ui_thread = ownerThread == thread,
+            ui_and_focus_thread_agree = true,
+            focus_keyboard_layout_matches_ui = true,
+            focus_requests = 1,
+            thread_input_attach_called = false
+        });
+    }
+
+    private void RequireFocusAgreement()
+    {
+        if (FocusWindow == IntPtr.Zero || FocusThread == 0)
+            throw new ExperimentFailure("window_input_focus_owner_not_pinned");
+        WindowInputNative.GuiThreadInfo ui = new() { Size = guiThreadInfoSize };
+        bool uiQuery = WindowInputNative.GetGUIThreadInfo(thread, ref ui);
+        int uiError = uiQuery ? 0 : Marshal.GetLastPInvokeError();
+        WindowInputNative.GuiThreadInfo focused = ui;
+        bool focusQuery = uiQuery;
+        int focusError = uiError;
+        if (FocusThread != thread)
+        {
+            focused = new() { Size = guiThreadInfoSize };
+            focusQuery = WindowInputNative.GetGUIThreadInfo(FocusThread, ref focused);
+            focusError = focusQuery ? 0 : Marshal.GetLastPInvokeError();
+        }
+        bool uiActiveRoot = uiQuery && ui.Active != IntPtr.Zero &&
+            InputNative.GetAncestor(ui.Active, 2 /* GA_ROOT */) == parentWindow;
+        bool focusActiveRoot = focusQuery && focused.Active != IntPtr.Zero &&
+            InputNative.GetAncestor(focused.Active, 2 /* GA_ROOT */) == parentWindow;
+        bool uiFocus = uiQuery && ui.Focus == FocusWindow;
+        bool ownerFocus = focusQuery && focused.Focus == FocusWindow;
+        bool callerFocus = InputNative.GetFocus() == FocusWindow;
+        bool uiLayout = WindowInputNative.GetKeyboardLayout(thread) == layout;
+        bool focusLayout = WindowInputNative.GetKeyboardLayout(FocusThread) == layout;
+        if (!focusStateRecorded)
+        {
+            focusStateRecorded = true;
+            try
+            {
+                record("window_input_focus_thread_state", new
+                {
+                    distinct_focus_thread = FocusThread != thread,
+                    ui_query_succeeded = uiQuery,
+                    ui_query_error = uiQuery ? null : (int?)uiError,
+                    focus_query_succeeded = focusQuery,
+                    focus_query_error = focusQuery ? null : (int?)focusError,
+                    ui_active_present = uiQuery && ui.Active != IntPtr.Zero,
+                    focus_active_present = focusQuery && focused.Active != IntPtr.Zero,
+                    ui_active_is_parent = uiQuery && ui.Active == parentWindow,
+                    focus_active_is_parent = focusQuery && focused.Active == parentWindow,
+                    ui_active_root_is_parent = uiActiveRoot,
+                    focus_active_root_is_parent = focusActiveRoot,
+                    ui_focus_is_pinned = uiFocus,
+                    owner_focus_is_pinned = ownerFocus,
+                    caller_focus_is_pinned = callerFocus,
+                    ui_layout_matches_original = uiLayout,
+                    focus_layout_matches_original = focusLayout
+                });
+            }
+            catch (Exception)
+            {
+                // Best-effort, bounded diagnostics cannot replace the checks.
+            }
+        }
+        if (!uiQuery)
+            throw new ExperimentFailure("window_input_ui_thread_focus_query_failed", uiError);
+        if (!focusQuery)
+            throw new ExperimentFailure("window_input_focus_thread_query_failed", focusError);
+        if (!uiActiveRoot || !focusActiveRoot)
+            throw new ExperimentFailure("window_input_focus_active_root_changed");
+        if (!uiFocus || !ownerFocus || !callerFocus)
+            throw new ExperimentFailure("window_input_thread_focus_disagreement");
+        if (!uiLayout || !focusLayout)
+            throw new ExperimentFailure("window_input_focus_thread_layout_changed");
+    }
+
+    private void RecordOwnerFailure(IntPtr window, uint actualThread, uint actualProcess, uint expectedThread, int? queryError,
         OwnerRole role, ValidationPhase phase)
     {
         // One failure record per target. Successful polling and input checks
@@ -473,8 +661,9 @@ internal sealed class WindowInputTarget
                 validation_phase = phase.ToString(),
                 owner_query_succeeded = actualThread != 0,
                 owner_query_error = queryError,
-                owner_thread_is_expected = actualThread != 0 ? actualThread == thread : (bool?)null,
+                owner_thread_is_expected = actualThread != 0 ? actualThread == expectedThread : (bool?)null,
                 owner_process_is_own = actualThread != 0 ? actualProcess == process : (bool?)null,
+                expected_owner_is_ui_thread = expectedThread == thread,
                 current_thread_is_expected = InputNative.GetCurrentThreadId() == thread,
                 window_nonzero = window != IntPtr.Zero,
                 window_is_parent = window == parentWindow,
@@ -515,6 +704,7 @@ internal sealed class WindowInputEmitter
 {
     private readonly WindowInputTarget target;
     private readonly Action requireTarget;
+    private readonly Action requireEmission;
     private readonly WindowInputNative.Input[] batch = new WindowInputNative.Input[2];
     private readonly byte[] keyboard = new byte[256];
     private readonly bool[] submittedKeys = new bool[256];
@@ -534,10 +724,11 @@ internal sealed class WindowInputEmitter
     internal int CleanupInserted { get; private set; }
     internal int CleanupObservations { get; private set; }
 
-    internal WindowInputEmitter(WindowInputTarget target, Action requireTarget)
+    internal WindowInputEmitter(WindowInputTarget target, Action requireTarget, Action requireEmission)
     {
         this.target = target;
         this.requireTarget = requireTarget;
+        this.requireEmission = requireEmission;
         inputSize = Marshal.SizeOf<WindowInputNative.Input>();
         if (inputSize != (IntPtr.Size == 8 ? 40 : 28) ||
             Marshal.OffsetOf<WindowInputNative.Input>(nameof(WindowInputNative.Input.Data)).ToInt32() != (IntPtr.Size == 8 ? 8 : 4))
@@ -663,7 +854,7 @@ internal sealed class WindowInputEmitter
     {
         if (cleanupAttempted || SubmissionUnknown || KeyPending || ButtonPending)
             throw new ExperimentFailure("window_input_pending_release_or_closed");
-        requireTarget();
+        requireEmission();
         target.RequirePoint(point, requireCursor);
         if (!WindowInputNative.GetKeyboardState(keyboard))
             throw new ExperimentFailure("window_input_keyboard_state_unavailable", Marshal.GetLastWin32Error());
@@ -763,6 +954,13 @@ internal static class WindowInputNative
     [StructLayout(LayoutKind.Sequential)]
     internal struct Rectangle { internal int Left, Top, Right, Bottom; }
     [StructLayout(LayoutKind.Sequential)]
+    internal struct GuiThreadInfo
+    {
+        internal uint Size, Flags;
+        internal IntPtr Active, Focus, Capture, MenuOwner, MoveSize, Caret;
+        internal Rectangle CaretRectangle;
+    }
+    [StructLayout(LayoutKind.Sequential)]
     internal struct MouseInput
     {
         internal int X, Y;
@@ -817,6 +1015,9 @@ internal static class WindowInputNative
     internal static extern IntPtr SetFocus(IntPtr window);
     [DllImport("user32.dll", ExactSpelling = true, SetLastError = true)]
     internal static extern uint GetWindowThreadProcessId(IntPtr window, out uint process);
+    [DllImport("user32.dll", ExactSpelling = true, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool GetGUIThreadInfo(uint thread, ref GuiThreadInfo information);
     [DllImport("user32.dll", ExactSpelling = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static extern bool IsWindowEnabled(IntPtr window);

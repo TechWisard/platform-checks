@@ -17,8 +17,19 @@ The control must be connected. The SDK `IOleInPlaceObject::GetWindow` supplies
 the real control HWND, which must belong to the test process and its UI thread,
 and be inside the existing AxHost and Form. The Form must already be the actual
 foreground window. The test requests focus once on that exact owned control and
-then verifies the resulting focus. It never attaches another thread's input
-queue or attempts to activate a foreign foreground window.
+then verifies the resulting focus. It never calls `AttachThreadInput` or
+attempts to activate a foreign foreground window.
+
+The focused descendant may belong to another thread of the same control
+process. After the single focus request, the test pins that exact HWND and its
+nonzero creator thread ID. Every later check requires the same window, thread,
+process and ancestry. Parent, AxHost and COM control windows still require the
+original UI thread. `GetGUIThreadInfo` for both threads must agree on the pinned
+focus and on an active window rooted at the parent Form. Both threads' current
+keyboard layouts must match the original layout. The first bounded state
+record reports these relationships without raw window, process or thread IDs.
+Only the exact pinned focus HWND may also satisfy a point hit on its worker
+thread; other hit windows retain the original UI-thread requirement.
 
 Both desktops must have one monitor and unchanged, unscaled geometry. The
 parent's complete native control client area must match the child's desktop
@@ -52,6 +63,17 @@ eight characters. It also observes the corresponding messages in the real
 parent control window. A quiet interval and a strictly newer child heartbeat
 must follow the sequence.
 
+The existing UI-thread message filter and an optional observer of the pinned
+worker thread report separate actual counts. The worker observer uses a
+thread-specific `WH_GETMESSAGE` hook in the same process, counts only messages
+removed from that queue, and reads only the message's window and type. It never
+reads key values, changes a message or stops the hook chain. An opened thread
+handle pins the original worker identity and must remain live for input and
+receipt-bound release checks. Success requires exactly eight key-down and
+eight key-up messages and one left-button down/up pair across the two distinct
+threads, with no outside-target, system-key, other-button, overflow or observer
+failure. With no worker thread, the original UI-only counts remain required.
+
 ## Failure and cleanup
 
 The input budget is at most 25 seconds of the already remaining session-test
@@ -69,6 +91,20 @@ run, then checks the queue and asynchronous state for the owned keys/button,
 with at most 20 observations at 25 ms intervals. The overall input result
 cannot pass if this cleanup is unverified. `window_input_cleanup_verified` is
 null when this input test was not requested.
+
+Observation failure stops new emissions and functional acceptance, while the
+ownership checks remain available for a release backed by an existing partial
+DOWN receipt. The worker hook is removed after those releases, including when
+release cleanup itself fails. Cleanup requires successful hook removal, bounded
+retirement and release of the pinned thread handle. An exceptional installation
+call without an observed native return leaves cleanup unverified. A static
+delegate and inert state remain rooted until this disposable process exits
+because a callback may already be entering when unhook returns. Observing idle
+callbacks does not establish that no later inert callback can enter.
+
+Combined actual message counts are checked again after observer shutdown.
+`window_input_cleanup_verified` includes both input-release and observer
+cleanup results; neither result alone permits success.
 
 This is a bounded disposable-VM test, not an input isolation mechanism.
 Foreground and hit-test checks precede submission but cannot make the global
@@ -95,7 +131,9 @@ fails has not verified input.
 The runner also validates the final report's exact schema and status, typed
 Boolean frame/account/input/cleanup fields, and separate false direct-input and
 physical-isolation fields. When child preparation was requested, its typed
-verification and cleanup fields must pass too. A successful process exit with
+render-eligibility and cleanup fields must pass too; preparation success and
+the narrowly permitted unresolved-foreground observation remain distinct.
+A successful process exit with
 missing or inconsistent evidence is rejected; reported flags cannot override a
 nonzero process exit.
 
@@ -104,6 +142,11 @@ nonzero process exit.
 - [IOleWindow::GetWindow](https://learn.microsoft.com/en-us/windows/win32/api/oleidl/nf-oleidl-iolewindow-getwindow)
 - [IOleInPlaceObject](https://learn.microsoft.com/en-us/windows/win32/api/oleidl/nn-oleidl-ioleinplaceobject)
 - [SetFocus](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setfocus)
+- [GetGUIThreadInfo](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getguithreadinfo)
+- [GetKeyboardLayout](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getkeyboardlayout)
+- [GetMsgProc](https://learn.microsoft.com/en-us/windows/win32/winmsg/getmsgproc)
+- [SetWindowsHookExW](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwindowshookexw)
+- [UnhookWindowsHookEx](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-unhookwindowshookex)
 - [SendInput](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendinput)
 - [MOUSEINPUT](https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-mouseinput)
 - [KEYBDINPUT](https://learn.microsoft.com/en-us/windows/win32/api/winuser/ns-winuser-keybdinput)
