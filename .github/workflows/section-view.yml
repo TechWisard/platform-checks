@@ -1,0 +1,39 @@
+name: Anonymous section protection and lifetime
+
+on:
+  push:
+    paths:
+      - 'checks/section-view/**'
+      - '.github/workflows/section-view.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: section-view-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  observe:
+    name: Section views (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 6
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-2022, windows-2025]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Configure independent section probe
+        run: cmake -S checks/section-view -B build/section-view -A x64
+      - name: Compile independent section probe
+        run: cmake --build build/section-view --config Release --parallel 2
+      - name: Observe protection and verify view cleanup
+        timeout-minutes: 1
+        shell: pwsh
+        run: |
+          & .\build\section-view\Release\section_view_observation.exe
+          exit $LASTEXITCODE
