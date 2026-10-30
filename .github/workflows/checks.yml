@@ -25,6 +25,8 @@ on:
       - '.github/workflows/native-host-runtime.yml'
       - 'checks/runtime/**'
       - '.github/workflows/runtime-probe.yml'
+      - 'checks/root-device/**'
+      - '.github/workflows/root-device.yml'
   pull_request:
   workflow_dispatch:
 

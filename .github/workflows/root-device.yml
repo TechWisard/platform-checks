@@ -1,0 +1,39 @@
+name: Temporary root-device property observation
+
+on:
+  push:
+    paths:
+      - 'checks/root-device/**'
+      - '.github/workflows/root-device.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: root-device-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  observe:
+    name: Root-device property (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 6
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-2022, windows-2025]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Configure independent SetupAPI probe
+        run: cmake -S checks/root-device -B build/root-device -A x64
+      - name: Compile independent SetupAPI probe
+        run: cmake --build build/root-device --config Release --parallel 2
+      - name: Observe temporary devnode properties and verify removal
+        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          & .\checks\root-device\run.ps1 -Executable .\build\root-device\Release\root_device_property.exe
+          exit $LASTEXITCODE
