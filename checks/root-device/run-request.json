@@ -1,0 +1,7 @@
+{
+  "schema": "root-device-observation-request/v1",
+  "source_commit": "df2369fd584a042f38a3cf61fb614935901c2a76",
+  "source_tree": "9a49bf9eeb70d4f7ad2ce5e5c00370c619d0c179",
+  "requested_utc": "2026-10-30 00:28:02 UTC",
+  "rationale": "Measure reserved SetupAPI service-property behavior on an owned temporary root devnode; verify removal."
+}
